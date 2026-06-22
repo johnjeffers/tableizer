@@ -1,0 +1,27 @@
+[package]
+name = "tableizer-core"
+description = "Tableizer data engine: byte-faithful parsing, out-of-core indexing, search, and sort."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = "2.0.18"
+# thiserror added via `cargo add`.
+
+# Engine dependency spine (add each as the corresponding module is implemented, so there are no
+# unused dependencies — see docs/spec.md §4):
+#   csv, csv-core   — RFC 4180 byte-faithful parsing / streaming record boundaries
+#   memmap2         — memory-mapped reads (guarded; see §4.2)
+#   encoding_rs     — BOM-aware decoding (UTF-8/16, Latin-1, Windows-1252)
+#   regex           — linear-time, ReDoS-safe search (NEVER fancy-regex)
+#   memchr          — fast literal substring search
+#   rayon           — data-parallel index build / external-sort run generation
+
+[dev-dependencies]
+# proptest        — round-trip / fidelity property tests (add with the parser)

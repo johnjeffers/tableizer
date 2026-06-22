@@ -1,0 +1,20 @@
+[package]
+name = "tableizer"
+description = "Tableizer cross-platform desktop shell (winit + wgpu + egui)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "tableizer"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+eframe = "0.34.3"
+tableizer-core = { path = "../tableizer-core" }
+# eframe added via `cargo add` (the winit + wgpu + egui desktop runtime).

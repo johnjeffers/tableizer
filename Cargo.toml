@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = ["crates/tableizer-core", "crates/tableizer"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT OR Apache-2.0"
+authors = ["John Jeffers <john@jeffers.cc>"]
+
+# Lints applied to every workspace crate (each opts in via `[lints] workspace = true`).
+[workspace.lints.rust]
+# The engine will need targeted `unsafe` (mmap); every use must be deliberate and justified,
+# so warn rather than forbid. CI treats warnings as errors.
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+
+# Optimise dependencies even in dev builds — the engine is I/O- and CPU-bound and unbearable
+# to exercise on real files when its deps are unoptimised.
+[profile.dev.package."*"]
+opt-level = 2
