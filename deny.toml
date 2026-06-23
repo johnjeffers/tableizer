@@ -14,6 +14,16 @@ allow = [
     "Zlib",
     "Unicode-3.0",
     "MPL-2.0",
+    # Public-domain-equivalent / Boost — both permissive. CC0-1.0 covers `hexf-parse` (egui) and
+    # `tiny-keccak` (the Arrow/Parquet hashing path); BSL-1.0 covers the `clipboard-win`/`error-code`
+    # clipboard stack pulled by eframe on Windows.
+    "CC0-1.0",
+    "BSL-1.0",
+    # Font licenses for the UI font bundled by egui/epaint (Ubuntu + others). Permissive for the
+    # bundled font assets; they only appear in the `(MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0`
+    # font crate.
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
 ]
 confidence-threshold = 0.9
 
@@ -23,6 +33,10 @@ multiple-versions = "warn"
 [advisories]
 # Fail on security advisories in the dependency tree.
 yanked = "deny"
+# `paste` 1.0.15 is flagged unmaintained (RUSTSEC-2024-0436) — an "unmaintained", not a
+# vulnerability, advisory. It is a transitive proc-macro dependency of `parquet` with no safe
+# upgrade available; accept it until the upstream Arrow/Parquet stack stops depending on it.
+ignore = ["RUSTSEC-2024-0436"]
 
 [sources]
 unknown-registry = "deny"

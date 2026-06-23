@@ -21,9 +21,10 @@ use arrow::datatypes::{DataType, SchemaRef};
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{
-    ArrowReaderMetadata, ArrowReaderOptions, PageIndexPolicy, ParquetRecordBatchReaderBuilder,
-    RowSelection, RowSelector,
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
+    RowSelector,
 };
+use parquet::file::metadata::PageIndexPolicy;
 
 use crate::search::Matcher;
 use crate::{
