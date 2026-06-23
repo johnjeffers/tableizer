@@ -4,7 +4,7 @@
 //! CLI argument: the **dialect** (delimiter + header) and **text encoding** are auto-detected and
 //! user-overridable. `CsvTable::open` returns instantly and indexes in the background, so the first
 //! screen is immediate. Rows render in a virtualised **`egui_table`** grid (header names, sticky
-//! header, sticky first column, resizable columns, column show/hide, header drag-to-reorder) that
+//! header, resizable columns, click-to-sort, column show/hide, header drag-to-reorder) that
 //! prefetches only the visible rows from the engine's [`tableizer_core::ViewportSource`] seam.
 //!
 //! Encoding is a *display* concern: cells stay raw bytes in the engine (byte fidelity); the app
@@ -521,8 +521,6 @@ struct GridLayout {
     order: Vec<ColumnId>,
     /// Visibility per source-column index.
     visible: Vec<bool>,
-    /// Number of leftmost displayed columns to freeze (keep on-screen while scrolling right).
-    frozen: usize,
 }
 
 impl GridLayout {
@@ -530,7 +528,6 @@ impl GridLayout {
         Self {
             order: (0..column_count as u32).map(ColumnId).collect(),
             visible: vec![true; column_count],
-            frozen: 1,
         }
     }
 
@@ -604,13 +601,12 @@ impl ViewControls {
     }
 }
 
-/// A persisted per-file view: column order/visibility/freeze + sort + filter. Saved to the config
-/// dir and reapplied when the same file is reopened.
+/// A persisted per-file view: column order/visibility + sort + filter. Saved to the config dir and
+/// reapplied when the same file is reopened.
 #[derive(Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 struct SavedView {
     order: Vec<u32>,
     visible: Vec<bool>,
-    frozen: usize,
     /// (column index, ascending?)
     sort: Option<(u32, bool)>,
     /// (query, regex, invert) — present only when a hide-non-matching filter is active.
@@ -626,7 +622,6 @@ impl SavedView {
         Self {
             order: layout.order.iter().map(|c| c.0).collect(),
             visible: layout.visible.clone(),
-            frozen: layout.frozen,
             sort: view
                 .sort
                 .map(|s| (s.column.0, s.direction == Direction::Ascending)),
@@ -644,7 +639,6 @@ impl SavedView {
         if self.visible.len() == layout.visible.len() {
             layout.visible = self.visible.clone();
         }
-        layout.frozen = self.frozen.min(layout.visible.len());
         view.sort = self.sort.map(|(c, asc)| SortKey {
             column: ColumnId(c),
             direction: if asc {
@@ -1073,23 +1067,15 @@ fn menu_bar(ui: &mut egui::Ui, app: &mut TableizerApp, to_open: &mut Option<Path
 
     if let View::Loaded(loaded) = &mut app.view {
         ui.menu_button("Parsing", |ui| parsing_menu(ui, loaded));
-        ui.menu_button("View", |ui| {
+        ui.menu_button("Columns", |ui| {
             ui.set_min_width(190.0);
-            menu_section(ui, "COLUMNS");
+            menu_section(ui, "VISIBLE");
             for (i, shown) in loaded.layout.visible.iter_mut().enumerate() {
                 ui.checkbox(
                     shown,
                     column_name(loaded.table.schema(), ColumnId(i as u32), loaded.encoding),
                 );
             }
-            menu_section(ui, "FREEZE");
-            ui.horizontal(|ui| {
-                ui.label("Leftmost columns:");
-                ui.add(
-                    egui::DragValue::new(&mut loaded.layout.frozen)
-                        .range(0..=loaded.table.schema().columns.len()),
-                );
-            });
             menu_section(ui, "RESET");
             if ui.button("Reset columns & view").clicked() {
                 // Column width/order/visibility/freeze, sort, and find/filter back to defaults.
@@ -1496,7 +1482,6 @@ fn grid(ui: &mut egui::Ui, loaded: &mut LoadedTable, palette: &theme::Palette) {
                 .resizable(true)
         })
         .collect();
-    let frozen = layout.frozen.min(displayed.len());
 
     // Keyboard: move the selected row + ⌘/Ctrl+C to copy it (unless typing in a text field).
     let mut scroll_to: Option<u64> = None;
@@ -1555,7 +1540,7 @@ fn grid(ui: &mut egui::Ui, loaded: &mut LoadedTable, palette: &theme::Palette) {
         .id_salt("tableizer-grid")
         .num_rows(total)
         .columns(table_columns)
-        .num_sticky_cols(frozen)
+        .num_sticky_cols(0)
         .headers(vec![egui_table::HeaderRow::new(palette.header_height)]);
     if let Some(row) = scroll_to {
         grid = grid.scroll_to_row(row, Some(egui::Align::Center));
