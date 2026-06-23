@@ -125,7 +125,7 @@ pub(crate) fn empty_view(ui: &mut egui::Ui, recent: &[PathBuf], to_open: &mut Op
         ui.label("Open a CSV, TSV, NDJSON, or Parquet file to get started.");
         ui.add_space(12.0);
         if ui.button("Open File…").clicked()
-            && let Some(path) = crate::model::pick_file()
+            && let Some(path) = rfd::FileDialog::new().pick_file()
         {
             *to_open = Some(path);
         }

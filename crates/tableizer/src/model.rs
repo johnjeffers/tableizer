@@ -76,20 +76,6 @@ pub(crate) fn cell_matches(text: &str, query: &str, case_sensitive: bool) -> boo
     }
 }
 
-/// The Open-file dialog, pre-filtered to the formats Tableizer reads, with an all-files escape hatch
-/// (detection still works on any file — the filter is only the dialog's default view).
-pub(crate) fn pick_file() -> Option<PathBuf> {
-    rfd::FileDialog::new()
-        .add_filter(
-            "Tabular data",
-            &[
-                "csv", "tsv", "tab", "txt", "ndjson", "jsonl", "parquet", "pqt",
-            ],
-        )
-        .add_filter("All files", &["*"])
-        .pick_file()
-}
-
 /// Open `path` behind the `ViewportSource` seam (the rest of the app is format-agnostic). The
 /// `dialect` is consulted only for [`Format::Delimited`]; the other readers carry their own schema.
 pub(crate) fn open_table(

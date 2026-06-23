@@ -17,7 +17,7 @@ pub(crate) fn menu_bar(ui: &mut egui::Ui, app: &mut TableizerApp, to_open: &mut 
     ui.menu_button("File", |ui| {
         ui.set_min_width(150.0);
         if ui.button("Open…").clicked() {
-            if let Some(path) = crate::model::pick_file() {
+            if let Some(path) = rfd::FileDialog::new().pick_file() {
                 *to_open = Some(path);
             }
             ui.close();

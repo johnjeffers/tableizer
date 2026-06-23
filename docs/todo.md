@@ -1,5 +1,7 @@
-- Footer shows
-  - file path | detected format | n cols, n rows | row(s) n selected
 - Package as a standard app
 - Create release artifacts for each OS
 - App should be allowed to be set as the default handler for CSV, TSV, etc.
+- Export
+  - Delimited (default to CSV, but allow user to pick)
+  - Parquet
+  - NDJSON
