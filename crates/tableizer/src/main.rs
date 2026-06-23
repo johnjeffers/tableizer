@@ -1866,17 +1866,19 @@ impl egui_table::TableDelegate for GridDelegate<'_> {
             egui::Id::new(("tz-col-drop", col_id.0)),
             egui::Sense::hover(),
         );
-        if let Some(dragged) = drop.dnd_hover_payload::<ColumnId>()
-            && *dragged != col_id
+        if drop
+            .dnd_hover_payload::<ColumnId>()
+            .is_some_and(|dragged| *dragged != col_id)
         {
-            let after = self
-                .columns
-                .iter()
-                .position(|&c| c == *dragged)
-                .is_some_and(|src| src < idx);
-            let x = if after { rect.right() - 1.5 } else { rect.left() + 1.5 };
+            // Highlight the whole header cell — the dragged column will take this column's slot.
             ui.painter()
-                .vline(x, rect.y_range(), egui::Stroke::new(3.0, self.palette.accent));
+                .rect_filled(rect, egui::CornerRadius::ZERO, self.palette.row_selected);
+            ui.painter().rect_stroke(
+                rect,
+                egui::CornerRadius::ZERO,
+                egui::Stroke::new(2.0, self.palette.accent),
+                egui::StrokeKind::Inside,
+            );
         }
         if let Some(dragged) = drop.dnd_release_payload::<ColumnId>()
             && *dragged != col_id
