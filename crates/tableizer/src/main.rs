@@ -1090,6 +1090,21 @@ fn menu_bar(ui: &mut egui::Ui, app: &mut TableizerApp, to_open: &mut Option<Path
                         .range(0..=loaded.table.schema().columns.len()),
                 );
             });
+            menu_section(ui, "RESET");
+            if ui.button("Reset columns & view").clicked() {
+                // Column width/order/visibility/freeze, sort, and find/filter back to defaults.
+                loaded.layout = GridLayout::new(loaded.table.schema().columns.len());
+                loaded.view.sort = None;
+                loaded.view.search.clear();
+                loaded.view.regex = false;
+                loaded.view.invert = false;
+                loaded.view.filter_mode = false;
+                loaded.view.selected_row = None;
+                // Drop egui_table's persisted column widths so they return to their initial size.
+                ui.ctx()
+                    .data_mut(|d| d.remove_by_type::<egui_table::TableState>());
+                ui.close();
+            }
         });
         ui.menu_button("Export", |ui| export_menu(ui, loaded));
     }
