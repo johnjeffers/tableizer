@@ -5,13 +5,13 @@
 default:
     @just --list
 
-# Open a file in the desktop app (release build)
-run file:
-    cargo run --release -p tableizer -- "{{file}}"
+# Open the desktop app (release build). Pass a file to open it directly, or omit to start empty.
+run file="":
+    if [ -n "{{file}}" ]; then cargo run --release -p tableizer -- "{{file}}"; else cargo run --release -p tableizer; fi
 
-# UI dev loop: auto-rebuild + re-run on save (debug build = fastest rebuilds)
-dev file:
-    cargo watch -x 'run -p tableizer -- {{file}}'
+# UI dev loop: auto-rebuild + re-run on save (debug build = fastest rebuilds). Optionally pass a file.
+dev file="":
+    if [ -n "{{file}}" ]; then cargo watch -x "run -p tableizer -- '{{file}}'"; else cargo watch -x "run -p tableizer"; fi
 
 # Run all tests
 test:

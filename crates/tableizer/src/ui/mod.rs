@@ -94,16 +94,35 @@ pub(crate) fn status_bar(ui: &mut egui::Ui, loaded: &LoadedTable, palette: &them
     });
 }
 
-/// The empty (no file) view.
+/// The empty (no file) view: an Open button (and recent files, if any). Mirrors File ▸ Open…, so a
+/// file can always be chosen from within the app — no CLI argument required.
 pub(crate) fn empty_view(ui: &mut egui::Ui, recent: &[PathBuf], to_open: &mut Option<PathBuf>) {
     ui.add_space(40.0);
     ui.vertical_centered(|ui| {
         ui.heading("Tableizer");
-        ui.label("Open a file via a CLI argument, or pick a recent one below.");
+        ui.label("Open a delimited file to get started.");
         ui.add_space(12.0);
-        for path in recent {
-            if ui.button(path.display().to_string()).clicked() {
-                *to_open = Some(path.clone());
+        if ui.button("Open File…").clicked()
+            && let Some(path) = rfd::FileDialog::new().pick_file()
+        {
+            *to_open = Some(path);
+        }
+        if !recent.is_empty() {
+            ui.add_space(16.0);
+            ui.label(egui::RichText::new("RECENT").weak());
+            ui.add_space(4.0);
+            for path in recent {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                if ui
+                    .button(name)
+                    .on_hover_text(path.display().to_string())
+                    .clicked()
+                {
+                    *to_open = Some(path.clone());
+                }
             }
         }
     });
