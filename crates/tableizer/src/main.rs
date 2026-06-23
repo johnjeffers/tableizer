@@ -311,28 +311,22 @@ mod fonts {
     /// Candidate OS-native UI font families, best first.
     fn os_ui_families() -> &'static [&'static str] {
         #[cfg(target_os = "macos")]
-        {
-            &[
-                "SF Pro Text",
-                "SF Pro",
-                ".AppleSystemUIFont",
-                "Helvetica Neue",
-            ]
-        }
+        return &[
+            "SF Pro Text",
+            "SF Pro",
+            ".AppleSystemUIFont",
+            "Helvetica Neue",
+        ];
         #[cfg(target_os = "windows")]
-        {
-            &["Segoe UI Variable Text", "Segoe UI"]
-        }
+        return &["Segoe UI Variable Text", "Segoe UI"];
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        {
-            &[
-                "Cantarell",
-                "Ubuntu",
-                "Noto Sans",
-                "DejaVu Sans",
-                "Liberation Sans",
-            ]
-        }
+        return &[
+            "Cantarell",
+            "Ubuntu",
+            "Noto Sans",
+            "DejaVu Sans",
+            "Liberation Sans",
+        ];
     }
 
     /// Bytes of the first of `names` that resolves to a parseable font in `db`.
