@@ -933,6 +933,8 @@ impl eframe::App for TableizerApp {
             View::Loaded(loaded) => Some(loaded.dialect),
             _ => None,
         };
+        // ⌘/Ctrl+F focuses the Find field.
+        let focus_find = ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F));
 
         egui::Panel::top("menu_bar").show_inside(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| menu_bar(ui, self, &mut to_open));
@@ -941,7 +943,7 @@ impl eframe::App for TableizerApp {
         if matches!(self.view, View::Loaded(_)) {
             egui::Panel::top("toolbar").show_inside(ui, |ui| {
                 if let View::Loaded(loaded) = &mut self.view {
-                    toolbar(ui, loaded);
+                    toolbar(ui, loaded, focus_find);
                 }
             });
         }
@@ -1370,16 +1372,19 @@ fn settings_window(
     *open = window_open;
 }
 
-/// The toolbar: dialect/header/encoding overrides, sort, and find/filter controls.
-fn toolbar(ui: &mut egui::Ui, loaded: &mut LoadedTable) {
+/// The toolbar: the find/filter controls. `focus_find` requests focus on the Find field (⌘/Ctrl+F).
+fn toolbar(ui: &mut egui::Ui, loaded: &mut LoadedTable, focus_find: bool) {
     let LoadedTable { view, .. } = loaded;
     ui.horizontal_wrapped(|ui| {
         ui.label("Find:");
-        ui.add(
+        let find = ui.add(
             egui::TextEdit::singleline(&mut view.search)
                 .hint_text("substring or regex")
                 .desired_width(180.0),
         );
+        if focus_find {
+            find.request_focus();
+        }
         ui.checkbox(&mut view.filter_mode, "Only show matches");
         ui.checkbox(&mut view.regex, "Regex");
         ui.checkbox(&mut view.invert, "Invert");
