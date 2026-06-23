@@ -47,15 +47,6 @@ fn sniff_file(path: &Path) -> Dialect {
     Dialect::sniff(&head)
 }
 
-/// Detect the text encoding from a leading byte-order mark; default to UTF-8.
-fn detect_encoding(path: &Path) -> &'static Encoding {
-    let mut bom = [0u8; 4];
-    let n = std::fs::File::open(path)
-        .and_then(|mut f| f.read(&mut bom))
-        .unwrap_or(0);
-    Encoding::for_bom(&bom[..n]).map_or(encoding_rs::UTF_8, |(enc, _)| enc)
-}
-
 /// Decode raw field bytes to display text in `encoding`, dropping a leading BOM the decoder surfaces.
 fn decode_field(bytes: &[u8], encoding: &'static Encoding) -> String {
     let (text, _, _) = encoding.decode(bytes);
@@ -224,7 +215,9 @@ impl TableizerApp {
 
     fn open_path(&mut self, path: PathBuf) {
         let dialect = sniff_file(&path);
-        let encoding = detect_encoding(&path);
+        // UTF-16 is transcoded to UTF-8 by the engine; single-byte encodings default to UTF-8 here and
+        // can be switched to Windows-1252 via the Encoding menu.
+        let encoding: &'static Encoding = encoding_rs::UTF_8;
         self.view = match open_table(&path, dialect) {
             Ok(table) => {
                 let layout = GridLayout::new(table.schema().columns.len());
@@ -331,6 +324,13 @@ fn show_table(
         } else {
             ui.label(format!("{}  ·  {total} rows", path.display()));
         }
+        let quality = table.data_quality();
+        if quality.complete && quality.ragged_rows > 0 {
+            ui.colored_label(
+                egui::Color32::from_rgb(230, 170, 60),
+                format!("⚠ {} ragged rows", quality.ragged_rows),
+            );
+        }
         ui.separator();
         dialect_menu(ui, dialect);
         ui.checkbox(&mut dialect.has_header, "Header row");
@@ -427,12 +427,7 @@ fn dialect_menu(ui: &mut egui::Ui, dialect: &mut Dialect) {
 
 fn encoding_menu(ui: &mut egui::Ui, encoding: &mut &'static Encoding) {
     ui.menu_button(format!("Encoding: {}", encoding.name()), |ui| {
-        for choice in [
-            encoding_rs::UTF_8,
-            encoding_rs::WINDOWS_1252,
-            encoding_rs::UTF_16LE,
-            encoding_rs::UTF_16BE,
-        ] {
+        for choice in [encoding_rs::UTF_8, encoding_rs::WINDOWS_1252] {
             if ui
                 .selectable_label(std::ptr::eq(*encoding, choice), choice.name())
                 .clicked()

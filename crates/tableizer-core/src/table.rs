@@ -18,8 +18,8 @@ use memmap2::Mmap;
 use crate::index::{OffsetIndex, record_reader};
 use crate::parse::Dialect;
 use crate::{
-    CancellationToken, Cell, Column, ColumnId, Error, InferredType, Result, RowCount, RowRange,
-    Schema, Viewport, ViewportRequest, ViewportSource,
+    CancellationToken, Cell, Column, ColumnId, DataQuality, Error, InferredType, Result, RowCount,
+    RowRange, Schema, Viewport, ViewportRequest, ViewportSource,
 };
 
 /// The byte source backing a table: either owned in-memory bytes or a memory-mapped file. Both
@@ -77,7 +77,7 @@ impl CsvTable {
     /// Open a file by memory-mapping it. Returns **immediately** (mmap + head parse); the offset
     /// index builds on a background thread so the first screen is never gated on a full scan.
     pub fn open(path: &Path, dialect: Dialect) -> Result<Self> {
-        let source = Source::Mmap(Arc::new(map_file(path)?));
+        let source = open_source(path)?;
         let schema = derive_schema(source.bytes(), &dialect);
         let index = Arc::new(Mutex::new(None));
         let frontier = Arc::new(AtomicU64::new(0));
@@ -171,6 +171,16 @@ impl ViewportSource for CsvTable {
                     cancel,
                 )
             }
+        }
+    }
+
+    fn data_quality(&self) -> DataQuality {
+        match self.index.lock().expect("index lock").as_ref() {
+            Some(index) => DataQuality {
+                ragged_rows: index.ragged_rows(),
+                complete: true,
+            },
+            None => DataQuality::default(),
         }
     }
 }
@@ -286,6 +296,21 @@ fn parse_io(e: csv::Error) -> Error {
     Error::Io(std::io::Error::other(e))
 }
 
+/// Build the byte source for a file: memory-mapped for single-byte encodings, or transcoded to UTF-8
+/// for UTF-16 (byte-level CSV parsing needs single-byte delimiters). UTF-16 is read fully into memory
+/// — fine for the small exports it's typically used for; huge UTF-16 files are not streamed.
+fn open_source(path: &Path) -> Result<Source> {
+    let mmap = map_file(path)?;
+    if let Some((encoding, _)) = encoding_rs::Encoding::for_bom(&mmap)
+        && (std::ptr::eq(encoding, encoding_rs::UTF_16LE)
+            || std::ptr::eq(encoding, encoding_rs::UTF_16BE))
+    {
+        let (utf8, _, _) = encoding.decode(&mmap); // also strips the BOM
+        return Ok(Source::Bytes(Arc::from(utf8.into_owned().into_bytes())));
+    }
+    Ok(Source::Mmap(Arc::new(mmap)))
+}
+
 /// Memory-map a file read-only.
 #[allow(unsafe_code)] // SAFETY justified at the `Mmap::map` call below.
 fn map_file(path: &Path) -> Result<Mmap> {
@@ -315,6 +340,28 @@ mod tests {
             has_header: false,
             ..Dialect::default()
         }
+    }
+
+    /// Point the index cache at a fresh tempdir so tests never touch the real OS state dir. Keep the
+    /// returned guard alive for the test's duration.
+    fn isolate_cache() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: each open-test holds its own cache guard; concurrent env reads only ever see *some*
+        // tempdir, and no test depends on a cross-test cache hit.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("TABLEIZER_CACHE_DIR", dir.path());
+        }
+        dir
+    }
+
+    /// Encode text as UTF-16LE with a BOM (for the transcoding test).
+    fn to_utf16le(s: &str) -> Vec<u8> {
+        let mut out = vec![0xFF, 0xFE];
+        for unit in s.encode_utf16() {
+            out.extend_from_slice(&unit.to_le_bytes());
+        }
+        out
     }
 
     /// Wait for a background build to finish (tiny test files complete almost instantly).
@@ -365,14 +412,7 @@ mod tests {
     #[test]
     fn opens_and_reads_a_file_via_mmap() {
         use std::io::Write;
-
-        // Isolate the index cache to a tempdir so the test never touches the real OS state dir.
-        let cache = tempfile::tempdir().unwrap();
-        // SAFETY: no other test reads/writes TABLEIZER_CACHE_DIR, so this single set is race-free.
-        #[allow(unsafe_code)]
-        unsafe {
-            std::env::set_var("TABLEIZER_CACHE_DIR", cache.path());
-        }
+        let _cache = isolate_cache();
 
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(b"x,y\n1,2\n3,4\n").unwrap();
@@ -430,5 +470,25 @@ mod tests {
             .unwrap();
         assert_eq!(viewport.rows[0][0].0.as_ref(), b"bob");
         assert_eq!(viewport.rows[0][1].0.as_ref(), b"30");
+    }
+
+    #[test]
+    fn opens_a_utf16le_file_by_transcoding_to_utf8() {
+        use std::io::Write;
+        let _cache = isolate_cache();
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&to_utf16le("a,b\n1,2\n3,4\n")).unwrap();
+
+        let table = CsvTable::open(file.path(), no_header()).unwrap();
+        await_indexed(&table);
+
+        // UTF-16 was transcoded to UTF-8, so the structure parses and cells are UTF-8 bytes.
+        assert!(matches!(table.row_count(), RowCount::Exact(3)));
+        let viewport = table
+            .fetch(&request(0, 3, &[0, 1]), &CancellationToken::new())
+            .unwrap();
+        assert_eq!(viewport.rows[0][0].0.as_ref(), b"a");
+        assert_eq!(viewport.rows[2][1].0.as_ref(), b"4");
     }
 }

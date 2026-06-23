@@ -35,6 +35,8 @@ pub struct OffsetIndex {
     /// `anchors[k]` is the byte offset of record `k * ANCHOR_INTERVAL`.
     anchors: Vec<u64>,
     row_count: u64,
+    /// Records whose field count differs from the first record's (a data-quality signal).
+    ragged_rows: u64,
     delimiter: u8,
     quote: u8,
 }
@@ -60,8 +62,15 @@ impl OffsetIndex {
         let mut anchors = Vec::new();
         let mut record = csv::ByteRecord::new();
         let mut row_count: u64 = 0;
+        let mut ragged_rows: u64 = 0;
+        let mut expected_cols: Option<usize> = None;
 
         while reader.read_byte_record(&mut record).map_err(parse_io)? {
+            match expected_cols {
+                None => expected_cols = Some(record.len()),
+                Some(cols) if record.len() != cols => ragged_rows += 1,
+                _ => {}
+            }
             if row_count.is_multiple_of(ANCHOR_INTERVAL) {
                 anchors.push(record_offset(&record));
             }
@@ -90,6 +99,7 @@ impl OffsetIndex {
         Ok(Self {
             anchors,
             row_count,
+            ragged_rows,
             delimiter: dialect.delimiter,
             quote: dialect.quote,
         })
@@ -98,6 +108,11 @@ impl OffsetIndex {
     /// Total number of records indexed.
     pub fn row_count(&self) -> u64 {
         self.row_count
+    }
+
+    /// Records whose field count differed from the first record's (a data-quality signal).
+    pub fn ragged_rows(&self) -> u64 {
+        self.ragged_rows
     }
 
     /// Byte offset where record `row` begins, or `None` if `row` is out of range.
@@ -133,12 +148,13 @@ impl OffsetIndex {
 
     /// Serialize the index to a compact little-endian blob for the on-disk cache (§4.7).
     pub(crate) fn serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(18 + self.anchors.len() * 8);
+        let mut out = Vec::with_capacity(26 + self.anchors.len() * 8);
         out.extend_from_slice(INDEX_MAGIC);
         out.extend_from_slice(&INDEX_VERSION.to_le_bytes());
         out.push(self.delimiter);
         out.push(self.quote);
         out.extend_from_slice(&self.row_count.to_le_bytes());
+        out.extend_from_slice(&self.ragged_rows.to_le_bytes());
         out.extend_from_slice(&(self.anchors.len() as u64).to_le_bytes());
         for &anchor in &self.anchors {
             out.extend_from_slice(&anchor.to_le_bytes());
@@ -160,6 +176,7 @@ impl OffsetIndex {
         let delimiter = read_u8(bytes, &mut pos)?;
         let quote = read_u8(bytes, &mut pos)?;
         let row_count = read_u64(bytes, &mut pos)?;
+        let ragged_rows = read_u64(bytes, &mut pos)?;
         let anchor_count = read_u64(bytes, &mut pos)?;
         let mut anchors = Vec::new();
         for _ in 0..anchor_count {
@@ -168,6 +185,7 @@ impl OffsetIndex {
         Some(Self {
             anchors,
             row_count,
+            ragged_rows,
             delimiter,
             quote,
         })
@@ -201,7 +219,7 @@ fn parse_io(e: csv::Error) -> Error {
 
 /// On-disk index format magic + version (bumped on any layout change to invalidate old caches).
 const INDEX_MAGIC: &[u8; 4] = b"TZIX";
-const INDEX_VERSION: u32 = 1;
+const INDEX_VERSION: u32 = 2;
 
 /// Little-endian read helpers for the cache format (shared with [`crate::cache`]). Each returns
 /// `None` (rather than panicking) when the buffer is too short — corrupt caches fail safely.
@@ -346,5 +364,17 @@ mod tests {
     fn deserialize_rejects_a_bad_blob() {
         assert!(OffsetIndex::deserialize(b"not an index at all").is_none());
         assert!(OffsetIndex::deserialize(&[]).is_none());
+    }
+
+    #[test]
+    fn counts_ragged_rows_and_round_trips_them() {
+        // Record 1 ("c,d,e") has 3 fields vs the first record's 2 → one ragged row.
+        let csv: &[u8] = b"a,b\nc,d,e\nf,g\n";
+        let index = OffsetIndex::build(csv, &Dialect::default()).unwrap();
+        assert_eq!(index.row_count(), 3);
+        assert_eq!(index.ragged_rows(), 1);
+
+        let restored = OffsetIndex::deserialize(&index.serialize()).expect("valid blob");
+        assert_eq!(restored.ragged_rows(), 1);
     }
 }

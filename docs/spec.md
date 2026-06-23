@@ -316,10 +316,10 @@ the same change that completes the work.
 - ✅ **Real CSV/TSV/custom-delimiter parsing + header detection** — `Dialect::sniff` (delimiter +
   header heuristics) auto-detected on open; header row names the columns and is excluded from the data;
   the app talks to a `Box<dyn ViewportSource>` (format seam, §4.5); delimiter + header are user-overridable.
-- ◐ **Encoding** — BOM detection + single-byte display decode (UTF-8 / Latin-1 / Windows-1252) via
-  `encoding_rs`, raw bytes stay canonical (byte fidelity); user-overridable. *UTF-16 parsing deferred*
-  (byte-level CSV parsing assumes single-byte delimiters; needs transcoding — documented). Malformed-row
-  *resilience* is in (ragged rows tolerated, never crash); a data-quality indicator UI is not yet surfaced.
+- ✅ **Encoding + malformed-row resilience** — BOM detection; UTF-8 / Latin-1 / Windows-1252 display decode
+  (raw bytes stay canonical — byte fidelity), user-overridable; **UTF-16 transcoded to UTF-8 at open** (small
+  files; huge UTF-16 isn't streamed — documented). Ragged rows are tolerated (never crash) and **counted +
+  surfaced as a "⚠ N ragged rows" badge** once indexing completes.
 - ✅ Continuous virtualised scroll + column show/hide/reorder (done in Phase 0 / grid spike).
   **Pagination dropped** — scroll supersedes it (§3.2).
 - ✅ **Search, clipboard, persistence, cache UI, recent-files.** Substring-match highlight (cell-level);

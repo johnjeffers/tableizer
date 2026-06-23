@@ -100,4 +100,19 @@ pub trait ViewportSource {
     /// Fetch one viewport slice. Must be cheap (Tier A) once the offset index exists, and must
     /// honour `cancel` so a fast-scrolling UI can abandon in-flight requests.
     fn fetch(&self, request: &ViewportRequest, cancel: &CancellationToken) -> Result<Viewport>;
+
+    /// A coarse data-quality summary surfaced to the user (ragged rows, …). Defaults to empty/unknown
+    /// so formats that don't track it need not implement it.
+    fn data_quality(&self) -> DataQuality {
+        DataQuality::default()
+    }
+}
+
+/// Coarse data-quality summary for the open table (spec §3.1 / §5).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DataQuality {
+    /// Records whose field count differs from the first row, once known.
+    pub ragged_rows: u64,
+    /// Whether the figures are final (the index finished building).
+    pub complete: bool,
 }

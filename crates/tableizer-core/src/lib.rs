@@ -22,6 +22,6 @@ pub use error::{Error, Result};
 pub use index::Progress;
 pub use table::CsvTable;
 pub use viewport::{
-    Cell, Column, ColumnId, InferredType, RowCount, RowRange, Schema, Viewport, ViewportRequest,
-    ViewportSource,
+    Cell, Column, ColumnId, DataQuality, InferredType, RowCount, RowRange, Schema, Viewport,
+    ViewportRequest, ViewportSource,
 };

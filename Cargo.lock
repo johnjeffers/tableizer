@@ -3016,6 +3016,7 @@ version = "0.0.0"
 dependencies = [
  "csv",
  "directories",
+ "encoding_rs",
  "memmap2",
  "tempfile",
  "thiserror 2.0.18",
