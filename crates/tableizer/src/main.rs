@@ -204,11 +204,23 @@ mod theme {
         };
 
         let text_styles = BTreeMap::from([
-            (TextStyle::Small, FontId::new(11.0, FontFamily::Proportional)),
+            (
+                TextStyle::Small,
+                FontId::new(11.0, FontFamily::Proportional),
+            ),
             (TextStyle::Body, FontId::new(13.5, FontFamily::Proportional)),
-            (TextStyle::Button, FontId::new(13.5, FontFamily::Proportional)),
-            (TextStyle::Heading, FontId::new(19.0, FontFamily::Proportional)),
-            (TextStyle::Monospace, FontId::new(12.5, FontFamily::Monospace)),
+            (
+                TextStyle::Button,
+                FontId::new(13.5, FontFamily::Proportional),
+            ),
+            (
+                TextStyle::Heading,
+                FontId::new(19.0, FontFamily::Proportional),
+            ),
+            (
+                TextStyle::Monospace,
+                FontId::new(12.5, FontFamily::Monospace),
+            ),
         ]);
         let style = Style {
             visuals,
@@ -298,7 +310,12 @@ mod fonts {
     fn os_ui_families() -> &'static [&'static str] {
         #[cfg(target_os = "macos")]
         {
-            &["SF Pro Text", "SF Pro", ".AppleSystemUIFont", "Helvetica Neue"]
+            &[
+                "SF Pro Text",
+                "SF Pro",
+                ".AppleSystemUIFont",
+                "Helvetica Neue",
+            ]
         }
         #[cfg(target_os = "windows")]
         {
@@ -306,7 +323,13 @@ mod fonts {
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
-            &["Cantarell", "Ubuntu", "Noto Sans", "DejaVu Sans", "Liberation Sans"]
+            &[
+                "Cantarell",
+                "Ubuntu",
+                "Noto Sans",
+                "DejaVu Sans",
+                "Liberation Sans",
+            ]
         }
     }
 
@@ -328,19 +351,43 @@ mod fonts {
         None
     }
 
-    /// Sorted installed font families, each paired with a monospaced flag (true if any of the
-    /// family's faces is monospaced) — for the picker's "Monospace" filter.
-    pub fn installed_families(db: &fontdb::Database) -> Vec<(String, bool)> {
+    /// Whether a face is actually monospaced, measured by comparing the advance widths of a narrow
+    /// and a wide glyph. `fontdb`'s `monospaced` flag only reads `post.isFixedPitch`, which some
+    /// genuinely-monospaced fonts (e.g. Monaco) leave unset — so we measure to be sure.
+    fn measured_monospaced(db: &fontdb::Database, id: fontdb::ID) -> bool {
+        use ab_glyph::Font;
+        db.with_face_data(id, |data, index| {
+            let Ok(font) = ab_glyph::FontRef::try_from_slice_and_index(data, index) else {
+                return false;
+            };
+            let (i, m) = (font.glyph_id('i'), font.glyph_id('M'));
+            if i.0 == 0 || m.0 == 0 {
+                return false; // not a Latin text font
+            }
+            let narrow = font.h_advance_unscaled(i);
+            let wide = font.h_advance_unscaled(m);
+            narrow > 0.0 && (narrow - wide).abs() < 1.0
+        })
+        .unwrap_or(false)
+    }
+
+    /// Sorted installed font families, each paired with a monospaced flag — for the picker's
+    /// "Monospace" filter. When `measure` is false the flag is just `fontdb`'s declaration (fast,
+    /// metadata only); when true it falls back to a measured advance-width check (catches fonts like
+    /// Monaco that don't declare it, but parses each family's font, so it runs off the UI thread).
+    pub fn installed_families(db: &fontdb::Database, measure: bool) -> Vec<(String, bool)> {
         use std::collections::BTreeMap;
         let mut families: BTreeMap<String, bool> = BTreeMap::new();
         for face in db.faces() {
+            let Some((name, _)) = face.families.first() else {
+                continue;
+            };
             // Skip private system fonts: macOS hides families whose name starts with '.'.
-            if let Some((name, _)) = face.families.first()
-                && !name.starts_with('.')
-            {
-                let mono = families.entry(name.clone()).or_insert(false);
-                *mono |= face.monospaced;
+            if name.starts_with('.') || families.contains_key(name) {
+                continue;
             }
+            let mono = face.monospaced || (measure && measured_monospaced(db, face.id));
+            families.insert(name.clone(), mono);
         }
         families.into_iter().collect()
     }
@@ -443,7 +490,9 @@ fn delimiter_label(delimiter: u8) -> String {
 /// Parse the custom-delimiter field: a single ASCII character, or a hex byte as `0xNN` / `\xNN`.
 /// Returns `None` for anything that isn't a single byte (so the field can be edited mid-entry).
 fn parse_delimiter(input: &str) -> Option<u8> {
-    if let Some(hex) = input.strip_prefix("0x").or_else(|| input.strip_prefix("\\x"))
+    if let Some(hex) = input
+        .strip_prefix("0x")
+        .or_else(|| input.strip_prefix("\\x"))
         && hex.len() == 2
     {
         return u8::from_str_radix(hex, 16).ok();
@@ -755,9 +804,11 @@ struct TableizerApp {
     /// `(settings, system_dark)` last pushed to egui — restyle only when this changes.
     applied_theme: Option<(theme::Settings, bool)>,
     /// System font database (for the chrome font + the table-font picker).
-    fonts_db: fontdb::Database,
+    fonts_db: std::sync::Arc<fontdb::Database>,
     /// Installed font families + a monospaced flag (cached for the picker).
     font_families: Vec<(String, bool)>,
+    /// Receives the background-measured family list (full monospace flags); `None` once applied.
+    font_rx: Option<std::sync::mpsc::Receiver<Vec<(String, bool)>>>,
     /// Table font last pushed to egui — rebuild the font atlas only when this changes.
     applied_table_font: Option<String>,
     /// Filter text in the table-font picker (inside the Settings window).
@@ -770,9 +821,19 @@ struct TableizerApp {
 
 impl TableizerApp {
     fn new(path: Option<PathBuf>) -> Self {
-        let mut fonts_db = fontdb::Database::new();
-        fonts_db.load_system_fonts();
-        let font_families = fonts::installed_families(&fonts_db);
+        let mut db = fontdb::Database::new();
+        db.load_system_fonts();
+        // Fast family list now (metadata only); refine monospace flags off-thread (parsing fonts to
+        // measure advances is slow, and would otherwise stall startup).
+        let font_families = fonts::installed_families(&db, false);
+        let fonts_db = std::sync::Arc::new(db);
+        let (font_tx, font_rx) = std::sync::mpsc::channel();
+        {
+            let fonts_db = std::sync::Arc::clone(&fonts_db);
+            std::thread::spawn(move || {
+                let _ = font_tx.send(fonts::installed_families(&fonts_db, true));
+            });
+        }
         let mut app = Self {
             view: View::Empty,
             recent: recent::load(),
@@ -780,6 +841,7 @@ impl TableizerApp {
             applied_theme: None,
             fonts_db,
             font_families,
+            font_rx: Some(font_rx),
             applied_table_font: None,
             font_search: String::new(),
             font_mono_only: false,
@@ -841,6 +903,13 @@ impl TableizerApp {
 impl eframe::App for TableizerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+
+        // Pick up the background-measured font-family list (full monospace flags) when it's ready.
+        let measured = self.font_rx.as_ref().and_then(|rx| rx.try_recv().ok());
+        if let Some(families) = measured {
+            self.font_families = families;
+            self.font_rx = None;
+        }
 
         // Resolve the theme (following the OS for `Auto`) and restyle only when it changes.
         let system_dark = ctx.system_theme().is_none_or(|t| t == egui::Theme::Dark);
@@ -1029,10 +1098,7 @@ fn menu_bar(ui: &mut egui::Ui, app: &mut TableizerApp, to_open: &mut Option<Path
     });
 
     // Settings opens a window (not a dropdown), so it's a plain menu-bar button.
-    if ui
-        .add(egui::Button::new("Settings").frame(false))
-        .clicked()
-    {
+    if ui.add(egui::Button::new("Settings").frame(false)).clicked() {
         app.settings_open = !app.settings_open;
     }
 }
@@ -1191,7 +1257,11 @@ fn settings_window(
                 .min_col_width(64.0)
                 .show(ui, |ui| {
                     ui.label("Theme");
-                    segmented(ui, &mut settings.mode, &theme::Mode::ALL.map(|m| (m, m.label())));
+                    segmented(
+                        ui,
+                        &mut settings.mode,
+                        &theme::Mode::ALL.map(|m| (m, m.label())),
+                    );
                     ui.end_row();
 
                     ui.label("Accent");
@@ -1241,7 +1311,9 @@ fn settings_window(
             );
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(egui::RichText::new("The quick brown fox  ·  0123456789").font(preview_font));
+                ui.label(
+                    egui::RichText::new("The quick brown fox  ·  0123456789").font(preview_font),
+                );
             });
             ui.add_space(8.0);
 
@@ -1262,7 +1334,13 @@ fn settings_window(
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         let row_w = ui.available_width();
-                        if menu_choice(ui, row_w, settings.table_font.is_none(), None, "App font (default)") {
+                        if menu_choice(
+                            ui,
+                            row_w,
+                            settings.table_font.is_none(),
+                            None,
+                            "App font (default)",
+                        ) {
                             settings.table_font = None;
                         }
                         let query = font_search.to_lowercase();
@@ -1301,7 +1379,7 @@ fn toolbar(ui: &mut egui::Ui, loaded: &mut LoadedTable) {
                 .hint_text("substring or regex")
                 .desired_width(180.0),
         );
-        ui.checkbox(&mut view.filter_mode, "Hide non-matching");
+        ui.checkbox(&mut view.filter_mode, "Only show matches");
         ui.checkbox(&mut view.regex, "Regex");
         ui.checkbox(&mut view.invert, "Invert");
     });
@@ -1470,9 +1548,11 @@ fn grid(ui: &mut egui::Ui, loaded: &mut LoadedTable, palette: &theme::Palette) {
     view.hovered_row = delegate.new_hovered;
 
     // Copy the targeted row (context "Copy row", or ⌘/Ctrl+C on the selection) as a TSV line.
-    let copy_target = delegate
-        .copy_row
-        .or(if copy_request { view.selected_row } else { None });
+    let copy_target = delegate.copy_row.or(if copy_request {
+        view.selected_row
+    } else {
+        None
+    });
     if let Some(row) = copy_target {
         let request = ViewportRequest {
             rows: RowRange { start: row, len: 1 },
@@ -1801,12 +1881,18 @@ impl egui_table::TableDelegate for GridDelegate<'_> {
                 .rect_filled(cell_rect, egui::CornerRadius::ZERO, self.palette.row_hover);
         }
         if Some(cell.row_nr) == self.selected_row {
-            ui.painter()
-                .rect_filled(cell_rect, egui::CornerRadius::ZERO, self.palette.row_selected);
+            ui.painter().rect_filled(
+                cell_rect,
+                egui::CornerRadius::ZERO,
+                self.palette.row_selected,
+            );
         }
         if cell_matches(&text, &self.search) {
-            ui.painter()
-                .rect_filled(cell_rect, egui::CornerRadius::ZERO, self.palette.search_match);
+            ui.painter().rect_filled(
+                cell_rect,
+                egui::CornerRadius::ZERO,
+                self.palette.search_match,
+            );
         }
 
         // Right-align numeric columns; show empty (null) cells as a faint placeholder.

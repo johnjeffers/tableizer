@@ -1,0 +1,5 @@
+- main table
+  - remove padding around main table
+  - support clicking column headers for sort (asc, desc, none)
+  - double-click separator to auto-size to largest value
+  - select on click-drag instead of scroll
