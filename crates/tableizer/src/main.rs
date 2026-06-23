@@ -1038,7 +1038,7 @@ fn menu_bar(ui: &mut egui::Ui, app: &mut TableizerApp, to_open: &mut Option<Path
             }
             ui.close();
         }
-        ui.menu_button("Recent", |ui| {
+        ui.menu_button("Open Recent", |ui| {
             if app.recent.is_empty() {
                 ui.label("(none)");
             }
@@ -1057,8 +1057,15 @@ fn menu_bar(ui: &mut egui::Ui, app: &mut TableizerApp, to_open: &mut Option<Path
                 }
             }
         });
-        ui.separator();
         let loaded = matches!(app.view, View::Loaded(_));
+        ui.add_enabled_ui(loaded, |ui| {
+            ui.menu_button("Export", |ui| {
+                if let View::Loaded(loaded) = &app.view {
+                    export_menu(ui, loaded);
+                }
+            });
+        });
+        ui.separator();
         if ui.add_enabled(loaded, egui::Button::new("Close")).clicked() {
             app.view = View::Empty;
             ui.close();
@@ -1092,7 +1099,6 @@ fn menu_bar(ui: &mut egui::Ui, app: &mut TableizerApp, to_open: &mut Option<Path
                 ui.close();
             }
         });
-        ui.menu_button("Export", |ui| export_menu(ui, loaded));
     }
 
     // Settings opens a window (not a dropdown), so it's a plain menu-bar button.
