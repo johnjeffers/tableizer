@@ -1616,70 +1616,73 @@ fn fmt_count(n: u64) -> String {
 /// The Parsing menu: delimiter (presets + custom), header row, and display encoding. Changing the
 /// delimiter or header re-opens the file (column structure may change); encoding is display-only.
 fn parsing_menu(ui: &mut egui::Ui, loaded: &mut LoadedTable) {
-    ui.set_min_width(196.0);
+    ui.set_min_width(180.0);
 
-    menu_section(ui, "DELIMITER");
-    // Auto is the default; presets/custom are explicit overrides for when sniffing guessed wrong.
-    let detected = loaded.detected_delimiter;
-    if menu_choice(
-        ui,
-        186.0,
-        loaded.delimiter_auto,
-        None,
-        &format!("Auto · detected {}", delimiter_label(detected)),
-    ) {
-        loaded.dialect.delimiter = detected;
-        loaded.delimiter_auto = true;
-        loaded.delimiter_input = delimiter_display(detected);
-    }
-    for (label, byte) in [
-        ("Comma", b','),
-        ("Tab", b'\t'),
-        ("Semicolon", b';'),
-        ("Pipe", b'|'),
-    ] {
+    ui.checkbox(&mut loaded.dialect.has_header, "Header row");
+
+    ui.menu_button("Delimiter", |ui| {
+        ui.set_min_width(196.0);
+        // Auto is the default; presets/custom are explicit overrides for when sniffing guessed wrong.
+        let detected = loaded.detected_delimiter;
         if menu_choice(
             ui,
             186.0,
-            !loaded.delimiter_auto && loaded.dialect.delimiter == byte,
+            loaded.delimiter_auto,
             None,
-            label,
+            &format!("Auto · detected {}", delimiter_label(detected)),
         ) {
-            loaded.dialect.delimiter = byte;
-            loaded.delimiter_auto = false;
-            loaded.delimiter_input = delimiter_display(byte);
+            loaded.dialect.delimiter = detected;
+            loaded.delimiter_auto = true;
+            loaded.delimiter_input = delimiter_display(detected);
         }
-    }
-    ui.horizontal(|ui| {
-        ui.label("Custom:");
-        ui.add(
-            egui::TextEdit::singleline(&mut loaded.delimiter_input)
-                .desired_width(54.0)
-                .hint_text(": or 0x01"),
-        );
-        if ui.button("Set").clicked()
-            && let Some(byte) = parse_delimiter(&loaded.delimiter_input)
-        {
-            loaded.dialect.delimiter = byte;
-            loaded.delimiter_auto = false;
+        for (label, byte) in [
+            ("Comma", b','),
+            ("Tab", b'\t'),
+            ("Semicolon", b';'),
+            ("Pipe", b'|'),
+        ] {
+            if menu_choice(
+                ui,
+                186.0,
+                !loaded.delimiter_auto && loaded.dialect.delimiter == byte,
+                None,
+                label,
+            ) {
+                loaded.dialect.delimiter = byte;
+                loaded.delimiter_auto = false;
+                loaded.delimiter_input = delimiter_display(byte);
+            }
         }
+        ui.horizontal(|ui| {
+            ui.label("Custom:");
+            ui.add(
+                egui::TextEdit::singleline(&mut loaded.delimiter_input)
+                    .desired_width(54.0)
+                    .hint_text(": or 0x01"),
+            );
+            if ui.button("Set").clicked()
+                && let Some(byte) = parse_delimiter(&loaded.delimiter_input)
+            {
+                loaded.dialect.delimiter = byte;
+                loaded.delimiter_auto = false;
+            }
+        });
     });
 
-    menu_section(ui, "HEADER");
-    ui.checkbox(&mut loaded.dialect.has_header, "First row is a header");
-
-    menu_section(ui, "ENCODING");
-    for choice in [encoding_rs::UTF_8, encoding_rs::WINDOWS_1252] {
-        if menu_choice(
-            ui,
-            186.0,
-            std::ptr::eq(loaded.encoding, choice),
-            None,
-            choice.name(),
-        ) {
-            loaded.encoding = choice;
+    ui.menu_button("Encoding", |ui| {
+        ui.set_min_width(160.0);
+        for choice in [encoding_rs::UTF_8, encoding_rs::WINDOWS_1252] {
+            if menu_choice(
+                ui,
+                150.0,
+                std::ptr::eq(loaded.encoding, choice),
+                None,
+                choice.name(),
+            ) {
+                loaded.encoding = choice;
+            }
         }
-    }
+    });
 }
 
 /// Export the table to a user-chosen file (native save dialog). Errors are reported to stderr.
