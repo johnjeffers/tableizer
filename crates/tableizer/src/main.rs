@@ -1808,15 +1808,18 @@ impl egui_table::TableDelegate for GridDelegate<'_> {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
         }
         ui.add_space(2.0);
-        ui.add(
-            egui::Label::new(
-                egui::RichText::new(name.to_uppercase())
-                    .color(self.palette.header_text)
-                    .size(11.0),
-            )
-            .selectable(false)
-            .truncate(),
-        );
+        let name_label = egui::Label::new(
+            egui::RichText::new(name.to_uppercase())
+                .color(self.palette.header_text)
+                .size(11.0),
+        )
+        .selectable(false);
+        // Auto-size (double-click separator) must also fit the header name → measure it in full.
+        ui.add(if ui.is_sizing_pass() {
+            name_label.wrap_mode(egui::TextWrapMode::Extend)
+        } else {
+            name_label.truncate()
+        });
 
         // Sort indicator: a small accent triangle on the sorted column (painted, not a glyph).
         if let Some(sort) = self.sort
@@ -1970,9 +1973,16 @@ impl egui_table::TableDelegate for GridDelegate<'_> {
         } else {
             egui::Label::new(egui::RichText::new(text.as_str()).font(font))
         }
-        .selectable(false)
-        .truncate();
-        // 10px of leading padding so text never touches the column edge; numeric columns align right.
+        .selectable(false);
+        // During the auto-size (sizing) pass, measure the full text rather than truncating, so a
+        // double-clicked separator fits the widest value.
+        let label = if ui.is_sizing_pass() {
+            label.wrap_mode(egui::TextWrapMode::Extend)
+        } else {
+            label.truncate()
+        };
+        // 10px of padding on both sides so text never touches the column edge (and so auto-size
+        // leaves the same margin); numeric columns align right.
         let layout = if numeric {
             egui::Layout::right_to_left(egui::Align::Center)
         } else {
@@ -1981,6 +1991,7 @@ impl egui_table::TableDelegate for GridDelegate<'_> {
         ui.with_layout(layout, |ui| {
             ui.add_space(10.0);
             ui.add(label);
+            ui.add_space(10.0);
         });
 
         // Right-click: copy this cell, or the whole row as TSV (handled after `show`).
