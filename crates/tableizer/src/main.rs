@@ -105,15 +105,40 @@ mod theme {
     }
 
     /// Persisted, user-editable theme settings.
-    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
     pub struct Settings {
+        #[serde(default)]
         pub mode: Mode,
+        #[serde(default)]
         pub accent: Accent,
+        #[serde(default)]
         pub density: Density,
+        /// Data-cell font family (a system font name); `None` = use the app font.
+        #[serde(default)]
+        pub table_font: Option<String>,
+        /// Data-cell font size, in points.
+        #[serde(default = "default_table_font_size")]
+        pub table_font_size: f32,
+    }
+
+    fn default_table_font_size() -> f32 {
+        13.5
+    }
+
+    impl Default for Settings {
+        fn default() -> Self {
+            Self {
+                mode: Mode::default(),
+                accent: Accent::default(),
+                density: Density::default(),
+                table_font: None,
+                table_font_size: default_table_font_size(),
+            }
+        }
     }
 
     /// Extra colors + metrics the custom grid/toolbar painting needs (beyond the egui [`Style`]).
-    #[derive(Clone, Copy)]
+    #[derive(Clone)]
     pub struct Palette {
         pub header_bg: Color32,
         pub header_text: Color32,
@@ -126,10 +151,12 @@ mod theme {
         pub border: Color32,
         pub row_height: f32,
         pub header_height: f32,
+        /// Font used for data cells (the user-chosen family + size).
+        pub table_font: FontId,
     }
 
     /// Whether `settings` resolves to dark, given the OS preference.
-    pub fn is_dark(settings: Settings, system_dark: bool) -> bool {
+    pub fn is_dark(settings: &Settings, system_dark: bool) -> bool {
         match settings.mode {
             Mode::Auto => system_dark,
             Mode::Light => false,
@@ -142,7 +169,7 @@ mod theme {
     }
 
     /// Build the egui [`Style`] + [`Palette`] for `settings` under the given OS theme.
-    pub fn build(settings: Settings, system_dark: bool) -> (Style, Palette) {
+    pub fn build(settings: &Settings, system_dark: bool) -> (Style, Palette) {
         let dark = is_dark(settings, system_dark);
         let accent = settings.accent.color();
         let comfortable = settings.density == Density::Comfortable;
@@ -222,6 +249,10 @@ mod theme {
             },
             row_height: if comfortable { 26.0 } else { 20.0 },
             header_height: if comfortable { 30.0 } else { 24.0 },
+            table_font: FontId::new(
+                settings.table_font_size,
+                FontFamily::Name(crate::fonts::TABLE_FONT.into()),
+            ),
         };
         (style, palette)
     }
@@ -240,28 +271,117 @@ fn main() -> eframe::Result<()> {
         "Tableizer",
         native_options,
         Box::new(move |cc| {
-            setup_fonts(&cc.egui_ctx);
+            let mut app = TableizerApp::new(path);
+            app.install_fonts(&cc.egui_ctx); // chrome + table fonts; re-installed on change in `ui`
             // The theme (`theme` module) is resolved and applied each frame in `App::ui`.
-            Ok(Box::new(TableizerApp::new(path)))
+            Ok(Box::new(app))
         }),
     )
 }
 
-/// Install the bundled Inter font (OFL — see `assets/Inter-OFL.txt`) as the primary proportional UI
-/// font, ahead of egui's defaults (which stay as fallbacks for glyphs Inter lacks).
-fn setup_fonts(ctx: &egui::Context) {
+/// Font management: an OS-native chrome font (with bundled Inter as a cross-platform fallback) and a
+/// user-selectable data-cell font, both resolved from the system font database via `fontdb`.
+mod fonts {
+    use eframe::egui::{FontData, FontDefinitions, FontFamily};
     use std::sync::Arc;
-    let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert(
-        "Inter".to_owned(),
-        Arc::new(egui::FontData::from_static(include_bytes!(
-            "../assets/InterVariable.ttf"
-        ))),
-    );
-    if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-        family.insert(0, "Inter".to_owned());
+
+    /// egui custom-family name used for data cells.
+    pub const TABLE_FONT: &str = "table";
+
+    /// Whether ab_glyph (egui's font backend) can parse these bytes — guards the atlas build against
+    /// unsupported fonts crashing the app.
+    fn parseable(data: &[u8]) -> bool {
+        ab_glyph::FontRef::try_from_slice(data).is_ok()
     }
-    ctx.set_fonts(fonts);
+
+    /// Candidate OS-native UI font families, best first.
+    fn os_ui_families() -> &'static [&'static str] {
+        #[cfg(target_os = "macos")]
+        {
+            &["SF Pro Text", "SF Pro", ".AppleSystemUIFont", "Helvetica Neue"]
+        }
+        #[cfg(target_os = "windows")]
+        {
+            &["Segoe UI Variable Text", "Segoe UI"]
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            &["Cantarell", "Ubuntu", "Noto Sans", "DejaVu Sans", "Liberation Sans"]
+        }
+    }
+
+    /// Bytes of the first of `names` that resolves to a parseable font in `db`.
+    fn load_family(db: &fontdb::Database, names: &[&str]) -> Option<Vec<u8>> {
+        for &name in names {
+            let Some(id) = db.query(&fontdb::Query {
+                families: &[fontdb::Family::Name(name)],
+                ..Default::default()
+            }) else {
+                continue;
+            };
+            if let Some(bytes) = db.with_face_data(id, |data, _| data.to_vec())
+                && parseable(&bytes)
+            {
+                return Some(bytes);
+            }
+        }
+        None
+    }
+
+    /// Sorted, de-duplicated list of installed font family names (for the picker).
+    pub fn installed_families(db: &fontdb::Database) -> Vec<String> {
+        let mut names: Vec<String> = db
+            .faces()
+            .filter_map(|face| face.families.first().map(|(name, _)| name.clone()))
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
+    /// Build egui font definitions: OS-native proportional chrome font (+ bundled Inter + egui's
+    /// defaults as fallbacks), and the chosen `table_family` for data cells (falling back to the
+    /// proportional stack when unset or unloadable).
+    pub fn definitions(db: &fontdb::Database, table_family: Option<&str>) -> FontDefinitions {
+        let mut fonts = FontDefinitions::default();
+
+        let mut proportional = Vec::new();
+        if let Some(bytes) = load_family(db, os_ui_families()) {
+            fonts
+                .font_data
+                .insert("os-ui".to_owned(), Arc::new(FontData::from_owned(bytes)));
+            proportional.push("os-ui".to_owned());
+        }
+        fonts.font_data.insert(
+            "Inter".to_owned(),
+            Arc::new(FontData::from_static(include_bytes!(
+                "../assets/InterVariable.ttf"
+            ))),
+        );
+        proportional.push("Inter".to_owned());
+        if let Some(defaults) = fonts.families.get(&FontFamily::Proportional) {
+            proportional.extend(defaults.iter().cloned());
+        }
+        fonts
+            .families
+            .insert(FontFamily::Proportional, proportional.clone());
+
+        let mut table = Vec::new();
+        if let Some(name) = table_family
+            && let Some(bytes) = load_family(db, &[name])
+        {
+            fonts
+                .font_data
+                .insert("table".to_owned(), Arc::new(FontData::from_owned(bytes)));
+            table.push("table".to_owned());
+        }
+        table.extend(proportional);
+        fonts
+            .families
+            .insert(FontFamily::Name(TABLE_FONT.into()), table);
+
+        fonts
+    }
 }
 
 /// Read a head sample and auto-detect the dialect (delimiter + header); fall back to the default.
@@ -628,20 +748,45 @@ struct TableizerApp {
     theme: theme::Settings,
     /// `(settings, system_dark)` last pushed to egui — restyle only when this changes.
     applied_theme: Option<(theme::Settings, bool)>,
+    /// System font database (for the chrome font + the table-font picker).
+    fonts_db: fontdb::Database,
+    /// Installed family names (cached for the picker).
+    font_families: Vec<String>,
+    /// Table font last pushed to egui — rebuild the font atlas only when this changes.
+    applied_table_font: Option<String>,
+    /// Filter text in the table-font picker.
+    font_search: String,
+    /// Whether the table-font picker window is open.
+    font_picker_open: bool,
 }
 
 impl TableizerApp {
     fn new(path: Option<PathBuf>) -> Self {
+        let mut fonts_db = fontdb::Database::new();
+        fonts_db.load_system_fonts();
+        let font_families = fonts::installed_families(&fonts_db);
         let mut app = Self {
             view: View::Empty,
             recent: recent::load(),
             theme: prefs::load(),
             applied_theme: None,
+            fonts_db,
+            font_families,
+            applied_table_font: None,
+            font_search: String::new(),
+            font_picker_open: false,
         };
         if let Some(path) = path {
             app.open_path(path);
         }
         app
+    }
+
+    /// Rebuild and install the font atlas (chrome + table fonts) for the current settings.
+    fn install_fonts(&mut self, ctx: &egui::Context) {
+        let definitions = fonts::definitions(&self.fonts_db, self.theme.table_font.as_deref());
+        ctx.set_fonts(definitions);
+        self.applied_table_font = self.theme.table_font.clone();
     }
 
     fn open_path(&mut self, path: PathBuf) {
@@ -690,14 +835,18 @@ impl eframe::App for TableizerApp {
 
         // Resolve the theme (following the OS for `Auto`) and restyle only when it changes.
         let system_dark = ctx.system_theme().is_none_or(|t| t == egui::Theme::Dark);
-        let (style, palette) = theme::build(self.theme, system_dark);
-        if self.applied_theme != Some((self.theme, system_dark)) {
+        let (style, palette) = theme::build(&self.theme, system_dark);
+        if self.applied_theme.as_ref() != Some(&(self.theme.clone(), system_dark)) {
             ctx.set_global_style(style);
-            self.applied_theme = Some((self.theme, system_dark));
+            self.applied_theme = Some((self.theme.clone(), system_dark));
+        }
+        // Rebuild the font atlas only when the chosen table font changes.
+        if self.applied_table_font != self.theme.table_font {
+            self.install_fonts(&ctx);
         }
 
         let mut to_open: Option<PathBuf> = None;
-        let theme_before = self.theme;
+        let theme_before = self.theme.clone();
         let dialect_before = match &self.view {
             View::Loaded(loaded) => Some(loaded.dialect),
             _ => None,
@@ -760,6 +909,16 @@ impl eframe::App for TableizerApp {
             }
             View::Loaded(loaded) => grid(ui, loaded, &palette),
         });
+
+        if self.font_picker_open {
+            font_picker_window(
+                &ctx,
+                &mut self.font_picker_open,
+                &mut self.theme,
+                &self.font_families,
+                &mut self.font_search,
+            );
+        }
 
         if self.theme != theme_before {
             prefs::save(&self.theme);
@@ -826,7 +985,9 @@ fn menu_bar(ui: &mut egui::Ui, app: &mut TableizerApp, to_open: &mut Option<Path
         }
     });
 
-    ui.menu_button("Settings", |ui| settings_menu(ui, &mut app.theme));
+    ui.menu_button("Settings", |ui| {
+        settings_menu(ui, &mut app.theme, &mut app.font_picker_open);
+    });
 }
 
 /// The Export submenu: current view or source, as CSV or TSV, to a chosen file.
@@ -908,8 +1069,8 @@ fn menu_choice(ui: &mut egui::Ui, selected: bool, dot: Option<egui::Color32>, te
     response.clicked()
 }
 
-/// The Settings submenu: theme mode, accent, density (live; persisted on change).
-fn settings_menu(ui: &mut egui::Ui, settings: &mut theme::Settings) {
+/// The Settings submenu: theme mode, accent, density, table font (live; persisted on change).
+fn settings_menu(ui: &mut egui::Ui, settings: &mut theme::Settings, font_picker_open: &mut bool) {
     ui.set_min_width(186.0);
     menu_section(ui, "THEME");
     for mode in theme::Mode::ALL {
@@ -933,6 +1094,83 @@ fn settings_menu(ui: &mut egui::Ui, settings: &mut theme::Settings) {
         if menu_choice(ui, settings.density == density, None, density.label()) {
             settings.density = density;
         }
+    }
+    menu_section(ui, "TABLE FONT");
+    let current = settings
+        .table_font
+        .clone()
+        .unwrap_or_else(|| "App font".to_owned());
+    // The picker is a window, not a submenu — menus close as soon as a text field takes focus.
+    if ui
+        .button(format!("{current} · {:.0} pt…", settings.table_font_size))
+        .clicked()
+    {
+        *font_picker_open = true;
+        ui.close();
+    }
+}
+
+/// The table-font picker window (size + searchable family list). It lives outside the menu system,
+/// which closes the moment an interactive widget like a search field takes focus.
+fn font_picker_window(
+    ctx: &egui::Context,
+    open: &mut bool,
+    settings: &mut theme::Settings,
+    families: &[String],
+    search: &mut String,
+) {
+    let mut window_open = true;
+    egui::Window::new("Table font")
+        .open(&mut window_open)
+        .resizable(false)
+        .collapsible(false)
+        .default_width(210.0)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Size:");
+                ui.add(
+                    egui::DragValue::new(&mut settings.table_font_size)
+                        .range(8.0..=32.0)
+                        .speed(0.2)
+                        .suffix(" pt"),
+                );
+            });
+            ui.add_space(6.0);
+            ui.add(
+                egui::TextEdit::singleline(search)
+                    .hint_text("Search fonts…")
+                    .desired_width(186.0),
+            );
+            ui.add_space(4.0);
+
+            let query = search.to_lowercase();
+            let mut chosen: Option<Option<String>> = None;
+            if menu_choice(ui, settings.table_font.is_none(), None, "App font (default)") {
+                chosen = Some(None);
+            }
+            egui::ScrollArea::vertical()
+                .max_height(320.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for family in families
+                        .iter()
+                        .filter(|f| query.is_empty() || f.to_lowercase().contains(&query))
+                    {
+                        let selected = settings.table_font.as_deref() == Some(family.as_str());
+                        if menu_choice(ui, selected, None, family) {
+                            chosen = Some(Some(family.clone()));
+                        }
+                    }
+                });
+
+            if let Some(selection) = chosen {
+                settings.table_font = selection;
+                search.clear();
+                *open = false;
+            }
+        });
+    if !window_open {
+        *open = false;
     }
 }
 
@@ -1090,7 +1328,7 @@ fn grid(ui: &mut egui::Ui, loaded: &mut LoadedTable, palette: &theme::Palette) {
         columns: displayed,
         headers,
         encoding,
-        palette: *palette,
+        palette: palette.clone(),
         search: view.search.to_lowercase(),
         selected_row: view.selected_row,
         hovered_row: view.hovered_row,
@@ -1472,10 +1710,11 @@ impl egui_table::TableDelegate for GridDelegate<'_> {
                 .map(|c| c.inferred),
             Some(InferredType::Integer) | Some(InferredType::Float)
         );
+        let font = self.palette.table_font.clone();
         let label = if text.is_empty() {
-            egui::Label::new(egui::RichText::new("—").weak())
+            egui::Label::new(egui::RichText::new("—").weak().font(font))
         } else {
-            egui::Label::new(text.as_str())
+            egui::Label::new(egui::RichText::new(text.as_str()).font(font))
         }
         .selectable(false)
         .truncate();
