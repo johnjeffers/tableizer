@@ -118,6 +118,7 @@ mod theme {
         pub header_bg: Color32,
         pub header_text: Color32,
         pub row_selected: Color32,
+        pub row_hover: Color32,
         pub search_match: Color32,
         pub stripe: Color32,
         pub warning: Color32,
@@ -201,6 +202,7 @@ mod theme {
                 Color32::from_gray(95)
             },
             row_selected: with_alpha(accent, if dark { 70 } else { 55 }),
+            row_hover: with_alpha(accent, if dark { 28 } else { 20 }),
             search_match: Color32::from_rgba_unmultiplied(250, 205, 70, if dark { 50 } else { 95 }),
             stripe: if dark {
                 Color32::from_white_alpha(8)
@@ -372,8 +374,10 @@ struct ViewControls {
     applied: ViewSpec,
     /// Last error from applying the view (e.g. invalid regex).
     error: Option<String>,
-    /// Keyboard-selected display row (highlighted; moved with arrow/page/home/end keys).
+    /// Selected display row (click or arrow/page/home/end keys); ⌘/Ctrl+C copies it.
     selected_row: Option<u64>,
+    /// Display row under the mouse (transient; drives the hover highlight).
+    hovered_row: Option<u64>,
 }
 
 impl ViewControls {
@@ -944,6 +948,13 @@ fn status_bar(ui: &mut egui::Ui, loaded: &LoadedTable, palette: &theme::Palette)
             ui.separator();
             ui.colored_label(palette.error, format!("filter error: {error}"));
         }
+        if let Some(row) = loaded.view.selected_row {
+            ui.separator();
+            let weak = ui.visuals().weak_text_color();
+            ui.label(
+                egui::RichText::new(format!("row {} selected", fmt_count(row + 1))).color(weak),
+            );
+        }
     });
 }
 
@@ -995,13 +1006,17 @@ fn grid(ui: &mut egui::Ui, loaded: &mut LoadedTable, palette: &theme::Palette) {
         .collect();
     let frozen = layout.frozen.min(displayed.len());
 
-    // Keyboard navigation: move the selected row (unless the user is typing in a text field).
+    // Keyboard: move the selected row + ⌘/Ctrl+C to copy it (unless typing in a text field).
     let mut scroll_to: Option<u64> = None;
+    let mut copy_request = false;
     let typing = ui.ctx().memory(|m| m.focused().is_some());
     if !typing && total > 0 {
         let last = total - 1;
         const PAGE: u64 = 20;
         ui.input(|i| {
+            if i.modifiers.command && i.key_pressed(egui::Key::C) {
+                copy_request = true;
+            }
             let current = view.selected_row;
             let next = if i.key_pressed(egui::Key::ArrowDown) {
                 Some(current.map_or(0, |r| (r + 1).min(last)))
@@ -1033,9 +1048,13 @@ fn grid(ui: &mut egui::Ui, loaded: &mut LoadedTable, palette: &theme::Palette) {
         palette: *palette,
         search: view.search.to_lowercase(),
         selected_row: view.selected_row,
+        hovered_row: view.hovered_row,
         cache_start: 0,
         cache: Vec::new(),
         pending_reorder: None,
+        new_hovered: None,
+        clicked_row: None,
+        copy_row: None,
     };
 
     let mut grid = egui_table::Table::new()
@@ -1051,6 +1070,31 @@ fn grid(ui: &mut egui::Ui, loaded: &mut LoadedTable, palette: &theme::Palette) {
 
     if let Some((dragged, before)) = delegate.pending_reorder {
         reorder(&mut layout.order, dragged, before);
+    }
+    if let Some(row) = delegate.clicked_row {
+        view.selected_row = Some(row);
+    }
+    view.hovered_row = delegate.new_hovered;
+
+    // Copy the targeted row (context "Copy row", or ⌘/Ctrl+C on the selection) as a TSV line.
+    let copy_target = delegate
+        .copy_row
+        .or(if copy_request { view.selected_row } else { None });
+    if let Some(row) = copy_target {
+        let request = ViewportRequest {
+            rows: RowRange { start: row, len: 1 },
+            columns: delegate.columns.clone(),
+        };
+        if let Ok(viewport) = delegate.table.fetch(&request, &CancellationToken::new())
+            && let Some(cells) = viewport.rows.first()
+        {
+            let line = cells
+                .iter()
+                .map(|cell| decode_field(&cell.0, delegate.encoding))
+                .collect::<Vec<_>>()
+                .join("\t");
+            ui.ctx().copy_text(line);
+        }
     }
 }
 
@@ -1210,12 +1254,20 @@ struct GridDelegate<'a> {
     palette: theme::Palette,
     /// Lowercased search query; cells containing it are highlighted (empty = no highlight).
     search: String,
-    /// Keyboard-selected display row to highlight, if any.
+    /// Selected display row to highlight, if any.
     selected_row: Option<u64>,
+    /// Row under the mouse last frame (painted as hovered).
+    hovered_row: Option<u64>,
     cache_start: u64,
     cache: Vec<Vec<Cell>>,
     /// Set by `header_cell_ui` when a column header is dropped onto another; applied after `show`.
     pending_reorder: Option<(ColumnId, ColumnId)>,
+    /// Row whose cell was hovered this frame (read back after `show` to update the hover state).
+    new_hovered: Option<u64>,
+    /// Row whose cell was left-clicked this frame (read back to update the selection).
+    clicked_row: Option<u64>,
+    /// Row to copy as TSV (from the "Copy row" context item); handled after `show`.
+    copy_row: Option<u64>,
 }
 
 impl egui_table::TableDelegate for GridDelegate<'_> {
@@ -1297,26 +1349,40 @@ impl egui_table::TableDelegate for GridDelegate<'_> {
         };
         let text = decode_field(&cell_value.0, self.encoding);
 
-        // Zebra stripe (odd rows) → keyboard selection → search match, painted in order so the most
-        // specific highlight wins.
+        let cell_rect = ui.max_rect();
+
+        // Whole-cell interaction: left-click selects the row, hover drives the row highlight,
+        // right-click opens the copy menu.
+        let response = ui.interact(
+            cell_rect,
+            ui.id().with((cell.row_nr, cell.col_nr)),
+            egui::Sense::click(),
+        );
+        if response.clicked() {
+            self.clicked_row = Some(cell.row_nr);
+        }
+        if response.hovered() {
+            self.new_hovered = Some(cell.row_nr);
+        }
+
+        // Backgrounds, least- to most-specific: stripe → hover → selection → search match.
         if cell.row_nr % 2 == 1 {
             ui.painter()
-                .rect_filled(ui.max_rect(), egui::CornerRadius::ZERO, self.palette.stripe);
+                .rect_filled(cell_rect, egui::CornerRadius::ZERO, self.palette.stripe);
+        }
+        if Some(cell.row_nr) == self.hovered_row {
+            ui.painter()
+                .rect_filled(cell_rect, egui::CornerRadius::ZERO, self.palette.row_hover);
         }
         if Some(cell.row_nr) == self.selected_row {
-            ui.painter().rect_filled(
-                ui.max_rect(),
-                egui::CornerRadius::ZERO,
-                self.palette.row_selected,
-            );
+            ui.painter()
+                .rect_filled(cell_rect, egui::CornerRadius::ZERO, self.palette.row_selected);
         }
         if cell_matches(&text, &self.search) {
-            ui.painter().rect_filled(
-                ui.max_rect(),
-                egui::CornerRadius::ZERO,
-                self.palette.search_match,
-            );
+            ui.painter()
+                .rect_filled(cell_rect, egui::CornerRadius::ZERO, self.palette.search_match);
         }
+
         // Right-align numeric columns; show empty (null) cells as a faint placeholder.
         let col_id = self
             .columns
@@ -1337,24 +1403,26 @@ impl egui_table::TableDelegate for GridDelegate<'_> {
             egui::Label::new(text.as_str())
         }
         .selectable(false)
-        .truncate()
-        .sense(egui::Sense::click());
+        .truncate();
         // 10px of leading padding so text never touches the column edge; numeric columns align right.
         let layout = if numeric {
             egui::Layout::right_to_left(egui::Align::Center)
         } else {
             egui::Layout::left_to_right(egui::Align::Center)
         };
-        let response = ui
-            .with_layout(layout, |ui| {
-                ui.add_space(10.0);
-                ui.add(label)
-            })
-            .inner;
-        // Right-click a cell to copy its value to the clipboard.
+        ui.with_layout(layout, |ui| {
+            ui.add_space(10.0);
+            ui.add(label);
+        });
+
+        // Right-click: copy this cell, or the whole row as TSV (handled after `show`).
         response.context_menu(|ui| {
-            if ui.button("Copy").clicked() {
+            if ui.button("Copy cell").clicked() {
                 ui.ctx().copy_text(text.clone());
+                ui.close();
+            }
+            if ui.button("Copy row").clicked() {
+                self.copy_row = Some(cell.row_nr);
                 ui.close();
             }
         });
