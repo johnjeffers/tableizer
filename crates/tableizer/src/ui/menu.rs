@@ -174,7 +174,8 @@ fn parsing_menu(ui: &mut egui::Ui, loaded: &mut LoadedTable) {
     egui::containers::menu::SubMenuButton::new("Delimiter")
         .config(
             egui::containers::menu::MenuConfig::new()
-                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                .style(super::wide_menu),
         )
         .ui(ui, |ui| {
             ui.set_min_width(196.0);

@@ -23,6 +23,15 @@ use tableizer_core::RowCount;
 use crate::model::LoadedTable;
 use crate::theme;
 
+/// egui's standard menu look (`menu_style`) with roomier horizontal item padding, so the highlight
+/// behind a hovered/selected item — and the menu-bar buttons — isn't cramped against the text.
+/// Applied to the menu bar and every menu/submenu popup; vertical padding is left as `menu_style`
+/// sets it.
+pub(crate) fn wide_menu(style: &mut egui::Style) {
+    egui::containers::menu::menu_style(style);
+    style.spacing.button_padding.x = 6.0;
+}
+
 /// The toolbar: the find/filter controls. `focus_find` requests focus on the Find field (⌘/Ctrl+F).
 pub(crate) fn toolbar(ui: &mut egui::Ui, loaded: &mut LoadedTable, focus_find: bool) {
     let LoadedTable { view, .. } = loaded;

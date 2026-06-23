@@ -167,7 +167,13 @@ impl eframe::App for TableizerApp {
         }
 
         egui::Panel::top("menu_bar").show_inside(ui, |ui| {
-            egui::MenuBar::new().ui(ui, |ui| menu_bar(ui, self, &mut to_open));
+            // `wide_menu` gives the bar buttons *and* every dropdown popup roomier horizontal item
+            // padding than egui's default `menu_style` (which hugs the text at 2px). `.config(..)`
+            // carries it into the submenus, which inherit the bar's menu config.
+            egui::MenuBar::new()
+                .style(crate::ui::wide_menu)
+                .config(egui::containers::menu::MenuConfig::new().style(crate::ui::wide_menu))
+                .ui(ui, |ui| menu_bar(ui, self, &mut to_open));
         });
 
         if matches!(self.view, View::Loaded(_)) {

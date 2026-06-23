@@ -1,5 +1,4 @@
-- Do not require a filename on open
-- Clear recents
+- Max number of recents?
 - Case-sensitive search
 - Table header stretches the entire window size
 - Parquet support
