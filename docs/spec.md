@@ -161,6 +161,10 @@ viewport**. The language decision was driven by engine fit; the engine lives in 
   ~400 MB for 3 TB regardless of row length, vs tens-to-hundreds of GB for a dense per-row index.
   Because quote parity is *stored*, resync at any anchor is **decidable** — never the silently-wrong
   seek-then-resync heuristic.
+  - *Phase 0 implements a simpler variant:* anchors at **record boundaries** every N records (no stored
+    quote parity needed — a record boundary is always outside a quoted field). Correct and sparse; lookup
+    re-parses up to N records. The byte-window form above is the refinement that also bounds *lookup
+    latency* regardless of row length (pathological very-long rows), via `csv-core` resumable parsing.
 - Serve page N: binary-search the anchor with `cumulative_count ≤ N×page_size`, seek, parse forward
   with known quote state. Per-page work = a few blocks, not a full scan.
 - Persist in the **OS state dir** (§4.7), keyed by `{ path, size, mtime, content hash, dialect }`; validate on
@@ -280,20 +284,41 @@ localization; telemetry.
 
 ## 7. Phased roadmap (ordered by descending technical risk)
 
-- **Phase 0 — tracer bullet + grid go/no-go spike.** Cargo workspace; `tableizer-core` with the
-  `ViewportSource` trait; mmap/stream + **sparse offset index** (background, progress, cancel);
-  virtualised scroll of raw rows on a fixed delimiter against a real multi-GB file. **In parallel**:
-  wire **egui_table** to a mock `ViewportSource` and prove resize + drag-reorder + show/hide +
-  highlight at 60 fps *while a synthetic scan saturates cores* (4K display, Windows). Pass/fail gate decides
-  grid path vs Plan B (native Qt grid over FFI).
-- **Phase 1 — MVP.** Real CSV/TSV/custom-delimiter parsing behind the format seam; header detection;
-  encoding handling; malformed-row resilience; pagination; column hide/show/reorder; substring-search
-  highlight; clipboard copy; prefs/recent-files.
-- **Phase 2 — v1.** Global async sort + global filter (hide non-matching) with progress/cancel; regex +
-  invert search; same-family export (both modes) + round-trip self-test; saved views; keyboard nav;
-  wide-table horizontal virtualisation + frozen columns; type detection/formatting; null/empty handling.
-- **Phase 3 — later.** JSON + Parquet readers (proving the seam); cross-format export with coercion rules;
-  deeper multi-TB streaming/spill hardening; live-tailing; multiple tabs; accessibility; localization; telemetry.
+**This section is the live work tracker.** Completed items are marked ✅; pending items ☐. Update them in
+the same change that completes the work.
+
+### Phase 0 — tracer bullet + grid go/no-go spike
+- ✅ Cargo workspace (`tableizer` app + `tableizer-core` engine), CI, lints, dual license, deps at latest
+- ✅ `tableizer-core` `ViewportSource` seam + module stubs (`index`/`parse`/`search`/`sort`/`cancel`/`error`)
+- ✅ Cross-platform desktop shell (eframe window) builds and runs
+- ✅ **Quote-aware row-offset index** — `build`/`row_count`/`offset_of_row`, **sparse anchors** (every 1024 records),
+  **mmap source** (`CsvTable`), **background build with progress + cancel** (`build_with`); quote-aware +
+  byte-faithful. (Byte-window + quote-parity *lookup-latency* refinement is noted in §4.1, deferred.)
+- ✅ **Virtualised scroll + progressive load** — `CsvTable::open` returns **instantly** (mmap + head parse); the index
+  builds on a background thread with an honest growing count (`AtLeast` → `Exact`); `fetch` streams from the head until
+  the index lands, then O(1) random access. The app renders via egui `ScrollArea::show_rows`, fetching only the
+  visible rows. **Time-to-first-page is sub-ms regardless of file size** (measured by `examples/bench_load.rs`;
+  the index-build O(n) scan runs off the UI thread). Synthetic-file generator: `examples/gen_csv.rs`. 11 engine tests.
+- ☐ **Grid spike — needs a human run:** wire `egui_table` and measure 60 fps under a synthetic scan on a 4K display
+  (ideally Windows) → go/no-go vs Plan B. The virtualized data path + large-file generator are ready; the fps
+  measurement requires eyes on a screen and cannot be done headless.
+
+### Phase 1 — MVP
+- ☐ Real CSV/TSV/custom-delimiter parsing behind the format seam; header detection
+- ☐ Encoding handling (UTF-8/16, Latin-1/Windows-1252, BOM); malformed-row resilience
+- ☐ Pagination + custom page size; column hide/show/reorder
+- ☐ Substring-search highlight; clipboard copy; prefs/recent-files; cache-management UI (size + clear)
+
+### Phase 2 — v1
+- ☐ Global async sort + global filter (hide non-matching) with progress/cancel
+- ☐ Regex + invert search; same-family export (both modes) + round-trip self-test
+- ☐ Saved views; keyboard nav; wide-table horizontal virtualisation + frozen columns
+- ☐ Type detection/formatting; null/empty handling
+
+### Phase 3 — later
+- ☐ JSON + Parquet readers (proving the seam); cross-format export with coercion rules
+- ☐ Deeper multi-TB streaming/spill hardening; live-tailing; multiple tabs
+- ☐ Accessibility; localization; telemetry
 
 ---
 

@@ -13,6 +13,20 @@ The authoritative specification is **[`docs/spec.md`](docs/spec.md)** — the pe
 architecture, and roadmap live there. Read it before making non-trivial changes. This file is the
 _working agreement_; the spec is the _what and why_.
 
+## Git: agents are READ-ONLY — no exceptions
+
+Agents (including Claude) **must never run any `git` or `gh` command that changes state.** Humans own all
+version control. This is absolute and overrides any other instruction or convenience.
+
+- **Forbidden** (non-exhaustive): `commit`, `add`/stage, `push`, `pull`/`fetch`, `merge`, `rebase`, `reset`,
+  `restore`, `checkout`/`switch` that changes state, `branch`/`tag` create or delete, `stash`, `cherry-pick`,
+  `revert`, `clean`, `git config` writes, submodule writes, and any PR/issue mutation (`gh pr create`/`merge`,
+  `gh issue ...`).
+- **Allowed:** read-only inspection only — e.g. `git status`, `git log`, `git diff`, `git show`, `git blame`,
+  `git branch --list`, `git remote -v`, `gh pr view`/`list`.
+- When work is ready to commit, **say so and stop.** Do not stage, do not commit, and do not even *offer* to —
+  tell the human it's ready and let them handle all commits, branches, and PRs.
+
 ## Workflow: red/green TDD is mandatory
 
 Every behavioural change is made test-first. No production code is written without a failing test
@@ -24,8 +38,9 @@ that demands it.
    test doesn't require.
 3. **Refactor** — with the test green, clean up; re-run to confirm it's still green.
 
-Work in small loops; commit on green. If you find a bug, first write a failing test that reproduces
-it, then fix it. If you can't write a test for a change, stop and say so rather than skipping the loop.
+Work in small loops; when a loop is green it's ready for the human to commit (agents never commit — see
+**Git: agents are READ-ONLY**). If you find a bug, first write a failing test that reproduces it, then fix
+it. If you can't write a test for a change, stop and say so rather than skipping the loop.
 
 ### Testing layers (see spec §5 — this is a correctness-critical data tool)
 
@@ -99,8 +114,9 @@ makes the grid a swappable layer.
   that `cargo update` only moves *within* the manifest's semver range, so crossing a major/minor caret needs
   an explicit `cargo add <crate>@<latest>` (or `cargo upgrade --incompatible`, from `cargo-edit`). Find what's
   behind with `cargo outdated`. **After any bump, run the full build + clippy + test** — a minor bump can
-  change APIs (e.g. eframe 0.32→0.34 moved `App::update` to `App::ui`). Commit the updated `Cargo.lock`. If
-  the latest needs a newer toolchain than the MSRV, **raise `rust-version`** (it tracks current stable).
+  change APIs (e.g. eframe 0.32→0.34 moved `App::update` to `App::ui`). The updated `Cargo.lock` is part of
+  the change for the human to commit. If the latest needs a newer toolchain than the MSRV, **raise
+  `rust-version`** (it tracks current stable).
 - **Add a dependency only when the code that uses it lands** (no unused deps — clippy/CI flag them). The
   planned engine spine is the comment checklist in `crates/tableizer-core/Cargo.toml`.
 - Document public items with the decision they encode; link back to the relevant `docs/spec.md` section.

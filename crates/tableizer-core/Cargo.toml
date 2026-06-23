@@ -11,6 +11,8 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+csv = "1.4.0"
+memmap2 = "0.9.11"
 thiserror = "2.0.18"
 # thiserror added via `cargo add`.
 
@@ -24,4 +26,5 @@ thiserror = "2.0.18"
 #   rayon           — data-parallel index build / external-sort run generation
 
 [dev-dependencies]
+tempfile = "3.27.0"
 # proptest        — round-trip / fidelity property tests (add with the parser)

@@ -11,12 +11,15 @@ pub mod index;
 pub mod parse;
 pub mod search;
 pub mod sort;
+pub mod table;
 pub mod viewport;
 
 mod cancel;
 
 pub use cancel::CancellationToken;
 pub use error::{Error, Result};
+pub use index::Progress;
+pub use table::CsvTable;
 pub use viewport::{
     Cell, Column, ColumnId, InferredType, RowCount, RowRange, Schema, Viewport, ViewportRequest,
     ViewportSource,
