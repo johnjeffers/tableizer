@@ -8,6 +8,7 @@
 
 pub mod cache;
 pub mod error;
+pub mod export;
 pub mod index;
 pub mod parse;
 pub mod search;
@@ -19,9 +20,12 @@ mod cancel;
 
 pub use cancel::CancellationToken;
 pub use error::{Error, Result};
+pub use export::ExportScope;
 pub use index::Progress;
+pub use search::FilterSpec;
+pub use sort::{Direction, SortKey};
 pub use table::CsvTable;
 pub use viewport::{
-    Cell, Column, ColumnId, DataQuality, InferredType, RowCount, RowRange, Schema, Viewport,
-    ViewportRequest, ViewportSource,
+    Cell, Column, ColumnId, DataQuality, InferredType, RowCount, RowRange, Schema, ViewSpec,
+    ViewStatus, Viewport, ViewportRequest, ViewportSource,
 };

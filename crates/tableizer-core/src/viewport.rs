@@ -5,6 +5,8 @@
 //! Keeping the UI confined to this trait is what makes the grid a swappable layer (`docs/spec.md`
 //! §4.5). Note the byte-fidelity guarantee on [`Cell`].
 
+use crate::search::FilterSpec;
+use crate::sort::SortKey;
 use crate::{CancellationToken, Result};
 
 /// Stable identifier for a column in *source* order, independent of display order.
@@ -101,11 +103,59 @@ pub trait ViewportSource {
     /// honour `cancel` so a fast-scrolling UI can abandon in-flight requests.
     fn fetch(&self, request: &ViewportRequest, cancel: &CancellationToken) -> Result<Viewport>;
 
+    /// Like [`fetch`](Self::fetch) but ignoring any active view (filter/sort) — source order. Used by
+    /// "export source". Defaults to [`fetch`](Self::fetch) for sources without a view.
+    fn fetch_source(
+        &self,
+        request: &ViewportRequest,
+        cancel: &CancellationToken,
+    ) -> Result<Viewport> {
+        self.fetch(request, cancel)
+    }
+
     /// A coarse data-quality summary surfaced to the user (ragged rows, …). Defaults to empty/unknown
     /// so formats that don't track it need not implement it.
     fn data_quality(&self) -> DataQuality {
         DataQuality::default()
     }
+
+    /// Apply a global filter and/or sort (the active "view"), built asynchronously. Returns
+    /// immediately; [`row_count`](Self::row_count) and [`fetch`](Self::fetch) reflect the view once it
+    /// lands. Errors synchronously only on an invalid regex. Default: no-op.
+    fn set_view(&self, _spec: &ViewSpec) -> Result<()> {
+        Ok(())
+    }
+
+    /// Clear any active filter/sort, returning to source order. Default: no-op.
+    fn clear_view(&self) {}
+
+    /// Whether a view (filter/sort) is currently being built. Default: not building.
+    fn view_status(&self) -> ViewStatus {
+        ViewStatus::default()
+    }
+}
+
+/// A global filter and/or sort to apply to the table (the active "view").
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ViewSpec {
+    /// Hide rows that don't match (and/or invert); `None` = no filter.
+    pub filter: Option<FilterSpec>,
+    /// Sort by a column; `None` = source order.
+    pub sort: Option<SortKey>,
+}
+
+impl ViewSpec {
+    /// Whether this view is the identity (no filter, no sort).
+    pub fn is_identity(&self) -> bool {
+        self.filter.is_none() && self.sort.is_none()
+    }
+}
+
+/// Status of the active-view build.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ViewStatus {
+    /// A view (filter/sort) is currently being built in the background.
+    pub building: bool,
 }
 
 /// Coarse data-quality summary for the open table (spec §3.1 / §5).

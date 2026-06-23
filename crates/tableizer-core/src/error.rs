@@ -18,6 +18,10 @@ pub enum Error {
     /// The operation was cancelled via its [`crate::CancellationToken`].
     #[error("operation cancelled")]
     Cancelled,
+
+    /// A user-supplied search pattern (regex) failed to compile.
+    #[error("invalid search pattern: {0}")]
+    InvalidPattern(String),
 }
 
 /// Convenience alias for engine results.

@@ -1,10 +1,14 @@
 //! Column sort (`docs/spec.md` §3.4).
 //!
-//! Page-local sort (Tier A, the default) reorders only the visible page and is explicitly labelled
-//! as such. Global sort (Tier C) is a distinct, named, async job that builds and persists a sort
-//! permutation of `(key, rownum)` pairs via a *bespoke* external merge sort (rayon run generation +
-//! k-way disk-spill merge) — deliberately NOT delegated to DataFusion/Polars, whose spill has
-//! documented pathologies at multi-TB scale.
+//! Sort is **global** and applied through the async "view" ([`crate::table::CsvTable`]): the engine
+//! extracts the sort-key field for every (filtered) row and orders them. With infinite virtualised
+//! scroll there is no page-local sort. Keys compare numerically when both parse as numbers, otherwise
+//! byte-lexicographically — so `"10"` sorts after `"9"`.
+//!
+//! The current implementation sorts in memory; a spill-to-disk external merge sort is the documented
+//! refinement for datasets whose key+rownum set exceeds RAM (§4.3).
+
+use std::cmp::Ordering;
 
 use crate::viewport::ColumnId;
 
@@ -18,24 +22,57 @@ pub enum Direction {
     Descending,
 }
 
-/// How far a sort reaches — the instant default vs the heavyweight global job. Surfacing this in the
-/// UI prevents a single click from silently launching a multi-hour, multi-TB-write operation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum Scope {
-    /// Reorder only the currently rendered page (Tier A, instant — but only sorts what is visible).
-    #[default]
-    PageLocal,
-    /// Reorder the entire dataset (Tier C, async, persisted permutation).
-    Global,
-}
-
 /// A request to sort by a column.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SortKey {
-    /// Column to sort by.
+    /// Column whose field is the sort key.
     pub column: ColumnId,
     /// Ascending or descending.
     pub direction: Direction,
-    /// Page-local or global.
-    pub scope: Scope,
+}
+
+/// Compare two key fields: numerically when both parse as numbers, else byte-lexicographically.
+pub(crate) fn compare_keys(a: &[u8], b: &[u8], direction: Direction) -> Ordering {
+    let ordering = match (parse_number(a), parse_number(b)) {
+        (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
+        _ => a.cmp(b),
+    };
+    match direction {
+        Direction::Ascending => ordering,
+        Direction::Descending => ordering.reverse(),
+    }
+}
+
+fn parse_number(bytes: &[u8]) -> Option<f64> {
+    std::str::from_utf8(bytes).ok()?.trim().parse::<f64>().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn numeric_keys_sort_numerically_not_lexically() {
+        // Lexically "10" < "9"; numerically 10 > 9.
+        assert_eq!(
+            compare_keys(b"10", b"9", Direction::Ascending),
+            Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn text_keys_sort_lexically() {
+        assert_eq!(
+            compare_keys(b"apple", b"banana", Direction::Ascending),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn descending_reverses_the_order() {
+        assert_eq!(
+            compare_keys(b"a", b"b", Direction::Descending),
+            Ordering::Greater
+        );
+    }
 }

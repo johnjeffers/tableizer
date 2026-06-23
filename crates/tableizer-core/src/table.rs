@@ -9,7 +9,7 @@
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -17,9 +17,10 @@ use memmap2::Mmap;
 
 use crate::index::{OffsetIndex, record_reader};
 use crate::parse::Dialect;
+use crate::search::Matcher;
 use crate::{
     CancellationToken, Cell, Column, ColumnId, DataQuality, Error, InferredType, Result, RowCount,
-    RowRange, Schema, Viewport, ViewportRequest, ViewportSource,
+    RowRange, Schema, SortKey, ViewSpec, ViewStatus, Viewport, ViewportRequest, ViewportSource,
 };
 
 /// The byte source backing a table: either owned in-memory bytes or a memory-mapped file. Both
@@ -55,6 +56,13 @@ pub struct CsvTable {
     /// Physical records that precede the data (1 if the dialect has a header row, else 0). The
     /// header is excluded from the row count and shifts data-row → physical-record translation.
     header_rows: u64,
+    /// Active view: an ordered list of data-rows to display (filter + sort applied), or `None` for
+    /// source order. Rebuilt asynchronously by `set_view`.
+    view: Arc<Mutex<Option<Vec<u64>>>>,
+    /// Whether a view build is currently running.
+    view_building: Arc<AtomicBool>,
+    /// Cancels the in-flight view build when a new one starts or the table is dropped.
+    view_cancel: Mutex<CancellationToken>,
 }
 
 impl CsvTable {
@@ -71,6 +79,9 @@ impl CsvTable {
             header_rows: u64::from(dialect.has_header),
             dialect,
             cancel: CancellationToken::new(),
+            view: Arc::new(Mutex::new(None)),
+            view_building: Arc::new(AtomicBool::new(false)),
+            view_cancel: Mutex::new(CancellationToken::new()),
         })
     }
 
@@ -107,14 +118,18 @@ impl CsvTable {
             index,
             frontier,
             cancel,
+            view: Arc::new(Mutex::new(None)),
+            view_building: Arc::new(AtomicBool::new(false)),
+            view_cancel: Mutex::new(CancellationToken::new()),
         })
     }
 }
 
 impl Drop for CsvTable {
     fn drop(&mut self) {
-        // Stop the background index build promptly; its `Arc`s keep the data alive until it exits.
+        // Stop the background index + view builds promptly; their `Arc`s keep data alive until they exit.
         self.cancel.cancel();
+        self.view_cancel.lock().expect("view cancel lock").cancel();
     }
 }
 
@@ -124,6 +139,16 @@ impl ViewportSource for CsvTable {
     }
 
     fn row_count(&self) -> RowCount {
+        // An active view (filter/sort) defines its own row count.
+        if let Some(len) = self
+            .view
+            .lock()
+            .expect("view lock")
+            .as_ref()
+            .map(|rows| rows.len() as u64)
+        {
+            return RowCount::Exact(len);
+        }
         let header = self.header_rows;
         match self.index.lock().expect("index lock").as_ref() {
             Some(index) => RowCount::Exact(index.row_count().saturating_sub(header)),
@@ -132,46 +157,30 @@ impl ViewportSource for CsvTable {
     }
 
     fn fetch(&self, request: &ViewportRequest, cancel: &CancellationToken) -> Result<Viewport> {
-        let bytes = self.source.bytes();
-        // Requests are in *data* rows; the index addresses *physical* records (header included).
-        let phys_start = request.rows.start.saturating_add(self.header_rows);
-        let guard = self.index.lock().expect("index lock");
-        match guard.as_ref() {
-            // Index ready: O(1) random access per physical record.
-            Some(index) => {
-                let total = index.row_count(); // physical
-                let phys_end = phys_start
-                    .saturating_add(u64::from(request.rows.len))
-                    .min(total);
-                let mut rows = Vec::new();
-                for phys in phys_start..phys_end {
-                    if cancel.is_cancelled() {
-                        return Err(Error::Cancelled);
-                    }
-                    let offset = index
-                        .offset_of_row(bytes, phys)
-                        .expect("a row below the total has an indexed offset");
-                    let record = parse_one_record(&bytes[offset as usize..], &self.dialect)
-                        .expect("a record exists at an indexed offset");
-                    rows.push(project_record(&record, &request.columns));
+        // Resolve the visible display-rows to *data* rows through the active view (small window).
+        let data_rows: Vec<u64> = {
+            let view = self.view.lock().expect("view lock");
+            match view.as_ref() {
+                Some(rows) => {
+                    let start = request.rows.start as usize;
+                    (start..start.saturating_add(request.rows.len as usize))
+                        .filter_map(|i| rows.get(i).copied())
+                        .collect()
                 }
-                Ok(Viewport { rows })
+                None => contiguous_rows(request.rows),
             }
-            // Index still building: serve the visible window by streaming from the head.
-            None => {
-                drop(guard);
-                fetch_streaming(
-                    bytes,
-                    &self.dialect,
-                    RowRange {
-                        start: phys_start,
-                        len: request.rows.len,
-                    },
-                    &request.columns,
-                    cancel,
-                )
-            }
-        }
+        };
+        self.fetch_data_rows(&data_rows, &request.columns, request.rows.start, cancel)
+    }
+
+    fn fetch_source(
+        &self,
+        request: &ViewportRequest,
+        cancel: &CancellationToken,
+    ) -> Result<Viewport> {
+        // Source order, ignoring any active filter/sort: data rows are exactly the display range.
+        let data_rows = contiguous_rows(request.rows);
+        self.fetch_data_rows(&data_rows, &request.columns, request.rows.start, cancel)
     }
 
     fn data_quality(&self) -> DataQuality {
@@ -183,6 +192,164 @@ impl ViewportSource for CsvTable {
             None => DataQuality::default(),
         }
     }
+
+    fn set_view(&self, spec: &ViewSpec) -> Result<()> {
+        // Compile the filter up front so an invalid regex errors synchronously.
+        let matcher = match &spec.filter {
+            Some(filter) => Some(Matcher::compile(filter)?),
+            None => None,
+        };
+        let sort = spec.sort;
+
+        // Cancel any in-flight build and install a fresh cancellation token.
+        let cancel = {
+            let mut guard = self.view_cancel.lock().expect("view cancel lock");
+            guard.cancel();
+            *guard = CancellationToken::new();
+            guard.clone()
+        };
+
+        if matcher.is_none() && sort.is_none() {
+            *self.view.lock().expect("view lock") = None;
+            self.view_building.store(false, Ordering::Relaxed);
+            return Ok(());
+        }
+
+        self.view_building.store(true, Ordering::Relaxed);
+        let source = self.source.clone();
+        let dialect = self.dialect;
+        let header_rows = self.header_rows;
+        let view = Arc::clone(&self.view);
+        let building = Arc::clone(&self.view_building);
+        thread::spawn(move || {
+            let built = build_view(
+                source.bytes(),
+                &dialect,
+                header_rows,
+                matcher,
+                sort,
+                &cancel,
+            );
+            if let Ok(rows) = built
+                && !cancel.is_cancelled()
+            {
+                *view.lock().expect("view lock") = Some(rows);
+            }
+            building.store(false, Ordering::Relaxed);
+        });
+        Ok(())
+    }
+
+    fn clear_view(&self) {
+        self.view_cancel.lock().expect("view cancel lock").cancel();
+        *self.view.lock().expect("view lock") = None;
+        self.view_building.store(false, Ordering::Relaxed);
+    }
+
+    fn view_status(&self) -> ViewStatus {
+        ViewStatus {
+            building: self.view_building.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl CsvTable {
+    /// Materialise the given data-rows (already resolved through any view) into a viewport: each row
+    /// is addressed via the offset index. Falls back to head-streaming if the index isn't ready yet.
+    fn fetch_data_rows(
+        &self,
+        data_rows: &[u64],
+        columns: &[ColumnId],
+        stream_start: u64,
+        cancel: &CancellationToken,
+    ) -> Result<Viewport> {
+        let bytes = self.source.bytes();
+        let guard = self.index.lock().expect("index lock");
+        let Some(index) = guard.as_ref() else {
+            // Index not ready → stream the head (sort/filter/export are UI-gated on a full index).
+            drop(guard);
+            let len = u32::try_from(data_rows.len()).unwrap_or(u32::MAX);
+            return fetch_streaming(
+                bytes,
+                &self.dialect,
+                RowRange {
+                    start: stream_start.saturating_add(self.header_rows),
+                    len,
+                },
+                columns,
+                cancel,
+            );
+        };
+        let total_physical = index.row_count();
+        let mut rows = Vec::new();
+        for &data_row in data_rows {
+            if cancel.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            let phys = data_row.saturating_add(self.header_rows);
+            if phys >= total_physical {
+                continue;
+            }
+            let offset = index
+                .offset_of_row(bytes, phys)
+                .expect("a row below the total has an indexed offset");
+            let record = parse_one_record(&bytes[offset as usize..], &self.dialect)
+                .expect("a record exists at an indexed offset");
+            rows.push(project_record(&record, columns));
+        }
+        Ok(Viewport { rows })
+    }
+}
+
+/// The contiguous data-rows covered by a display `range` (the identity view).
+fn contiguous_rows(range: RowRange) -> Vec<u64> {
+    (range.start..range.start.saturating_add(u64::from(range.len))).collect()
+}
+
+/// Build the display order for a view: scan every data record, keep those passing `matcher`, and (if
+/// `sort` is set) order them by the sort-key field. Returns data-row indices in display order. Sorts
+/// in memory — the spill-to-disk external merge sort (§4.3) is the documented refinement.
+fn build_view(
+    bytes: &[u8],
+    dialect: &Dialect,
+    header_rows: u64,
+    matcher: Option<Matcher>,
+    sort: Option<SortKey>,
+    cancel: &CancellationToken,
+) -> Result<Vec<u64>> {
+    let mut reader = record_reader(bytes, dialect);
+    let mut record = csv::ByteRecord::new();
+    let mut rows: Vec<(Vec<u8>, u64)> = Vec::new();
+    let mut physical = 0u64;
+
+    while reader.read_byte_record(&mut record).map_err(parse_io)? {
+        let phys = physical;
+        physical += 1;
+        if phys < header_rows {
+            continue;
+        }
+        if phys.is_multiple_of(4096) && cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        if let Some(matcher) = &matcher
+            && !matcher.matches(&record)
+        {
+            continue;
+        }
+        let key = match &sort {
+            Some(sort) => record
+                .get(sort.column.0 as usize)
+                .unwrap_or_default()
+                .to_vec(),
+            None => Vec::new(),
+        };
+        rows.push((key, phys - header_rows));
+    }
+
+    if let Some(sort) = &sort {
+        rows.sort_by(|a, b| crate::sort::compare_keys(&a.0, &b.0, sort.direction));
+    }
+    Ok(rows.into_iter().map(|(_, data_row)| data_row).collect())
 }
 
 /// Spawn the background index build, publishing the growing row count via `frontier` and storing the
@@ -262,7 +429,9 @@ fn derive_schema(bytes: &[u8], dialect: &Dialect) -> Schema {
     let Some(first) = parse_one_record(bytes, dialect) else {
         return Schema::default();
     };
-    let columns = (0..first.len())
+    let column_count = first.len();
+    let types = infer_column_types(bytes, dialect, column_count);
+    let columns = (0..column_count)
         .map(|i| {
             let name: Box<[u8]> = if dialect.has_header {
                 let field: &[u8] = first.get(i).unwrap_or_default();
@@ -273,11 +442,69 @@ fn derive_schema(bytes: &[u8], dialect: &Dialect) -> Schema {
             Column {
                 id: ColumnId(i as u32),
                 name,
-                inferred: InferredType::Text,
+                inferred: types.get(i).copied().unwrap_or_default(),
             }
         })
         .collect();
     Schema { columns }
+}
+
+/// Records sampled from the head to infer column types (presentational only — alignment/formatting).
+const TYPE_SAMPLE_ROWS: usize = 200;
+
+/// Infer a presentational type per column by sampling the first [`TYPE_SAMPLE_ROWS`] data records: a
+/// column is `Integer`/`Float`/`Boolean` only if every non-empty sampled value fits (empties are
+/// treated as nulls and never disqualify a type); otherwise `Text`. Never mutates cell bytes.
+fn infer_column_types(bytes: &[u8], dialect: &Dialect, column_count: usize) -> Vec<InferredType> {
+    let mut reader = record_reader(bytes, dialect);
+    let mut record = csv::ByteRecord::new();
+    let mut all_int = vec![true; column_count];
+    let mut all_float = vec![true; column_count];
+    let mut all_bool = vec![true; column_count];
+    let mut any_value = vec![false; column_count];
+
+    let skip = usize::from(dialect.has_header);
+    let (mut physical, mut sampled) = (0usize, 0usize);
+    while sampled < TYPE_SAMPLE_ROWS && reader.read_byte_record(&mut record).unwrap_or(false) {
+        if physical < skip {
+            physical += 1;
+            continue;
+        }
+        physical += 1;
+        sampled += 1;
+        for c in 0..column_count {
+            let Ok(text) = std::str::from_utf8(record.get(c).unwrap_or_default()) else {
+                all_int[c] = false;
+                all_float[c] = false;
+                all_bool[c] = false;
+                continue;
+            };
+            let text = text.trim();
+            if text.is_empty() {
+                continue; // empty = null; doesn't disqualify any type
+            }
+            any_value[c] = true;
+            all_int[c] &= text.parse::<i64>().is_ok();
+            all_float[c] &= text.parse::<f64>().is_ok();
+            all_bool[c] &= matches!(text.to_ascii_lowercase().as_str(), "true" | "false");
+        }
+    }
+
+    (0..column_count)
+        .map(|c| {
+            if !any_value[c] {
+                InferredType::Text
+            } else if all_int[c] {
+                InferredType::Integer
+            } else if all_float[c] {
+                InferredType::Float
+            } else if all_bool[c] {
+                InferredType::Boolean
+            } else {
+                InferredType::Text
+            }
+        })
+        .collect()
 }
 
 /// Parse exactly one record from the start of `bytes`.
@@ -324,6 +551,7 @@ fn map_file(path: &Path) -> Result<Mmap> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Direction, FilterSpec};
     use std::time::Duration;
 
     fn request(start: u64, len: u32, columns: &[u32]) -> ViewportRequest {
@@ -373,6 +601,17 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         panic!("index did not complete in time");
+    }
+
+    /// Wait for an async view (filter/sort) build to finish.
+    fn await_view(table: &CsvTable) {
+        for _ in 0..2000 {
+            if !table.view_status().building {
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!("view did not build in time");
     }
 
     #[test]
@@ -490,5 +729,86 @@ mod tests {
             .unwrap();
         assert_eq!(viewport.rows[0][0].0.as_ref(), b"a");
         assert_eq!(viewport.rows[2][1].0.as_ref(), b"4");
+    }
+
+    #[test]
+    fn global_sort_orders_rows_by_a_column() {
+        // Header "n"; data rows 3, 1, 2 → ascending sort yields 1, 2, 3.
+        let table = CsvTable::from_bytes(b"n\n3\n1\n2\n".to_vec(), Dialect::default()).unwrap();
+        table
+            .set_view(&ViewSpec {
+                filter: None,
+                sort: Some(SortKey {
+                    column: ColumnId(0),
+                    direction: Direction::Ascending,
+                }),
+            })
+            .unwrap();
+        await_view(&table);
+
+        let viewport = table
+            .fetch(&request(0, 3, &[0]), &CancellationToken::new())
+            .unwrap();
+        assert_eq!(viewport.rows[0][0].0.as_ref(), b"1");
+        assert_eq!(viewport.rows[1][0].0.as_ref(), b"2");
+        assert_eq!(viewport.rows[2][0].0.as_ref(), b"3");
+    }
+
+    #[test]
+    fn global_filter_hides_non_matching_rows() {
+        let table = CsvTable::from_bytes(
+            b"name\napple\nbanana\navocado\n".to_vec(),
+            Dialect::default(),
+        )
+        .unwrap();
+        table
+            .set_view(&ViewSpec {
+                filter: Some(FilterSpec {
+                    query: "av".into(),
+                    regex: false,
+                    invert: false,
+                }),
+                sort: None,
+            })
+            .unwrap();
+        await_view(&table);
+
+        assert!(matches!(table.row_count(), RowCount::Exact(1)));
+        let viewport = table
+            .fetch(&request(0, 10, &[0]), &CancellationToken::new())
+            .unwrap();
+        assert_eq!(viewport.rows.len(), 1);
+        assert_eq!(viewport.rows[0][0].0.as_ref(), b"avocado");
+    }
+
+    #[test]
+    fn clear_view_returns_to_source_order() {
+        let table = CsvTable::from_bytes(b"n\n3\n1\n2\n".to_vec(), Dialect::default()).unwrap();
+        table
+            .set_view(&ViewSpec {
+                filter: None,
+                sort: Some(SortKey {
+                    column: ColumnId(0),
+                    direction: Direction::Ascending,
+                }),
+            })
+            .unwrap();
+        await_view(&table);
+        table.clear_view();
+
+        let viewport = table
+            .fetch(&request(0, 3, &[0]), &CancellationToken::new())
+            .unwrap();
+        assert_eq!(viewport.rows[0][0].0.as_ref(), b"3"); // source order restored
+    }
+
+    #[test]
+    fn infers_numeric_columns_for_alignment() {
+        let table =
+            CsvTable::from_bytes(b"name,age\nalice,30\nbob,25\n".to_vec(), Dialect::default())
+                .unwrap();
+        let columns = &table.schema().columns;
+        assert_eq!(columns[0].inferred, InferredType::Text); // "name" is text
+        assert_eq!(columns[1].inferred, InferredType::Integer); // "age" is integer
     }
 }

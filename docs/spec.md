@@ -329,10 +329,23 @@ the same change that completes the work.
   the Cache menu); **recent-files** persisted to the OS config dir (File menu + Empty-view list).
 
 ### Phase 2 — v1
-- ☐ Global async sort + global filter (hide non-matching) with progress/cancel
-- ☐ Regex + invert search; same-family export (both modes) + round-trip self-test
-- ☐ Saved views; keyboard nav; wide-table horizontal virtualisation + frozen columns
-- ☐ Type detection/formatting; null/empty handling
+- ✅ **Global async sort + global filter** — both modelled as one async **"view"** (filter → sort) over the
+  data, built on a background thread with progress (`view_status().building`) and cancellation (a new
+  view cancels the in-flight one). Sort compares numerically when both keys parse as numbers, else
+  lexically; asc/desc. `fetch` maps display rows through the view; `row_count` reflects the filtered count.
+  *In-memory* sort/filter for now — the spill-to-disk external merge sort (§4.3) is the documented
+  refinement for key+rownum sets that exceed RAM.
+- ✅ **Regex + invert search; same-family export (both modes) + round-trip self-test** — `Matcher`
+  (literal escaped to regex, case-insensitive, ReDoS-safe linear automaton, invert). Export to CSV/TSV in
+  two modes — **current view** (filter+sort+visible columns) and **source** (all rows/cols, view-bypassing
+  `fetch_source`) — with a native save dialog; quoting via the `csv` writer, covered by a round-trip test.
+- ✅ **Saved views; keyboard nav; frozen columns** — per-file column order/visibility/freeze + sort + filter
+  persisted to the config dir (JSON) and reapplied on reopen; arrow/page/home/end row selection with
+  scroll-to-selection; configurable frozen (sticky) leftmost columns. (`egui_table` already horizontally
+  virtualises columns.)
+- ✅ **Type detection/formatting; null/empty handling** — sampled per-column type inference
+  (Integer/Float/Boolean/Text, presentational only — never mutates bytes); numeric columns right-aligned;
+  empty (null) cells shown with a faint placeholder.
 
 ### Phase 3 — later
 - ☐ JSON + Parquet readers (proving the seam); cross-format export with coercion rules

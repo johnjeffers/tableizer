@@ -1,36 +1,106 @@
-//! Streaming search engine: literal, substring, and regex over a single cancellable scan
-//! (`docs/spec.md` §3.3).
+//! Search / filter matching (`docs/spec.md` §3.3).
 //!
-//! Regex MUST be linear-time / ReDoS-safe — the `regex` crate, never a backtracking engine — since
-//! patterns are user-supplied. Invert search is the complement of the match predicate. Highlight is
-//! Tier A (in place over the paginated view); hide-non-matching is Tier C (a virtualised result list).
+//! A literal query is escaped to a regex, so one code path serves literal, substring, AND regex —
+//! all on the `regex` crate's linear-time automaton (ReDoS-safe; user-supplied patterns are never a
+//! backtracking risk). A record matches if **any field** matches; `invert` flips the result.
 
-/// What to search for.
-#[derive(Clone, Debug)]
-pub enum Pattern {
-    /// A literal byte substring (accelerated with `memchr` / `aho-corasick` when implemented).
-    Literal(Vec<u8>),
-    /// A regular-expression source string (compiled with the linear-time `regex` engine).
-    Regex(String),
-}
+use crate::{Error, Result};
 
-/// How matches affect the view.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum SearchMode {
-    /// Highlight matches in place over the normal paginated view (Tier A).
-    #[default]
-    Highlight,
-    /// Hide rows that do not match — a virtualised result list (Tier C).
-    HideNonMatching,
-}
-
-/// A full search request, including whether to invert the match predicate.
-#[derive(Clone, Debug)]
-pub struct SearchQuery {
-    /// The pattern to match.
-    pub pattern: Pattern,
-    /// Whether to highlight or filter.
-    pub mode: SearchMode,
-    /// When true, show rows that do NOT match (invert search).
+/// A filter request as plain data (no compiled state), suitable for crossing the
+/// [`crate::ViewportSource`] seam.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FilterSpec {
+    /// The query (a literal substring, or a regex if `regex` is set).
+    pub query: String,
+    /// Interpret `query` as a regular expression rather than a literal substring.
+    pub regex: bool,
+    /// Show rows that do NOT match (invert search).
     pub invert: bool,
+}
+
+/// A compiled, case-insensitive matcher over record fields.
+pub struct Matcher {
+    regex: regex::bytes::Regex,
+    invert: bool,
+}
+
+impl Matcher {
+    /// Compile a matcher from a [`FilterSpec`]. Returns [`Error::InvalidPattern`] if a regex query
+    /// does not compile (literal queries always compile — they are escaped first).
+    pub fn compile(spec: &FilterSpec) -> Result<Self> {
+        let pattern = if spec.regex {
+            spec.query.clone()
+        } else {
+            regex::escape(&spec.query)
+        };
+        let regex = regex::bytes::RegexBuilder::new(&pattern)
+            .case_insensitive(true)
+            .build()
+            .map_err(|e| Error::InvalidPattern(e.to_string()))?;
+        Ok(Self {
+            regex,
+            invert: spec.invert,
+        })
+    }
+
+    /// Whether `record` matches: any field matches the pattern, XOR-ed with `invert`.
+    pub fn matches(&self, record: &csv::ByteRecord) -> bool {
+        let any = record.iter().any(|field| self.regex.is_match(field));
+        any ^ self.invert
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(fields: &[&str]) -> csv::ByteRecord {
+        let mut record = csv::ByteRecord::new();
+        for field in fields {
+            record.push_field(field.as_bytes());
+        }
+        record
+    }
+
+    fn matcher(query: &str, regex: bool, invert: bool) -> Matcher {
+        Matcher::compile(&FilterSpec {
+            query: query.into(),
+            regex,
+            invert,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn literal_match_is_a_case_insensitive_substring() {
+        let m = matcher("err", false, false);
+        assert!(m.matches(&record(&["INFO", "Error: x"])));
+        assert!(!m.matches(&record(&["INFO", "ok"])));
+    }
+
+    #[test]
+    fn regex_match() {
+        let m = matcher(r"^\d+$", true, false);
+        assert!(m.matches(&record(&["abc", "123"])));
+        assert!(!m.matches(&record(&["abc", "12x"])));
+    }
+
+    #[test]
+    fn invert_negates_the_match() {
+        let m = matcher("x", false, true);
+        assert!(!m.matches(&record(&["x"]))); // contains x → inverted → false
+        assert!(m.matches(&record(&["y"]))); // no x → inverted → true
+    }
+
+    #[test]
+    fn an_invalid_regex_is_an_error() {
+        assert!(matches!(
+            Matcher::compile(&FilterSpec {
+                query: "(".into(),
+                regex: true,
+                invert: false,
+            }),
+            Err(Error::InvalidPattern(_))
+        ));
+    }
 }
