@@ -1,4 +1,3 @@
-- Dark mode changes OS chrome
 - Parquet support
 - Package as a standard app
 - Create release artifacts for each OS

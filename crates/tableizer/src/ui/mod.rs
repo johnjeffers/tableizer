@@ -1,0 +1,161 @@
+//! The egui rendering layer: top-level window panels (toolbar, status bar, empty state), small
+//! shared widgets, and — via submodules — the menu bar, Settings window, and data grid.
+
+mod grid;
+mod menu;
+mod settings;
+
+pub(crate) use grid::grid;
+pub(crate) use menu::menu_bar;
+pub(crate) use settings::settings_window;
+
+use std::path::PathBuf;
+
+use eframe::egui;
+use tableizer_core::RowCount;
+
+use crate::model::LoadedTable;
+use crate::theme;
+
+/// A full-width menu choice row with hover + selected states (selected = accent fill + strong text),
+/// optionally led by a colored dot. Returns true when clicked.
+fn menu_choice(
+    ui: &mut egui::Ui,
+    width: f32,
+    selected: bool,
+    dot: Option<egui::Color32>,
+    text: &str,
+) -> bool {
+    let sel_bg = ui.visuals().selection.bg_fill;
+    let hover_bg = ui.visuals().widgets.hovered.weak_bg_fill;
+    let text_color = if selected {
+        ui.visuals().strong_text_color()
+    } else {
+        ui.visuals().text_color()
+    };
+    // In a menu popup, callers must pass a fixed width — `available_width()` there is the whole
+    // window and would balloon the menu; in a window, `available_width()` is correct.
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 24.0), egui::Sense::click());
+    if selected {
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(5), sel_bg);
+    } else if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(5), hover_bg);
+    }
+    let text_x = if let Some(color) = dot {
+        ui.painter()
+            .circle_filled(rect.left_center() + egui::vec2(13.0, 0.0), 5.0, color);
+        26.0
+    } else {
+        10.0
+    };
+    ui.painter().text(
+        rect.left_center() + egui::vec2(text_x, 0.0),
+        egui::Align2::LEFT_CENTER,
+        text,
+        theme::text_style(theme::MENU_ITEM).resolve(ui.style()),
+        text_color,
+    );
+    response.clicked()
+}
+
+/// The toolbar: the find/filter controls. `focus_find` requests focus on the Find field (⌘/Ctrl+F).
+pub(crate) fn toolbar(ui: &mut egui::Ui, loaded: &mut LoadedTable, focus_find: bool) {
+    let LoadedTable { view, .. } = loaded;
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Find:");
+        let find = ui.add(
+            egui::TextEdit::singleline(&mut view.search)
+                .hint_text("substring or regex")
+                .desired_width(180.0),
+        );
+        if focus_find {
+            find.request_focus();
+        }
+        ui.checkbox(&mut view.filter_mode, "Only show matches");
+        ui.checkbox(&mut view.regex, "Regex");
+        ui.checkbox(&mut view.invert, "Invert");
+    });
+}
+
+/// The bottom status bar: path, row count, indexing/view-build progress, data-quality, errors.
+pub(crate) fn status_bar(ui: &mut egui::Ui, loaded: &LoadedTable, palette: &theme::Palette) {
+    let (total, indexing) = match loaded.table.row_count() {
+        RowCount::Exact(n) => (n, false),
+        RowCount::AtLeast(n) => (n, true),
+    };
+    ui.horizontal(|ui| {
+        ui.label(loaded.path.display().to_string());
+        ui.separator();
+        if indexing {
+            ui.label(format!("indexing… ≥ {} rows", fmt_count(total)));
+            ui.spinner();
+            ui.ctx().request_repaint();
+        } else {
+            ui.label(format!("{} rows", fmt_count(total)));
+        }
+        let quality = loaded.table.data_quality();
+        if quality.complete && quality.ragged_rows > 0 {
+            ui.separator();
+            ui.colored_label(
+                palette.warning,
+                format!("⚠ {} ragged rows", fmt_count(quality.ragged_rows)),
+            );
+        }
+        if loaded.table.view_status().building {
+            ui.separator();
+            ui.spinner();
+            ui.label("applying view…");
+            ui.ctx().request_repaint();
+        }
+        if let Some(error) = &loaded.view.error {
+            ui.separator();
+            ui.colored_label(palette.error, format!("filter error: {error}"));
+        }
+        if let Some(span) = loaded.view.selected {
+            ui.separator();
+            let weak = ui.visuals().weak_text_color();
+            let label = if span.len() == 1 {
+                format!("row {} selected", fmt_count(span.lo() + 1))
+            } else {
+                format!(
+                    "rows {}–{} selected ({})",
+                    fmt_count(span.lo() + 1),
+                    fmt_count(span.hi() + 1),
+                    fmt_count(span.len())
+                )
+            };
+            ui.label(egui::RichText::new(label).color(weak));
+        }
+    });
+}
+
+/// The empty (no file) view.
+pub(crate) fn empty_view(ui: &mut egui::Ui, recent: &[PathBuf], to_open: &mut Option<PathBuf>) {
+    ui.add_space(40.0);
+    ui.vertical_centered(|ui| {
+        ui.heading("Tableizer");
+        ui.label("Open a file via a CLI argument, or pick a recent one below.");
+        ui.add_space(12.0);
+        for path in recent {
+            if ui.button(path.display().to_string()).clicked() {
+                *to_open = Some(path.clone());
+            }
+        }
+    });
+}
+
+/// Format a row count with thousands separators.
+fn fmt_count(n: u64) -> String {
+    let digits = n.to_string();
+    let bytes = digits.as_bytes();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
+}
