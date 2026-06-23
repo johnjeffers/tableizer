@@ -1367,15 +1367,8 @@ fn settings_window(
 
 /// The toolbar: dialect/header/encoding overrides, sort, and find/filter controls.
 fn toolbar(ui: &mut egui::Ui, loaded: &mut LoadedTable) {
-    let LoadedTable {
-        table,
-        encoding,
-        view,
-        ..
-    } = loaded;
+    let LoadedTable { view, .. } = loaded;
     ui.horizontal_wrapped(|ui| {
-        sort_menu(ui, table.schema(), encoding, &mut view.sort);
-        ui.separator();
         ui.label("Find:");
         ui.add(
             egui::TextEdit::singleline(&mut view.search)
@@ -1520,6 +1513,7 @@ fn grid(ui: &mut egui::Ui, loaded: &mut LoadedTable, palette: &theme::Palette) {
         headers,
         encoding,
         palette: palette.clone(),
+        sort: view.sort,
         search: view.search.to_lowercase(),
         selected_row: view.selected_row,
         hovered_row: view.hovered_row,
@@ -1529,6 +1523,7 @@ fn grid(ui: &mut egui::Ui, loaded: &mut LoadedTable, palette: &theme::Palette) {
         new_hovered: None,
         clicked_row: None,
         copy_row: None,
+        pending_sort: None,
     };
 
     let mut grid = egui_table::Table::new()
@@ -1544,6 +1539,20 @@ fn grid(ui: &mut egui::Ui, loaded: &mut LoadedTable, palette: &theme::Palette) {
 
     if let Some((dragged, target, after)) = delegate.pending_reorder {
         reorder(&mut layout.order, dragged, target, after);
+    }
+    // Clicking a column header cycles its sort: none → ascending → descending → none.
+    if let Some(col) = delegate.pending_sort {
+        view.sort = match view.sort {
+            Some(s) if s.column == col && s.direction == Direction::Ascending => Some(SortKey {
+                column: col,
+                direction: Direction::Descending,
+            }),
+            Some(s) if s.column == col && s.direction == Direction::Descending => None,
+            _ => Some(SortKey {
+                column: col,
+                direction: Direction::Ascending,
+            }),
+        };
     }
     if let Some(row) = delegate.clicked_row {
         view.selected_row = Some(row);
@@ -1657,52 +1666,6 @@ fn parsing_menu(ui: &mut egui::Ui, loaded: &mut LoadedTable) {
     }
 }
 
-fn sort_menu(
-    ui: &mut egui::Ui,
-    schema: &Schema,
-    encoding: &'static Encoding,
-    sort: &mut Option<SortKey>,
-) {
-    let label = match sort {
-        Some(s) => format!(
-            "Sort: col{} {}",
-            s.column.0,
-            if s.direction == Direction::Ascending {
-                "asc"
-            } else {
-                "desc"
-            }
-        ),
-        None => "Sort: none".to_string(),
-    };
-    ui.menu_button(label, |ui| {
-        if ui.button("(none)").clicked() {
-            *sort = None;
-            ui.close();
-        }
-        ui.separator();
-        for i in 0..schema.columns.len() as u32 {
-            ui.horizontal(|ui| {
-                ui.label(column_name(schema, ColumnId(i), encoding));
-                if ui.small_button("asc").clicked() {
-                    *sort = Some(SortKey {
-                        column: ColumnId(i),
-                        direction: Direction::Ascending,
-                    });
-                    ui.close();
-                }
-                if ui.small_button("desc").clicked() {
-                    *sort = Some(SortKey {
-                        column: ColumnId(i),
-                        direction: Direction::Descending,
-                    });
-                    ui.close();
-                }
-            });
-        }
-    });
-}
-
 /// Export the table to a user-chosen file (native save dialog). Errors are reported to stderr.
 fn export_to_file(
     table: &dyn ViewportSource,
@@ -1761,6 +1724,8 @@ struct GridDelegate<'a> {
     encoding: &'static Encoding,
     /// Resolved theme colors + metrics for painting.
     palette: theme::Palette,
+    /// Active sort (for the header indicator), if any.
+    sort: Option<SortKey>,
     /// Lowercased search query; cells containing it are highlighted (empty = no highlight).
     search: String,
     /// Selected display row to highlight, if any.
@@ -1778,6 +1743,8 @@ struct GridDelegate<'a> {
     clicked_row: Option<u64>,
     /// Row to copy as TSV (from the "Copy row" context item); handled after `show`.
     copy_row: Option<u64>,
+    /// Column whose header was clicked this frame (read back to cycle the sort).
+    pending_sort: Option<ColumnId>,
 }
 
 impl egui_table::TableDelegate for GridDelegate<'_> {
@@ -1852,6 +1819,32 @@ impl egui_table::TableDelegate for GridDelegate<'_> {
             .truncate(),
         );
 
+        // Sort indicator: a small accent triangle on the sorted column (painted, not a glyph).
+        if let Some(sort) = self.sort
+            && sort.column == col_id
+        {
+            let cx = rect.right() - 9.0;
+            let cy = rect.center().y;
+            let points = if sort.direction == Direction::Ascending {
+                vec![
+                    egui::pos2(cx - 4.0, cy + 2.5),
+                    egui::pos2(cx + 4.0, cy + 2.5),
+                    egui::pos2(cx, cy - 3.0),
+                ]
+            } else {
+                vec![
+                    egui::pos2(cx - 4.0, cy - 2.5),
+                    egui::pos2(cx + 4.0, cy - 2.5),
+                    egui::pos2(cx, cy + 3.0),
+                ]
+            };
+            ui.painter().add(egui::Shape::convex_polygon(
+                points,
+                self.palette.accent,
+                egui::Stroke::NONE,
+            ));
+        }
+
         // Dim the column currently being dragged.
         if ui.ctx().is_being_dragged(handle_id) {
             ui.painter()
@@ -1889,6 +1882,21 @@ impl egui_table::TableDelegate for GridDelegate<'_> {
                 .position(|&c| c == *dragged)
                 .is_some_and(|src| src < idx);
             self.pending_reorder = Some((*dragged, col_id, after));
+        }
+
+        // Click the header body (right of the grip) to cycle this column's sort.
+        let sort_rect =
+            egui::Rect::from_min_max(egui::pos2(handle.rect.right() + 4.0, rect.top()), rect.max);
+        let sort_click = ui.interact(
+            sort_rect,
+            egui::Id::new(("tz-col-sort", col_id.0)),
+            egui::Sense::click(),
+        );
+        if sort_click.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if sort_click.clicked() {
+            self.pending_sort = Some(col_id);
         }
     }
 
