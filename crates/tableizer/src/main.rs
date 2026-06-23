@@ -23,39 +23,187 @@ use tableizer_core::{
     RowCount, RowRange, Schema, SortKey, ViewSpec, ViewportRequest, ViewportSource, parse::Dialect,
 };
 
-/// Every UI color in one place. [`theme`] builds the base egui theme from these constants, and the
-/// toolbar/grid use the accent constants directly — nothing else hardcodes a color. Retheme the app
-/// by editing this module.
-mod palette {
-    use eframe::egui::{Color32, Visuals};
+/// The app's whole visual system in one place: a light/dark theme that can follow the OS, a
+/// user-selectable accent color and layout density. [`build`] turns [`Settings`] into an egui
+/// [`Style`] (spacing, rounding, widget colors) plus a [`Palette`] of the extra colors the custom
+/// grid/toolbar painting needs. Retheme by editing this module.
+mod theme {
+    use eframe::egui::{Color32, CornerRadius, Margin, Stroke, Style, Theme, Vec2, style::Spacing};
+    use serde::{Deserialize, Serialize};
 
-    /// Window / panel background.
-    // pub const BACKGROUND: Color32 = Color32::from_gray(27);
-    pub const BACKGROUND: Color32 = Color32::from_gray(248);
-    /// Primary text (cells, labels, menus).
-    pub const TEXT: Color32 = Color32::from_gray(210);
-    /// Column-header bar background.
-    pub const HEADER_BG: Color32 = Color32::from_gray(60);
-    /// Column-header text.
-    pub const HEADER_TEXT: Color32 = Color32::WHITE;
-    /// Keyboard-selected row highlight (also egui's text/widget selection fill).
-    pub const ROW_SELECTED: Color32 = Color32::from_rgb(40, 55, 85);
-    /// Search-match cell highlight.
-    pub const SEARCH_MATCH: Color32 = Color32::from_gray(210);
-    /// Data-quality warning badge (e.g. ragged rows).
-    pub const WARNING: Color32 = Color32::from_rgb(230, 170, 60);
-    /// Error text (e.g. invalid filter regex).
-    pub const ERROR: Color32 = Color32::from_rgb(230, 100, 100);
+    /// Light/dark selection.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum Mode {
+        /// Follow the OS light/dark setting.
+        #[default]
+        Auto,
+        Light,
+        Dark,
+    }
 
-    /// The base egui theme, derived from the palette. Starts from the dark preset (for sensible
-    /// per-widget-state shading) and overrides the colors that define the app's look.
-    pub fn theme() -> Visuals {
-        let mut visuals = Visuals::dark();
-        visuals.panel_fill = BACKGROUND;
-        visuals.window_fill = BACKGROUND;
-        visuals.override_text_color = Some(TEXT);
-        visuals.selection.bg_fill = ROW_SELECTED;
-        visuals
+    impl Mode {
+        pub const ALL: [Mode; 3] = [Mode::Auto, Mode::Light, Mode::Dark];
+        pub fn label(self) -> &'static str {
+            match self {
+                Mode::Auto => "Auto (OS)",
+                Mode::Light => "Light",
+                Mode::Dark => "Dark",
+            }
+        }
+    }
+
+    /// Accent color for selection, active controls, links and focus.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum Accent {
+        #[default]
+        Blue,
+        Teal,
+        Violet,
+        Amber,
+    }
+
+    impl Accent {
+        pub const ALL: [Accent; 4] = [Accent::Blue, Accent::Teal, Accent::Violet, Accent::Amber];
+        pub fn label(self) -> &'static str {
+            match self {
+                Accent::Blue => "Blue",
+                Accent::Teal => "Teal",
+                Accent::Violet => "Violet",
+                Accent::Amber => "Amber",
+            }
+        }
+        pub fn color(self) -> Color32 {
+            match self {
+                Accent::Blue => Color32::from_rgb(56, 124, 246),
+                Accent::Teal => Color32::from_rgb(22, 160, 145),
+                Accent::Violet => Color32::from_rgb(138, 104, 244),
+                Accent::Amber => Color32::from_rgb(228, 150, 42),
+            }
+        }
+    }
+
+    /// Layout density.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum Density {
+        #[default]
+        Comfortable,
+        Compact,
+    }
+
+    impl Density {
+        pub const ALL: [Density; 2] = [Density::Comfortable, Density::Compact];
+        pub fn label(self) -> &'static str {
+            match self {
+                Density::Comfortable => "Comfortable",
+                Density::Compact => "Compact",
+            }
+        }
+    }
+
+    /// Persisted, user-editable theme settings.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct Settings {
+        pub mode: Mode,
+        pub accent: Accent,
+        pub density: Density,
+    }
+
+    /// Extra colors + metrics the custom grid/toolbar painting needs (beyond the egui [`Style`]).
+    #[derive(Clone, Copy)]
+    pub struct Palette {
+        pub header_bg: Color32,
+        pub header_text: Color32,
+        pub row_selected: Color32,
+        pub search_match: Color32,
+        pub stripe: Color32,
+        pub warning: Color32,
+        pub error: Color32,
+        pub row_height: f32,
+        pub header_height: f32,
+    }
+
+    /// Whether `settings` resolves to dark, given the OS preference.
+    pub fn is_dark(settings: Settings, system_dark: bool) -> bool {
+        match settings.mode {
+            Mode::Auto => system_dark,
+            Mode::Light => false,
+            Mode::Dark => true,
+        }
+    }
+
+    fn with_alpha(color: Color32, alpha: u8) -> Color32 {
+        Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
+    }
+
+    /// Build the egui [`Style`] + [`Palette`] for `settings` under the given OS theme.
+    pub fn build(settings: Settings, system_dark: bool) -> (Style, Palette) {
+        let dark = is_dark(settings, system_dark);
+        let accent = settings.accent.color();
+        let comfortable = settings.density == Density::Comfortable;
+
+        let mut visuals = if dark { Theme::Dark } else { Theme::Light }.default_visuals();
+        // Accent wherever egui draws selection / focus / links.
+        visuals.selection.bg_fill = with_alpha(accent, if dark { 110 } else { 90 });
+        visuals.selection.stroke = Stroke::new(1.0, accent);
+        visuals.hyperlink_color = accent;
+        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, with_alpha(accent, 160));
+        // Consistent, subtle rounding everywhere.
+        let radius = CornerRadius::same(5);
+        visuals.widgets.noninteractive.corner_radius = radius;
+        visuals.widgets.inactive.corner_radius = radius;
+        visuals.widgets.hovered.corner_radius = radius;
+        visuals.widgets.active.corner_radius = radius;
+        visuals.widgets.open.corner_radius = radius;
+        visuals.window_corner_radius = CornerRadius::same(8);
+        visuals.menu_corner_radius = CornerRadius::same(6);
+
+        let scale = if comfortable { 1.0 } else { 0.65 };
+        let spacing = Spacing {
+            item_spacing: Vec2::new(8.0 * scale, 6.0 * scale),
+            button_padding: Vec2::new(8.0 * scale, 4.0 * scale),
+            menu_margin: Margin::same((6.0 * scale) as i8),
+            window_margin: Margin::same((8.0 * scale) as i8),
+            interact_size: Vec2::new(
+                Spacing::default().interact_size.x,
+                if comfortable { 24.0 } else { 20.0 },
+            ),
+            ..Spacing::default()
+        };
+
+        let style = Style {
+            visuals,
+            spacing,
+            ..Style::default()
+        };
+
+        let palette = Palette {
+            header_bg: if dark {
+                Color32::from_gray(48)
+            } else {
+                Color32::from_gray(232)
+            },
+            header_text: if dark {
+                Color32::from_gray(235)
+            } else {
+                Color32::from_gray(25)
+            },
+            row_selected: with_alpha(accent, if dark { 70 } else { 55 }),
+            search_match: Color32::from_rgba_unmultiplied(250, 205, 70, if dark { 50 } else { 95 }),
+            stripe: if dark {
+                Color32::from_white_alpha(6)
+            } else {
+                Color32::from_black_alpha(8)
+            },
+            warning: Color32::from_rgb(235, 165, 50),
+            error: if dark {
+                Color32::from_rgb(240, 110, 110)
+            } else {
+                Color32::from_rgb(200, 50, 50)
+            },
+            row_height: if comfortable { 24.0 } else { 20.0 },
+            header_height: if comfortable { 28.0 } else { 22.0 },
+        };
+        (style, palette)
     }
 }
 
@@ -71,9 +219,8 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Tableizer",
         native_options,
-        Box::new(move |cc| {
-            // Theme is derived entirely from `palette`, so every color lives in one place.
-            cc.egui_ctx.set_visuals(palette::theme());
+        Box::new(move |_cc| {
+            // The theme (`theme` module) is resolved and applied each frame in `App::update`.
             Ok(Box::new(TableizerApp::new(path)))
         }),
     )
@@ -369,9 +516,42 @@ fn human_bytes(n: u64) -> String {
     format!("{size:.1} {}", UNITS[unit])
 }
 
+/// Theme-settings persistence in the OS config dir.
+mod prefs {
+    use crate::theme::Settings;
+    use std::path::PathBuf;
+
+    fn file() -> Option<PathBuf> {
+        let base = directories::BaseDirs::new()?;
+        Some(base.config_dir().join("tableizer").join("theme.json"))
+    }
+
+    pub fn load() -> Settings {
+        file()
+            .and_then(|f| std::fs::read(f).ok())
+            .and_then(|data| serde_json::from_slice(&data).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(settings: &Settings) {
+        let Some(path) = file() else {
+            return;
+        };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(data) = serde_json::to_vec_pretty(settings) {
+            let _ = std::fs::write(path, data);
+        }
+    }
+}
+
 struct TableizerApp {
     view: View,
     recent: Vec<PathBuf>,
+    theme: theme::Settings,
+    /// `(settings, system_dark)` last pushed to egui — restyle only when this changes.
+    applied_theme: Option<(theme::Settings, bool)>,
 }
 
 impl TableizerApp {
@@ -379,6 +559,8 @@ impl TableizerApp {
         let mut app = Self {
             view: View::Empty,
             recent: recent::load(),
+            theme: prefs::load(),
+            applied_theme: None,
         };
         if let Some(path) = path {
             app.open_path(path);
@@ -416,146 +598,229 @@ impl TableizerApp {
 
 impl eframe::App for TableizerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let mut to_open: Option<PathBuf> = None;
+        let ctx = ui.ctx().clone();
 
-        ui.horizontal(|ui| {
-            ui.menu_button("File", |ui| {
-                if self.recent.is_empty() {
-                    ui.label("(no recent files)");
-                }
-                for path in &self.recent {
-                    if ui.button(path.display().to_string()).clicked() {
-                        to_open = Some(path.clone());
-                        ui.close();
-                    }
-                }
-            });
-            ui.menu_button("Cache", |ui| {
-                ui.label(format!(
-                    "Index cache: {}",
-                    human_bytes(tableizer_core::cache::total_size())
-                ));
-                if ui.button("Clear cache").clicked() {
-                    tableizer_core::cache::clear();
-                    ui.close();
-                }
-            });
-        });
-        ui.separator();
-
-        match &mut self.view {
-            View::Empty => {
-                ui.heading("Tableizer");
-                ui.label("Open a file via a CLI argument, or pick one from the File menu.");
-                if !self.recent.is_empty() {
-                    ui.add_space(8.0);
-                    ui.label("Recent:");
-                    for path in &self.recent {
-                        if ui.button(path.display().to_string()).clicked() {
-                            to_open = Some(path.clone());
-                        }
-                    }
-                }
-            }
-            View::Failed { path, error } => {
-                ui.heading("Could not open file");
-                ui.label(format!("{}: {error}", path.display()));
-            }
-            View::Loaded(loaded) => show_table(ui, loaded),
+        // Resolve the theme (following the OS for `Auto`) and restyle only when it changes.
+        let system_dark = ctx.system_theme().is_none_or(|t| t == egui::Theme::Dark);
+        let (style, palette) = theme::build(self.theme, system_dark);
+        if self.applied_theme != Some((self.theme, system_dark)) {
+            ctx.set_global_style(style);
+            self.applied_theme = Some((self.theme, system_dark));
         }
 
+        let mut to_open: Option<PathBuf> = None;
+        let theme_before = self.theme;
+        let dialect_before = match &self.view {
+            View::Loaded(loaded) => Some(loaded.dialect),
+            _ => None,
+        };
+
+        egui::Panel::top("menu_bar").show_inside(ui, |ui| {
+            egui::MenuBar::new().ui(ui, |ui| menu_bar(ui, self, &mut to_open));
+        });
+
+        if matches!(self.view, View::Loaded(_)) {
+            egui::Panel::top("toolbar").show_inside(ui, |ui| {
+                if let View::Loaded(loaded) = &mut self.view {
+                    toolbar(ui, loaded);
+                }
+            });
+        }
+
+        // React to the toolbar's edits: a dialect change re-opens the file; otherwise apply the
+        // filter/sort view and persist the per-file saved view.
+        if let View::Loaded(loaded) = &mut self.view {
+            if Some(loaded.dialect) != dialect_before {
+                if let Ok(reopened) = open_table(&loaded.path, loaded.dialect) {
+                    loaded.table = reopened;
+                    loaded.layout = GridLayout::new(loaded.table.schema().columns.len());
+                }
+            } else {
+                let desired = loaded.view.desired();
+                if desired != loaded.view.applied {
+                    loaded.view.applied = desired.clone();
+                    loaded.view.error = match loaded.table.set_view(&desired) {
+                        Ok(()) => None,
+                        Err(error) => Some(error.to_string()),
+                    };
+                }
+                let current = SavedView::snapshot(&loaded.layout, &loaded.view);
+                if current != loaded.saved {
+                    views::save(&loaded.path, &current);
+                    loaded.saved = current;
+                }
+            }
+        }
+
+        if matches!(self.view, View::Loaded(_)) {
+            egui::Panel::bottom("status_bar").show_inside(ui, |ui| {
+                if let View::Loaded(loaded) = &self.view {
+                    status_bar(ui, loaded, &palette);
+                }
+            });
+        }
+
+        egui::CentralPanel::default().show_inside(ui, |ui| match &mut self.view {
+            View::Empty => empty_view(ui, &self.recent, &mut to_open),
+            View::Failed { path, error } => {
+                ui.add_space(40.0);
+                ui.vertical_centered(|ui| {
+                    ui.heading("Could not open file");
+                    ui.label(format!("{}: {error}", path.display()));
+                });
+            }
+            View::Loaded(loaded) => grid(ui, loaded, &palette),
+        });
+
+        if self.theme != theme_before {
+            prefs::save(&self.theme);
+        }
         if let Some(path) = to_open {
             self.open_path(path);
         }
     }
 
-    /// `App::ui` hands us a `Ui` with no background, so the window background *is* the clear color —
-    /// this is what makes [`palette::BACKGROUND`] actually paint the app background.
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        palette::BACKGROUND.to_normalized_gamma_f32()
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        // Window edges match the panel background (set via the theme `Style`).
+        visuals.panel_fill.to_normalized_gamma_f32()
     }
 }
 
-/// Render the loaded table: a toolbar (status + dialect/encoding override + columns) and the grid.
-fn show_table(ui: &mut egui::Ui, loaded: &mut LoadedTable) {
+/// The menu bar (File / View / Export / Cache / Settings).
+fn menu_bar(ui: &mut egui::Ui, app: &mut TableizerApp, to_open: &mut Option<PathBuf>) {
+    ui.menu_button("File", |ui| {
+        if app.recent.is_empty() {
+            ui.label("(no recent files)");
+        }
+        for path in &app.recent {
+            if ui.button(path.display().to_string()).clicked() {
+                *to_open = Some(path.clone());
+                ui.close();
+            }
+        }
+    });
+
+    if let View::Loaded(loaded) = &mut app.view {
+        ui.menu_button("View", |ui| {
+            ui.label("Columns");
+            for (i, shown) in loaded.layout.visible.iter_mut().enumerate() {
+                ui.checkbox(
+                    shown,
+                    column_name(loaded.table.schema(), ColumnId(i as u32), loaded.encoding),
+                );
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("Freeze columns:");
+                ui.add(
+                    egui::DragValue::new(&mut loaded.layout.frozen)
+                        .range(0..=loaded.table.schema().columns.len()),
+                );
+            });
+        });
+        ui.menu_button("Export", |ui| export_menu(ui, loaded));
+    }
+
+    ui.menu_button("Cache", |ui| {
+        ui.label(format!(
+            "Index cache: {}",
+            human_bytes(tableizer_core::cache::total_size())
+        ));
+        if ui.button("Clear cache").clicked() {
+            tableizer_core::cache::clear();
+            ui.close();
+        }
+    });
+
+    ui.menu_button("Settings", |ui| settings_menu(ui, &mut app.theme));
+}
+
+/// The Export submenu: current view or source, as CSV or TSV, to a chosen file.
+fn export_menu(ui: &mut egui::Ui, loaded: &LoadedTable) {
+    let mut request: Option<(ExportScope, u8, &str)> = None;
+    ui.label("Current view");
+    if ui.button("as CSV…").clicked() {
+        request = Some((ExportScope::CurrentView, b',', "csv"));
+        ui.close();
+    }
+    if ui.button("as TSV…").clicked() {
+        request = Some((ExportScope::CurrentView, b'\t', "tsv"));
+        ui.close();
+    }
+    ui.separator();
+    ui.label("Source (all rows & columns)");
+    if ui.button("as CSV…").clicked() {
+        request = Some((ExportScope::Source, b',', "csv"));
+        ui.close();
+    }
+    if ui.button("as TSV…").clicked() {
+        request = Some((ExportScope::Source, b'\t', "tsv"));
+        ui.close();
+    }
+    if let Some((scope, delimiter, extension)) = request {
+        export_to_file(
+            loaded.table.as_ref(),
+            &loaded.dialect,
+            loaded.encoding,
+            &loaded.layout,
+            scope,
+            delimiter,
+            extension,
+        );
+    }
+}
+
+/// The Settings submenu: theme mode, accent, density (live; persisted on change).
+fn settings_menu(ui: &mut egui::Ui, settings: &mut theme::Settings) {
+    ui.label("Theme");
+    for mode in theme::Mode::ALL {
+        if ui
+            .selectable_label(settings.mode == mode, mode.label())
+            .clicked()
+        {
+            settings.mode = mode;
+        }
+    }
+    ui.separator();
+    ui.label("Accent");
+    for accent in theme::Accent::ALL {
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+            ui.painter()
+                .rect_filled(rect, egui::CornerRadius::same(3), accent.color());
+            if ui
+                .selectable_label(settings.accent == accent, accent.label())
+                .clicked()
+            {
+                settings.accent = accent;
+            }
+        });
+    }
+    ui.separator();
+    ui.label("Density");
+    for density in theme::Density::ALL {
+        if ui
+            .selectable_label(settings.density == density, density.label())
+            .clicked()
+        {
+            settings.density = density;
+        }
+    }
+}
+
+/// The toolbar: dialect/header/encoding overrides, sort, and find/filter controls.
+fn toolbar(ui: &mut egui::Ui, loaded: &mut LoadedTable) {
     let LoadedTable {
-        path,
         table,
-        layout,
         dialect,
         encoding,
         view,
-        saved,
+        ..
     } = loaded;
-    let (total, indexing) = match table.row_count() {
-        RowCount::Exact(n) => (n, false),
-        RowCount::AtLeast(n) => (n, true),
-    };
-
-    let dialect_before = *dialect;
-    ui.horizontal(|ui| {
-        ui.heading("Tableizer");
-        if indexing {
-            ui.label(format!("{}  ·  indexing… ≥ {total} rows", path.display()));
-            ui.spinner();
-            ui.ctx().request_repaint();
-        } else {
-            ui.label(format!("{}  ·  {total} rows", path.display()));
-        }
-        let quality = table.data_quality();
-        if quality.complete && quality.ragged_rows > 0 {
-            ui.colored_label(
-                palette::WARNING,
-                format!("⚠ {} ragged rows", quality.ragged_rows),
-            );
-        }
-        ui.separator();
+    ui.horizontal_wrapped(|ui| {
         dialect_menu(ui, dialect);
-        ui.checkbox(&mut dialect.has_header, "Header row");
+        ui.checkbox(&mut dialect.has_header, "Header");
         encoding_menu(ui, encoding);
-        ui.menu_button("Columns", |ui| {
-            for (i, shown) in layout.visible.iter_mut().enumerate() {
-                ui.checkbox(
-                    shown,
-                    column_name(table.schema(), ColumnId(i as u32), encoding),
-                );
-            }
-        });
-        ui.label("Freeze:");
-        ui.add(egui::DragValue::new(&mut layout.frozen).range(0..=table.schema().columns.len()));
-        ui.menu_button("Export", |ui| {
-            let mut request: Option<(ExportScope, u8, &str)> = None;
-            ui.label("Current view:");
-            if ui.button("CSV…").clicked() {
-                request = Some((ExportScope::CurrentView, b',', "csv"));
-                ui.close();
-            }
-            if ui.button("TSV…").clicked() {
-                request = Some((ExportScope::CurrentView, b'\t', "tsv"));
-                ui.close();
-            }
-            ui.separator();
-            ui.label("Source (all rows & columns):");
-            if ui.button("CSV…").clicked() {
-                request = Some((ExportScope::Source, b',', "csv"));
-                ui.close();
-            }
-            if ui.button("TSV…").clicked() {
-                request = Some((ExportScope::Source, b'\t', "tsv"));
-                ui.close();
-            }
-            if let Some((scope, delimiter, extension)) = request {
-                export_to_file(
-                    table.as_ref(),
-                    dialect,
-                    encoding,
-                    layout,
-                    scope,
-                    delimiter,
-                    extension,
-                );
-            }
-        });
         ui.separator();
         sort_menu(ui, table.schema(), encoding, &mut view.sort);
         ui.separator();
@@ -563,64 +828,90 @@ fn show_table(ui: &mut egui::Ui, loaded: &mut LoadedTable) {
         ui.add(
             egui::TextEdit::singleline(&mut view.search)
                 .hint_text("substring or regex")
-                .desired_width(160.0),
+                .desired_width(180.0),
         );
         ui.checkbox(&mut view.filter_mode, "Hide non-matching");
         ui.checkbox(&mut view.regex, "Regex");
         ui.checkbox(&mut view.invert, "Invert");
     });
-    ui.separator();
+}
 
-    // A dialect change re-opens the file (column count may change), so skip rendering this frame.
-    // (Encoding is display-only — no re-open needed.)
-    if *dialect != dialect_before {
-        if let Ok(reopened) = open_table(path, *dialect) {
-            *table = reopened;
-            *layout = GridLayout::new(table.schema().columns.len());
+/// The bottom status bar: path, row count, indexing/view-build progress, data-quality, errors.
+fn status_bar(ui: &mut egui::Ui, loaded: &LoadedTable, palette: &theme::Palette) {
+    let (total, indexing) = match loaded.table.row_count() {
+        RowCount::Exact(n) => (n, false),
+        RowCount::AtLeast(n) => (n, true),
+    };
+    ui.horizontal(|ui| {
+        ui.label(loaded.path.display().to_string());
+        ui.separator();
+        if indexing {
+            ui.label(format!("indexing… ≥ {} rows", fmt_count(total)));
+            ui.spinner();
+            ui.ctx().request_repaint();
+        } else {
+            ui.label(format!("{} rows", fmt_count(total)));
         }
-        return;
-    }
-
-    // Apply the desired view (filter/sort) to the engine when the controls change.
-    let desired = view.desired();
-    if desired != view.applied {
-        view.applied = desired.clone();
-        view.error = match table.set_view(&desired) {
-            Ok(()) => None,
-            Err(error) => Some(error.to_string()),
-        };
-    }
-    if let Some(error) = &view.error {
-        ui.colored_label(palette::ERROR, format!("filter error: {error}"));
-    }
-    if table.view_status().building {
-        ui.horizontal(|ui| {
+        let quality = loaded.table.data_quality();
+        if quality.complete && quality.ragged_rows > 0 {
+            ui.separator();
+            ui.colored_label(
+                palette.warning,
+                format!("⚠ {} ragged rows", fmt_count(quality.ragged_rows)),
+            );
+        }
+        if loaded.table.view_status().building {
+            ui.separator();
             ui.spinner();
             ui.label("applying view…");
-        });
-        ui.ctx().request_repaint();
-    }
+            ui.ctx().request_repaint();
+        }
+        if let Some(error) = &loaded.view.error {
+            ui.separator();
+            ui.colored_label(palette.error, format!("filter error: {error}"));
+        }
+    });
+}
 
-    // Persist this file's view (column layout + sort + filter) whenever it changes.
-    let current = SavedView::snapshot(layout, view);
-    if current != *saved {
-        views::save(path, &current);
-        *saved = current;
-    }
+/// The empty (no file) view.
+fn empty_view(ui: &mut egui::Ui, recent: &[PathBuf], to_open: &mut Option<PathBuf>) {
+    ui.add_space(40.0);
+    ui.vertical_centered(|ui| {
+        ui.heading("Tableizer");
+        ui.label("Open a file via a CLI argument, or pick a recent one below.");
+        ui.add_space(12.0);
+        for path in recent {
+            if ui.button(path.display().to_string()).clicked() {
+                *to_open = Some(path.clone());
+            }
+        }
+    });
+}
 
-    // Snapshot the (menu-applied) encoding as a plain Copy value for rendering.
+/// The virtualised grid, plus keyboard navigation and column-reorder application.
+fn grid(ui: &mut egui::Ui, loaded: &mut LoadedTable, palette: &theme::Palette) {
+    let LoadedTable {
+        table,
+        layout,
+        encoding,
+        view,
+        ..
+    } = loaded;
     let encoding: &'static Encoding = encoding;
+    let total = match table.row_count() {
+        RowCount::Exact(n) | RowCount::AtLeast(n) => n,
+    };
 
     let displayed = layout.displayed();
     if displayed.is_empty() {
-        ui.label("All columns hidden.");
+        ui.add_space(20.0);
+        ui.vertical_centered(|ui| ui.label("All columns hidden — enable some in the View menu."));
         return;
     }
     let headers: Vec<String> = displayed
         .iter()
         .map(|&c| column_name(table.schema(), c, encoding))
         .collect();
-
     let table_columns: Vec<egui_table::Column> = (0..displayed.len())
         .map(|_| egui_table::Column::new(140.0).resizable(true))
         .collect();
@@ -661,6 +952,7 @@ fn show_table(ui: &mut egui::Ui, loaded: &mut LoadedTable) {
         columns: displayed,
         headers,
         encoding,
+        palette: *palette,
         search: view.search.to_lowercase(),
         selected_row: view.selected_row,
         cache_start: 0,
@@ -673,7 +965,7 @@ fn show_table(ui: &mut egui::Ui, loaded: &mut LoadedTable) {
         .num_rows(total)
         .columns(table_columns)
         .num_sticky_cols(frozen)
-        .headers(vec![egui_table::HeaderRow::new(22.0)]);
+        .headers(vec![egui_table::HeaderRow::new(palette.header_height)]);
     if let Some(row) = scroll_to {
         grid = grid.scroll_to_row(row, Some(egui::Align::Center));
     }
@@ -682,6 +974,20 @@ fn show_table(ui: &mut egui::Ui, loaded: &mut LoadedTable) {
     if let Some((dragged, before)) = delegate.pending_reorder {
         reorder(&mut layout.order, dragged, before);
     }
+}
+
+/// Format a row count with thousands separators.
+fn fmt_count(n: u64) -> String {
+    let digits = n.to_string();
+    let bytes = digits.as_bytes();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
 }
 
 fn dialect_menu(ui: &mut egui::Ui, dialect: &mut Dialect) {
@@ -822,6 +1128,8 @@ struct GridDelegate<'a> {
     /// Display names aligned with `columns`.
     headers: Vec<String>,
     encoding: &'static Encoding,
+    /// Resolved theme colors + metrics for painting.
+    palette: theme::Palette,
     /// Lowercased search query; cells containing it are highlighted (empty = no highlight).
     search: String,
     /// Keyboard-selected display row to highlight, if any.
@@ -853,14 +1161,21 @@ impl egui_table::TableDelegate for GridDelegate<'_> {
         self.cache = viewport.rows;
     }
 
+    fn default_row_height(&self) -> f32 {
+        self.palette.row_height
+    }
+
     fn header_cell_ui(&mut self, ui: &mut egui::Ui, cell: &egui_table::HeaderCellInfo) {
         let idx = cell.col_range.start;
         let (Some(&col_id), Some(name)) = (self.columns.get(idx), self.headers.get(idx)) else {
             return;
         };
         // Paint a distinct header bar so headers are always visible regardless of theme.
-        ui.painter()
-            .rect_filled(ui.max_rect(), egui::CornerRadius::ZERO, palette::HEADER_BG);
+        ui.painter().rect_filled(
+            ui.max_rect(),
+            egui::CornerRadius::ZERO,
+            self.palette.header_bg,
+        );
         // The header is a drag source carrying its column id, and a drop target for reordering.
         let response = ui
             .dnd_drag_source(egui::Id::new(("tz-col", col_id.0)), col_id, |ui| {
@@ -869,7 +1184,7 @@ impl egui_table::TableDelegate for GridDelegate<'_> {
                     egui::Label::new(
                         egui::RichText::new(name.as_str())
                             .strong()
-                            .color(palette::HEADER_TEXT),
+                            .color(self.palette.header_text),
                     )
                     .selectable(false),
                 );
@@ -896,20 +1211,24 @@ impl egui_table::TableDelegate for GridDelegate<'_> {
         };
         let text = decode_field(&cell_value.0, self.encoding);
 
-        // Highlight the keyboard-selected row.
+        // Zebra stripe (odd rows) → keyboard selection → search match, painted in order so the most
+        // specific highlight wins.
+        if cell.row_nr % 2 == 1 {
+            ui.painter()
+                .rect_filled(ui.max_rect(), egui::CornerRadius::ZERO, self.palette.stripe);
+        }
         if Some(cell.row_nr) == self.selected_row {
             ui.painter().rect_filled(
                 ui.max_rect(),
                 egui::CornerRadius::ZERO,
-                palette::ROW_SELECTED,
+                self.palette.row_selected,
             );
         }
-        // Highlight cells containing the search query (over the selection).
         if cell_matches(&text, &self.search) {
             ui.painter().rect_filled(
                 ui.max_rect(),
                 egui::CornerRadius::ZERO,
-                palette::SEARCH_MATCH,
+                self.palette.search_match,
             );
         }
         // Right-align numeric columns; show empty (null) cells as a faint placeholder.
