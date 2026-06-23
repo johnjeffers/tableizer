@@ -27,10 +27,18 @@ pub(crate) fn decode_field(bytes: &[u8], encoding: &'static Encoding) -> String 
     text.strip_prefix('\u{feff}').unwrap_or(&text).to_owned()
 }
 
-/// Case-insensitive substring match. `query_lower` must already be lowercased (an empty query never
-/// matches, so an empty search box highlights nothing).
-pub(crate) fn cell_matches(text: &str, query_lower: &str) -> bool {
-    !query_lower.is_empty() && text.to_lowercase().contains(query_lower)
+/// Substring match for the in-place highlight. When `case_sensitive` is false the caller must pass a
+/// lowercased `query` (the cell text is lowercased here to match); when true, `query` is compared
+/// as-is. An empty query never matches, so an empty search box highlights nothing.
+pub(crate) fn cell_matches(text: &str, query: &str, case_sensitive: bool) -> bool {
+    if query.is_empty() {
+        return false;
+    }
+    if case_sensitive {
+        text.contains(query)
+    } else {
+        text.to_lowercase().contains(query)
+    }
 }
 
 /// Open `path` behind the `ViewportSource` seam (the app is format-agnostic).
@@ -167,6 +175,8 @@ pub(crate) struct ViewControls {
     pub(crate) search: String,
     /// Interpret the query as a regex.
     pub(crate) regex: bool,
+    /// Match the query case-sensitively (default: case-insensitive).
+    pub(crate) case_sensitive: bool,
     /// Show only NON-matching rows.
     pub(crate) invert: bool,
     /// Hide non-matching rows (filter) rather than only highlighting them.
@@ -193,6 +203,7 @@ impl ViewControls {
                 query: self.search.clone(),
                 regex: self.regex,
                 invert: self.invert,
+                case_sensitive: self.case_sensitive,
             })
         } else {
             None
@@ -214,6 +225,9 @@ pub(crate) struct SavedView {
     sort: Option<(u32, bool)>,
     /// (query, regex, invert) — present only when a hide-non-matching filter is active.
     filter: Option<(String, bool, bool)>,
+    /// Whether find matches case-sensitively. Defaulted so views saved before this field load.
+    #[serde(default)]
+    case_sensitive: bool,
     /// Explicit delimiter override; `None` = auto-detect (the default).
     #[serde(default)]
     pub(crate) delimiter: Option<u8>,
@@ -234,6 +248,7 @@ impl SavedView {
                 .map(|s| (s.column.0, s.direction == Direction::Ascending)),
             filter: (view.filter_mode && !view.search.is_empty())
                 .then(|| (view.search.clone(), view.regex, view.invert)),
+            case_sensitive: view.case_sensitive,
             delimiter,
         }
     }
@@ -254,6 +269,7 @@ impl SavedView {
                 Direction::Descending
             },
         });
+        view.case_sensitive = self.case_sensitive;
         if let Some((query, regex, invert)) = &self.filter {
             view.search = query.clone();
             view.regex = *regex;
@@ -361,10 +377,15 @@ mod tests {
     }
 
     #[test]
-    fn cell_matches_is_case_insensitive_and_ignores_empty_query() {
-        assert!(cell_matches("Hello World", "world"));
-        assert!(!cell_matches("Hello", "xyz"));
-        assert!(!cell_matches("Hello", "")); // empty query highlights nothing
+    fn cell_matches_handles_case_and_empty_query() {
+        // Case-insensitive: caller passes a lowercased query; cell text is lowercased to match.
+        assert!(cell_matches("Hello World", "world", false));
+        assert!(!cell_matches("Hello", "xyz", false));
+        assert!(!cell_matches("Hello", "", false)); // empty query highlights nothing
+        // Case-sensitive: compared as-is.
+        assert!(cell_matches("Hello World", "World", true));
+        assert!(!cell_matches("Hello World", "world", true));
+        assert!(!cell_matches("Hello", "", true));
     }
 
     #[test]

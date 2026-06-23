@@ -1,4 +1,3 @@
-- Max number of recents?
 - Case-sensitive search
 - Table header stretches the entire window size
 - Parquet support

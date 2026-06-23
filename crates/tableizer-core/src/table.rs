@@ -767,6 +767,7 @@ mod tests {
                     query: "av".into(),
                     regex: false,
                     invert: false,
+                    case_sensitive: false,
                 }),
                 sort: None,
             })

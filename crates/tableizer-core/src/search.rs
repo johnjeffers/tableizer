@@ -16,9 +16,11 @@ pub struct FilterSpec {
     pub regex: bool,
     /// Show rows that do NOT match (invert search).
     pub invert: bool,
+    /// Match `query` case-sensitively. When false (the default), matching ignores case.
+    pub case_sensitive: bool,
 }
 
-/// A compiled, case-insensitive matcher over record fields.
+/// A compiled matcher over record fields (case-insensitive unless the spec sets `case_sensitive`).
 pub struct Matcher {
     regex: regex::bytes::Regex,
     invert: bool,
@@ -34,7 +36,7 @@ impl Matcher {
             regex::escape(&spec.query)
         };
         let regex = regex::bytes::RegexBuilder::new(&pattern)
-            .case_insensitive(true)
+            .case_insensitive(!spec.case_sensitive)
             .build()
             .map_err(|e| Error::InvalidPattern(e.to_string()))?;
         Ok(Self {
@@ -67,6 +69,7 @@ mod tests {
             query: query.into(),
             regex,
             invert,
+            case_sensitive: false,
         })
         .unwrap()
     }
@@ -99,8 +102,26 @@ mod tests {
                 query: "(".into(),
                 regex: true,
                 invert: false,
+                case_sensitive: false,
             }),
             Err(Error::InvalidPattern(_))
         ));
+    }
+
+    #[test]
+    fn case_sensitive_match_respects_case() {
+        let spec = |case_sensitive| FilterSpec {
+            query: "err".into(),
+            regex: false,
+            invert: false,
+            case_sensitive,
+        };
+        // Insensitive (default) matches regardless of case.
+        let insensitive = Matcher::compile(&spec(false)).unwrap();
+        assert!(insensitive.matches(&record(&["ERROR"])));
+        // Sensitive matches only the exact case.
+        let sensitive = Matcher::compile(&spec(true)).unwrap();
+        assert!(!sensitive.matches(&record(&["ERROR"])));
+        assert!(sensitive.matches(&record(&["an error"])));
     }
 }

@@ -47,6 +47,7 @@ pub(crate) fn toolbar(ui: &mut egui::Ui, loaded: &mut LoadedTable, focus_find: b
         }
         ui.checkbox(&mut view.filter_mode, "Only show matches");
         ui.checkbox(&mut view.regex, "Regex");
+        ui.checkbox(&mut view.case_sensitive, "Match case");
         ui.checkbox(&mut view.invert, "Invert");
     });
 }

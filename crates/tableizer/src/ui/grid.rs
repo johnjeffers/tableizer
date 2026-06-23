@@ -91,7 +91,12 @@ pub(crate) fn grid(ui: &mut egui::Ui, loaded: &mut LoadedTable, palette: &theme:
         encoding,
         palette: palette.clone(),
         sort: view.sort,
-        search: view.search.to_lowercase(),
+        search: if view.case_sensitive {
+            view.search.clone()
+        } else {
+            view.search.to_lowercase()
+        },
+        search_case_sensitive: view.case_sensitive,
         selected: view.selected,
         drag_active: view.selecting,
         hovered_row: view.hovered_row,
@@ -206,8 +211,11 @@ struct GridDelegate<'a> {
     palette: theme::Palette,
     /// Active sort (for the header indicator), if any.
     sort: Option<SortKey>,
-    /// Lowercased search query; cells containing it are highlighted (empty = no highlight).
+    /// Search query for the highlight: raw when `search_case_sensitive`, else lowercased (the cell
+    /// text is lowercased to match). Cells containing it are highlighted (empty = no highlight).
     search: String,
+    /// Whether the highlight match is case-sensitive.
+    search_case_sensitive: bool,
     /// Selected display rows to highlight, if any.
     selected: Option<RowSpan>,
     /// Whether a row-selection drag is in progress (cells extend the selection to the pointer).
@@ -447,7 +455,7 @@ impl egui_table::TableDelegate for GridDelegate<'_> {
                 self.palette.row_selected,
             );
         }
-        if cell_matches(&text, &self.search) {
+        if cell_matches(&text, &self.search, self.search_case_sensitive) {
             ui.painter().rect_filled(
                 cell_rect,
                 egui::CornerRadius::ZERO,
