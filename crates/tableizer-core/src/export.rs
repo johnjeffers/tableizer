@@ -1,4 +1,4 @@
-//! Export the current view or the source to CSV/TSV (`docs/spec.md` §3.6).
+//! Export the current view or the source to CSV/TSV (`docs/formats.md`).
 //!
 //! Two same-family modes: **current view** (active filter + sort, the given visible columns in
 //! display order — what the user sees) and **source** (every row/column in source order, ignoring the

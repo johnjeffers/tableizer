@@ -2,8 +2,8 @@
 //!
 //! The UI only ever asks for a small slice of a logical table via [`ViewportSource`]; the engine
 //! decides how to satisfy it (offset-index seek, sort permutation, filtered result list, ...).
-//! Keeping the UI confined to this trait is what makes the grid a swappable layer (`docs/spec.md`
-//! §4.5). Note the byte-fidelity guarantee on [`Cell`].
+//! Keeping the UI confined to this trait is what makes the grid a swappable layer
+//! (`docs/architecture.md`). Note the byte-fidelity guarantee on [`Cell`].
 
 use crate::search::FilterSpec;
 use crate::sort::SortKey;
@@ -55,7 +55,7 @@ pub struct Schema {
 }
 
 /// Total row count — exact once the offset-index build completes, otherwise a growing lower bound
-/// while it is still running (progressive availability; see `docs/spec.md` §4.1).
+/// while it is still running (progressive availability; see `docs/architecture.md`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RowCount {
     /// Indexing finished; this is the exact total.
@@ -158,7 +158,7 @@ pub struct ViewStatus {
     pub building: bool,
 }
 
-/// Coarse data-quality summary for the open table (spec §3.1 / §5).
+/// Coarse data-quality summary for the open table (`docs/architecture.md`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DataQuality {
     /// Records whose field count differs from the first row, once known.

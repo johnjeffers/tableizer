@@ -1,11 +1,12 @@
-//! A [`ViewportSource`] over a delimited file with **progressive availability** (`docs/spec.md` §2,
-//! §4.1): [`CsvTable::open`] returns immediately (mmap + parse the head for the schema) and builds
+//! A [`ViewportSource`] over a delimited file with **progressive availability**
+//! (`docs/architecture.md`): [`CsvTable::open`] returns immediately (mmap + parse the head for the
+//! schema) and builds
 //! the offset index on a background thread. Until the index lands, rows are served by streaming from
 //! the head; once it lands, lookups are O(1) random access. The row count grows honestly
 //! ([`RowCount::AtLeast`] → [`RowCount::Exact`]).
 //!
 //! Cells hold the exact field bytes the parser yields — type inference is presentational only and
-//! never mutates them (the byte-fidelity invariant, spec §3.1).
+//! never mutates them (the byte-fidelity invariant — see `AGENTS.md`).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

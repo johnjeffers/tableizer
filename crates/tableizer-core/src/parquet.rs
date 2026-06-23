@@ -1,4 +1,4 @@
-//! A [`ViewportSource`] over a Parquet file (`docs/spec.md` §4.5 — the columnar format that proves
+//! A [`ViewportSource`] over a Parquet file (`docs/formats.md` — the columnar format that proves
 //! the format-reader seam).
 //!
 //! Unlike the text formats there is no offset index to build: the footer metadata already gives the

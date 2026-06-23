@@ -3,8 +3,8 @@
 //!
 //! The load-bearing seam between the engine and any GUI is [`ViewportSource`]: the UI only ever
 //! asks for a small, already-materialised slice of a logical table, so the grid stays a thin,
-//! swappable layer (see `docs/spec.md` §4). The modules here are currently design-bearing stubs;
-//! each carries the decisions it must honour when implemented.
+//! swappable layer (see `docs/architecture.md`). Each module carries the decision it encodes; the
+//! format readers (`table`/`json`/`parquet`) are described in `docs/formats.md`.
 
 pub mod cache;
 pub mod error;

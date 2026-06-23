@@ -26,7 +26,7 @@ thiserror = "2.0.18"
 # thiserror added via `cargo add`.
 
 # Engine dependency spine (add each as the corresponding module is implemented, so there are no
-# unused dependencies — see docs/spec.md §4):
+# unused dependencies — see docs/architecture.md):
 #   csv, csv-core   — RFC 4180 byte-faithful parsing / streaming record boundaries
 #   memmap2         — memory-mapped reads (guarded; see §4.2)
 #   encoding_rs     — BOM-aware decoding (UTF-8/16, Latin-1, Windows-1252)

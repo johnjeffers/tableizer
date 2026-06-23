@@ -1,6 +1,6 @@
 //! A [`ViewportSource`] over JSON — both **NDJSON / JSON Lines** (one value per line) and a single
-//! top-level **JSON array** (`[ {…}, {…} ]`), the two common *tabular* JSON shapes (`docs/spec.md`
-//! §3.1 / §4.5 — the nested format that proves the format-reader seam).
+//! top-level **JSON array** (`[ {…}, {…} ]`), the two common *tabular* JSON shapes — the nested
+//! format that proves the format-reader seam (`docs/formats.md`).
 //!
 //! The two shapes differ only in how records are delimited, so the engine is identical apart from a
 //! [`Records`] boundary strategy:

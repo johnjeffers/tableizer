@@ -1,4 +1,4 @@
-//! Byte-faithful parsing of CSV / TSV / arbitrary-separator text (`docs/spec.md` §3.1).
+//! Byte-faithful parsing of CSV / TSV / arbitrary-separator text (`docs/formats.md`).
 //!
 //! To be built on the `csv` / `csv-core` crates using *byte* records, so the canonical cell value
 //! is always the exact source bytes. Encoding handling (BOM-aware, via `encoding_rs`) is
@@ -30,7 +30,7 @@ impl Default for Dialect {
 impl Dialect {
     /// Auto-detect a dialect from a head sample: pick the delimiter that yields the most consistent
     /// column count, and guess whether the first row is a header. Always an *editable default* — the
-    /// user can override (spec §3.1). On a tie, earlier candidates win (comma first).
+    /// user can override (`docs/formats.md`). On a tie, earlier candidates win (comma first).
     pub fn sniff(sample: &[u8]) -> Self {
         const CANDIDATES: [u8; 4] = [b',', b'\t', b';', b'|'];
         let mut best_delim = b',';

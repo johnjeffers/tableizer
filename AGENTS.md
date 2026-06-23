@@ -9,9 +9,10 @@ command, an invariant, or the layout, update this file in the same change.
 separator data files, including very large (multi-TB) ones, as browsable tables. It is **read-only**:
 no cell editing, no save-back, ever. Export always writes a _new_ file.
 
-The authoritative specification is **[`docs/spec.md`](docs/spec.md)** — the performance contract,
-architecture, and roadmap live there. Read it before making non-trivial changes. This file is the
-_working agreement_; the spec is the _what and why_.
+The design reference is **[`docs/architecture.md`](docs/architecture.md)** (the performance contract
+and engine structure) and **[`docs/formats.md`](docs/formats.md)** (how each input format meets the
+seam); the roadmap is **[`docs/todo.md`](docs/todo.md)**. Read them before making non-trivial changes.
+This file is the _working agreement_; those are the _what and why_.
 
 ## Git: agents are READ-ONLY — no exceptions
 
@@ -42,7 +43,7 @@ Work in small loops; when a loop is green it's ready for the human to commit (ag
 **Git: agents are READ-ONLY**). If you find a bug, first write a failing test that reproduces it, then fix
 it. If you can't write a test for a change, stop and say so rather than skipping the loop.
 
-### Testing layers (see spec §5 — this is a correctness-critical data tool)
+### Testing layers (see `docs/architecture.md` § Security & testing — a correctness-critical data tool)
 
 - **Unit tests** live next to the code in `#[cfg(test)] mod tests`. Integration tests go in
   `crates/<crate>/tests/`.
@@ -81,7 +82,7 @@ The seam between them is **`ViewportSource`** (`crates/tableizer-core/src/viewpo
 ever asks for a small, already-materialised slice of a logical table. Keep it that way — it is what
 makes the grid a swappable layer.
 
-## Invariants — do not violate without changing the spec first
+## Invariants — do not violate without updating `docs/architecture.md` first
 
 - **Byte fidelity.** A cell's canonical value is the _exact source bytes_ (`Cell(Box<[u8]>)`). Type
   inference is presentational only (alignment/sort/formatting) and must **never** mutate stored or
@@ -92,7 +93,8 @@ makes the grid a swappable layer.
   spill pathologies). Their parsing/Arrow interchange may be reused; the sort is bespoke.
 - **Pagination goes through the offset index**, never byte-offset arithmetic (quoted embedded newlines
   make `offset = page × size` silently wrong). The index is sparse, quote-parity-aware, and persisted.
-- **Tier discipline** (spec §2). Tier A ops are instant; Tier B/C ops are async, show progress within
+- **Tier discipline** (`docs/architecture.md` § Performance contract). Tier A ops are instant; Tier
+  B/C ops are async, show progress within
   ~100 ms, and are cancellable. Never block the UI thread; never silently turn a global op into a
   windowed one (e.g. page-local sort must be _labelled_ as such).
 - **Read-only.** No editing/undo/dirty-state. If a change implies mutating the source file, it's wrong.
@@ -119,6 +121,7 @@ makes the grid a swappable layer.
   `rust-version`** (it tracks current stable).
 - **Add a dependency only when the code that uses it lands** (no unused deps — clippy/CI flag them). The
   planned engine spine is the comment checklist in `crates/tableizer-core/Cargo.toml`.
-- Document public items with the decision they encode; link back to the relevant `docs/spec.md` section.
-- Keep `docs/spec.md` "Confirmed by you" vs "Recommended — pending confirmation" honest: don't promote a
-  proposal to a decision without the owner's sign-off.
+- Document public items with the decision they encode; link back to `docs/architecture.md` (or
+  `docs/formats.md` for format behaviour).
+- Keep `docs/architecture.md` and `docs/formats.md` current — update them in the same change that
+  alters a performance contract, an invariant, or a format's behaviour.

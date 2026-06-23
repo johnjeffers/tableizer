@@ -32,7 +32,7 @@ impl Source {
 pub(crate) fn map_file(path: &Path) -> Result<Mmap> {
     let file = File::open(path)?;
     // SAFETY: we map a read-only view of `file` and never mutate the mapping. Documented risk:
-    // another process truncating the file could cause SIGBUS on later access (spec §4.2); Phase 0
-    // accepts this — a SIGBUS guard / positioned-read fallback is planned.
+    // another process truncating the file could cause SIGBUS on later access (`docs/architecture.md`
+    // § I/O); accepted for now — a SIGBUS guard / positioned-read fallback is planned.
     Ok(unsafe { Mmap::map(&file)? })
 }

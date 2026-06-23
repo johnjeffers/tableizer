@@ -1,5 +1,5 @@
 //! Row-offset index — maps a 0-based record index to the byte offset where that record begins, so a
-//! viewport can seek directly to any row (`docs/spec.md` §4.1).
+//! viewport can seek directly to any row (`docs/architecture.md`).
 //!
 //! **Sparse:** one anchor byte-offset is stored every [`ANCHOR_INTERVAL`] records (not one per row),
 //! so the index stays small on huge files. [`OffsetIndex::offset_of_row`] seeks to the nearest
@@ -193,7 +193,7 @@ impl OffsetIndex {
 }
 
 /// A `csv` reader configured to surface every physical record (no header skipping) and to treat
-/// ragged rows as data rather than errors (spec §3.1 malformed-row resilience).
+/// ragged rows as data rather than errors (malformed-row resilience; `docs/formats.md`).
 pub(crate) fn record_reader<'a>(bytes: &'a [u8], dialect: &Dialect) -> csv::Reader<&'a [u8]> {
     csv::ReaderBuilder::new()
         .delimiter(dialect.delimiter)

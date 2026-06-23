@@ -1,4 +1,4 @@
-//! Column sort (`docs/spec.md` §3.4).
+//! Column sort (`docs/architecture.md`).
 //!
 //! Sort is **global** and applied through the async "view" ([`crate::table::CsvTable`]): the engine
 //! extracts the sort-key field for every (filtered) row and orders them. With infinite virtualised

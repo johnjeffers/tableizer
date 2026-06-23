@@ -1,4 +1,4 @@
-//! Persistent index cache (`docs/spec.md` §4.7): the offset index is written to the OS *state* dir —
+//! Persistent index cache (`docs/architecture.md`): the offset index is written to the OS *state* dir —
 //! never beside the source file — and reloaded on the next open if it is still valid (matching size +
 //! mtime + dialect). A stale index would show *silently-wrong rows*, so validation is strict: any
 //! mismatch (missing, stale, different dialect, corrupt) returns `None` and the index is rebuilt.

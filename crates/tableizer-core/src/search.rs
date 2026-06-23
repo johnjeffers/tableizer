@@ -1,4 +1,4 @@
-//! Search / filter matching (`docs/spec.md` §3.3).
+//! Search / filter matching (`docs/architecture.md`).
 //!
 //! A literal query is escaped to a regex, so one code path serves literal, substring, AND regex —
 //! all on the `regex` crate's linear-time automaton (ReDoS-safe; user-supplied patterns are never a
@@ -20,7 +20,7 @@ pub struct FilterSpec {
     pub case_sensitive: bool,
 }
 
-/// A compiled matcher over record fields (case-insensitive unless the spec sets `case_sensitive`).
+/// A compiled matcher over record fields (case-insensitive unless the `FilterSpec` sets `case_sensitive`).
 pub struct Matcher {
     regex: regex::bytes::Regex,
     invert: bool,
