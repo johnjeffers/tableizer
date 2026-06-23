@@ -28,8 +28,12 @@ use tableizer_core::{
 /// [`Style`] (spacing, rounding, widget colors) plus a [`Palette`] of the extra colors the custom
 /// grid/toolbar painting needs. Retheme by editing this module.
 mod theme {
-    use eframe::egui::{Color32, CornerRadius, Margin, Stroke, Style, Theme, Vec2, style::Spacing};
+    use eframe::egui::{
+        Color32, CornerRadius, FontFamily, FontId, Margin, Stroke, Style, TextStyle, Theme, Vec2,
+        style::Spacing,
+    };
     use serde::{Deserialize, Serialize};
+    use std::collections::BTreeMap;
 
     /// Light/dark selection.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,6 +122,7 @@ mod theme {
         pub stripe: Color32,
         pub warning: Color32,
         pub error: Color32,
+        pub border: Color32,
         pub row_height: f32,
         pub header_height: f32,
     }
@@ -170,29 +175,37 @@ mod theme {
             ..Spacing::default()
         };
 
+        let text_styles = BTreeMap::from([
+            (TextStyle::Small, FontId::new(11.0, FontFamily::Proportional)),
+            (TextStyle::Body, FontId::new(13.5, FontFamily::Proportional)),
+            (TextStyle::Button, FontId::new(13.5, FontFamily::Proportional)),
+            (TextStyle::Heading, FontId::new(19.0, FontFamily::Proportional)),
+            (TextStyle::Monospace, FontId::new(12.5, FontFamily::Monospace)),
+        ]);
         let style = Style {
             visuals,
             spacing,
+            text_styles,
             ..Style::default()
         };
 
         let palette = Palette {
             header_bg: if dark {
-                Color32::from_gray(48)
+                Color32::from_gray(38)
             } else {
-                Color32::from_gray(232)
+                Color32::from_gray(236)
             },
             header_text: if dark {
-                Color32::from_gray(235)
+                Color32::from_gray(165)
             } else {
-                Color32::from_gray(25)
+                Color32::from_gray(95)
             },
             row_selected: with_alpha(accent, if dark { 70 } else { 55 }),
             search_match: Color32::from_rgba_unmultiplied(250, 205, 70, if dark { 50 } else { 95 }),
             stripe: if dark {
-                Color32::from_white_alpha(6)
+                Color32::from_white_alpha(8)
             } else {
-                Color32::from_black_alpha(8)
+                Color32::from_black_alpha(10)
             },
             warning: Color32::from_rgb(235, 165, 50),
             error: if dark {
@@ -200,8 +213,13 @@ mod theme {
             } else {
                 Color32::from_rgb(200, 50, 50)
             },
-            row_height: if comfortable { 24.0 } else { 20.0 },
-            header_height: if comfortable { 28.0 } else { 22.0 },
+            border: if dark {
+                Color32::from_white_alpha(24)
+            } else {
+                Color32::from_black_alpha(28)
+            },
+            row_height: if comfortable { 26.0 } else { 20.0 },
+            header_height: if comfortable { 30.0 } else { 24.0 },
         };
         (style, palette)
     }
@@ -219,11 +237,29 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Tableizer",
         native_options,
-        Box::new(move |_cc| {
-            // The theme (`theme` module) is resolved and applied each frame in `App::update`.
+        Box::new(move |cc| {
+            setup_fonts(&cc.egui_ctx);
+            // The theme (`theme` module) is resolved and applied each frame in `App::ui`.
             Ok(Box::new(TableizerApp::new(path)))
         }),
     )
+}
+
+/// Install the bundled Inter font (OFL — see `assets/Inter-OFL.txt`) as the primary proportional UI
+/// font, ahead of egui's defaults (which stay as fallbacks for glyphs Inter lacks).
+fn setup_fonts(ctx: &egui::Context) {
+    use std::sync::Arc;
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "Inter".to_owned(),
+        Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/InterVariable.ttf"
+        ))),
+    );
+    if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        family.insert(0, "Inter".to_owned());
+    }
+    ctx.set_fonts(fonts);
 }
 
 /// Read a head sample and auto-detect the dialect (delimiter + header); fall back to the default.
@@ -913,7 +949,11 @@ fn grid(ui: &mut egui::Ui, loaded: &mut LoadedTable, palette: &theme::Palette) {
         .map(|&c| column_name(table.schema(), c, encoding))
         .collect();
     let table_columns: Vec<egui_table::Column> = (0..displayed.len())
-        .map(|_| egui_table::Column::new(140.0).resizable(true))
+        .map(|_| {
+            egui_table::Column::new(180.0)
+                .range(64.0..=900.0)
+                .resizable(true)
+        })
         .collect();
     let frozen = layout.frozen.min(displayed.len());
 
@@ -1170,24 +1210,32 @@ impl egui_table::TableDelegate for GridDelegate<'_> {
         let (Some(&col_id), Some(name)) = (self.columns.get(idx), self.headers.get(idx)) else {
             return;
         };
-        // Paint a distinct header bar so headers are always visible regardless of theme.
-        ui.painter().rect_filled(
-            ui.max_rect(),
-            egui::CornerRadius::ZERO,
-            self.palette.header_bg,
+        // Distinct header bar with a hairline beneath it.
+        let rect = ui.max_rect();
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::ZERO, self.palette.header_bg);
+        ui.painter().hline(
+            rect.x_range(),
+            rect.bottom() - 0.5,
+            egui::Stroke::new(1.0, self.palette.border),
         );
         // The header is a drag source carrying its column id, and a drop target for reordering.
+        // Small, uppercase, muted label — the modern data-table header look.
         let response = ui
             .dnd_drag_source(egui::Id::new(("tz-col", col_id.0)), col_id, |ui| {
                 ui.set_min_width(ui.available_width()); // make the whole header cell draggable
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(name.as_str())
-                            .strong()
-                            .color(self.palette.header_text),
-                    )
-                    .selectable(false),
-                );
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add_space(10.0);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(name.to_uppercase())
+                                .color(self.palette.header_text)
+                                .size(11.0),
+                        )
+                        .selectable(false)
+                        .truncate(),
+                    );
+                });
             })
             .response;
         if response.hovered() {
@@ -1246,18 +1294,25 @@ impl egui_table::TableDelegate for GridDelegate<'_> {
             Some(InferredType::Integer) | Some(InferredType::Float)
         );
         let label = if text.is_empty() {
-            egui::Label::new(egui::RichText::new("·").weak())
+            egui::Label::new(egui::RichText::new("—").weak())
         } else {
-            egui::Label::new(egui::RichText::new(text.as_str()).monospace())
+            egui::Label::new(text.as_str())
         }
         .selectable(false)
+        .truncate()
         .sense(egui::Sense::click());
+        // 10px of leading padding so text never touches the column edge; numeric columns align right.
         let layout = if numeric {
             egui::Layout::right_to_left(egui::Align::Center)
         } else {
             egui::Layout::left_to_right(egui::Align::Center)
         };
-        let response = ui.with_layout(layout, |ui| ui.add(label)).inner;
+        let response = ui
+            .with_layout(layout, |ui| {
+                ui.add_space(10.0);
+                ui.add(label)
+            })
+            .inner;
         // Right-click a cell to copy its value to the clipboard.
         response.context_menu(|ui| {
             if ui.button("Copy").clicked() {
