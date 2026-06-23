@@ -328,15 +328,21 @@ mod fonts {
         None
     }
 
-    /// Sorted, de-duplicated list of installed font family names (for the picker).
-    pub fn installed_families(db: &fontdb::Database) -> Vec<String> {
-        let mut names: Vec<String> = db
-            .faces()
-            .filter_map(|face| face.families.first().map(|(name, _)| name.clone()))
-            .collect();
-        names.sort_unstable();
-        names.dedup();
-        names
+    /// Sorted installed font families, each paired with a monospaced flag (true if any of the
+    /// family's faces is monospaced) — for the picker's "Monospace" filter.
+    pub fn installed_families(db: &fontdb::Database) -> Vec<(String, bool)> {
+        use std::collections::BTreeMap;
+        let mut families: BTreeMap<String, bool> = BTreeMap::new();
+        for face in db.faces() {
+            // Skip private system fonts: macOS hides families whose name starts with '.'.
+            if let Some((name, _)) = face.families.first()
+                && !name.starts_with('.')
+            {
+                let mono = families.entry(name.clone()).or_insert(false);
+                *mono |= face.monospaced;
+            }
+        }
+        families.into_iter().collect()
     }
 
     /// Build egui font definitions: OS-native proportional chrome font (+ bundled Inter + egui's
@@ -750,14 +756,16 @@ struct TableizerApp {
     applied_theme: Option<(theme::Settings, bool)>,
     /// System font database (for the chrome font + the table-font picker).
     fonts_db: fontdb::Database,
-    /// Installed family names (cached for the picker).
-    font_families: Vec<String>,
+    /// Installed font families + a monospaced flag (cached for the picker).
+    font_families: Vec<(String, bool)>,
     /// Table font last pushed to egui — rebuild the font atlas only when this changes.
     applied_table_font: Option<String>,
-    /// Filter text in the table-font picker.
+    /// Filter text in the table-font picker (inside the Settings window).
     font_search: String,
-    /// Whether the table-font picker window is open.
-    font_picker_open: bool,
+    /// Whether the picker is filtered to monospaced fonts.
+    font_mono_only: bool,
+    /// Whether the Settings window is open.
+    settings_open: bool,
 }
 
 impl TableizerApp {
@@ -774,7 +782,8 @@ impl TableizerApp {
             font_families,
             applied_table_font: None,
             font_search: String::new(),
-            font_picker_open: false,
+            font_mono_only: false,
+            settings_open: false,
         };
         if let Some(path) = path {
             app.open_path(path);
@@ -910,13 +919,24 @@ impl eframe::App for TableizerApp {
             View::Loaded(loaded) => grid(ui, loaded, &palette),
         });
 
-        if self.font_picker_open {
-            font_picker_window(
+        // Settings window: toggled by the menu-bar item and ⌘/Ctrl+, ; closed by its ✕ or Esc.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma)) {
+            self.settings_open = !self.settings_open;
+        }
+        if self.settings_open
+            && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+            && ctx.memory(|m| m.focused().is_none())
+        {
+            self.settings_open = false;
+        }
+        if self.settings_open {
+            settings_window(
                 &ctx,
-                &mut self.font_picker_open,
+                &mut self.settings_open,
                 &mut self.theme,
                 &self.font_families,
                 &mut self.font_search,
+                &mut self.font_mono_only,
             );
         }
 
@@ -1008,9 +1028,13 @@ fn menu_bar(ui: &mut egui::Ui, app: &mut TableizerApp, to_open: &mut Option<Path
         }
     });
 
-    ui.menu_button("Settings", |ui| {
-        settings_menu(ui, &mut app.theme, &mut app.font_picker_open);
-    });
+    // Settings opens a window (not a dropdown), so it's a plain menu-bar button.
+    if ui
+        .add(egui::Button::new("Settings").frame(false))
+        .clicked()
+    {
+        app.settings_open = !app.settings_open;
+    }
 }
 
 /// The Export submenu: current view or source, as CSV or TSV, to a chosen file.
@@ -1058,7 +1082,13 @@ fn menu_section(ui: &mut egui::Ui, title: &str) {
 
 /// A full-width menu choice row with hover + selected states (selected = accent fill + strong text),
 /// optionally led by a colored dot. Returns true when clicked.
-fn menu_choice(ui: &mut egui::Ui, selected: bool, dot: Option<egui::Color32>, text: &str) -> bool {
+fn menu_choice(
+    ui: &mut egui::Ui,
+    width: f32,
+    selected: bool,
+    dot: Option<egui::Color32>,
+    text: &str,
+) -> bool {
     let sel_bg = ui.visuals().selection.bg_fill;
     let hover_bg = ui.visuals().widgets.hovered.weak_bg_fill;
     let text_color = if selected {
@@ -1066,8 +1096,9 @@ fn menu_choice(ui: &mut egui::Ui, selected: bool, dot: Option<egui::Color32>, te
     } else {
         ui.visuals().text_color()
     };
-    // Fixed width — `available_width()` inside a popup is the whole window, which balloons the menu.
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(186.0, 24.0), egui::Sense::click());
+    // In a menu popup, callers must pass a fixed width — `available_width()` there is the whole
+    // window and would balloon the menu; in a window, `available_width()` is correct.
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 24.0), egui::Sense::click());
     if selected {
         ui.painter()
             .rect_filled(rect, egui::CornerRadius::same(5), sel_bg);
@@ -1092,109 +1123,165 @@ fn menu_choice(ui: &mut egui::Ui, selected: bool, dot: Option<egui::Color32>, te
     response.clicked()
 }
 
-/// The Settings submenu: theme mode, accent, density, table font (live; persisted on change).
-fn settings_menu(ui: &mut egui::Ui, settings: &mut theme::Settings, font_picker_open: &mut bool) {
-    ui.set_min_width(186.0);
-    menu_section(ui, "THEME");
-    for mode in theme::Mode::ALL {
-        if menu_choice(ui, settings.mode == mode, None, mode.label()) {
-            settings.mode = mode;
-        }
-    }
-    menu_section(ui, "ACCENT");
-    for accent in theme::Accent::ALL {
-        if menu_choice(
-            ui,
-            settings.accent == accent,
-            Some(accent.color()),
-            accent.label(),
-        ) {
-            settings.accent = accent;
-        }
-    }
-    menu_section(ui, "DENSITY");
-    for density in theme::Density::ALL {
-        if menu_choice(ui, settings.density == density, None, density.label()) {
-            settings.density = density;
-        }
-    }
-    menu_section(ui, "TABLE FONT");
-    let current = settings
-        .table_font
-        .clone()
-        .unwrap_or_else(|| "App font".to_owned());
-    // The picker is a window, not a submenu — menus close as soon as a text field takes focus.
-    if ui
-        .button(format!("{current} · {:.0} pt…", settings.table_font_size))
-        .clicked()
-    {
-        *font_picker_open = true;
-        ui.close();
-    }
+/// A section heading inside the Settings window.
+fn settings_section(ui: &mut egui::Ui, title: &str) {
+    ui.add_space(2.0);
+    ui.label(egui::RichText::new(title).strong().size(14.0));
+    ui.add_space(6.0);
 }
 
-/// The table-font picker window (size + searchable family list). It lives outside the menu system,
-/// which closes the moment an interactive widget like a search field takes focus.
-fn font_picker_window(
+/// A horizontal segmented control (pill row) for a small set of mutually-exclusive choices.
+fn segmented<T: Copy + PartialEq>(ui: &mut egui::Ui, current: &mut T, options: &[(T, &str)]) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        for (value, label) in options {
+            if ui.selectable_label(*current == *value, *label).clicked() {
+                *current = *value;
+            }
+        }
+    });
+}
+
+/// A row of clickable accent color swatches; the selected one is ringed.
+fn accent_swatches(ui: &mut egui::Ui, current: &mut theme::Accent) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 10.0;
+        let ring = ui.visuals().weak_text_color();
+        for accent in theme::Accent::ALL {
+            let (rect, response) =
+                ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
+            let center = rect.center();
+            ui.painter().circle_filled(center, 7.0, accent.color());
+            if *current == accent {
+                ui.painter()
+                    .circle_stroke(center, 9.5, egui::Stroke::new(2.0, accent.color()));
+            } else if response.hovered() {
+                ui.painter()
+                    .circle_stroke(center, 9.5, egui::Stroke::new(1.5, ring));
+            }
+            if response.on_hover_text(accent.label()).clicked() {
+                *current = accent;
+            }
+        }
+    });
+}
+
+/// The Settings window (non-modal, singleton): appearance (theme/accent/density) and the table font
+/// (size + live preview + searchable family list). Everything applies live and persists on change.
+/// Toggled from the menu bar and ⌘/Ctrl+, ; closed by its ✕ or Esc.
+fn settings_window(
     ctx: &egui::Context,
     open: &mut bool,
     settings: &mut theme::Settings,
-    families: &[String],
-    search: &mut String,
+    families: &[(String, bool)],
+    font_search: &mut String,
+    mono_only: &mut bool,
 ) {
-    let mut window_open = true;
-    egui::Window::new("Table font")
+    let mut window_open = *open;
+    egui::Window::new("Settings")
         .open(&mut window_open)
         .resizable(false)
         .collapsible(false)
-        .default_width(210.0)
+        .default_width(360.0)
         .show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Size:");
-                ui.add(
-                    egui::DragValue::new(&mut settings.table_font_size)
-                        .range(8.0..=32.0)
-                        .speed(0.2)
-                        .suffix(" pt"),
-                );
-            });
-            ui.add_space(6.0);
-            ui.add(
-                egui::TextEdit::singleline(search)
-                    .hint_text("Search fonts…")
-                    .desired_width(186.0),
-            );
-            ui.add_space(4.0);
-
-            let query = search.to_lowercase();
-            let mut chosen: Option<Option<String>> = None;
-            if menu_choice(ui, settings.table_font.is_none(), None, "App font (default)") {
-                chosen = Some(None);
-            }
-            egui::ScrollArea::vertical()
-                .max_height(320.0)
-                .auto_shrink([false, false])
+            settings_section(ui, "Appearance");
+            egui::Grid::new("settings_appearance")
+                .num_columns(2)
+                .spacing([24.0, 12.0])
+                .min_col_width(64.0)
                 .show(ui, |ui| {
-                    for family in families
-                        .iter()
-                        .filter(|f| query.is_empty() || f.to_lowercase().contains(&query))
-                    {
-                        let selected = settings.table_font.as_deref() == Some(family.as_str());
-                        if menu_choice(ui, selected, None, family) {
-                            chosen = Some(Some(family.clone()));
-                        }
-                    }
+                    ui.label("Theme");
+                    segmented(ui, &mut settings.mode, &theme::Mode::ALL.map(|m| (m, m.label())));
+                    ui.end_row();
+
+                    ui.label("Accent");
+                    accent_swatches(ui, &mut settings.accent);
+                    ui.end_row();
+
+                    ui.label("Density");
+                    segmented(
+                        ui,
+                        &mut settings.density,
+                        &theme::Density::ALL.map(|d| (d, d.label())),
+                    );
+                    ui.end_row();
                 });
 
-            if let Some(selection) = chosen {
-                settings.table_font = selection;
-                search.clear();
-                *open = false;
-            }
+            ui.add_space(12.0);
+            settings_section(ui, "Table font");
+            ui.horizontal(|ui| {
+                ui.label("Size");
+                ui.spacing_mut().item_spacing.x = 4.0;
+                let h = ui.spacing().interact_size.y;
+                // Snap to whole points so stepping reads cleanly (e.g. 13.5 → 14 → 15).
+                if ui.button(egui::RichText::new("−").size(15.0)).clicked() {
+                    settings.table_font_size = (settings.table_font_size.ceil() - 1.0).max(8.0);
+                }
+                ui.add_sized(
+                    egui::vec2(48.0, h),
+                    egui::Label::new(format!("{:.1} pt", settings.table_font_size)),
+                );
+                if ui.button(egui::RichText::new("+").size(15.0)).clicked() {
+                    settings.table_font_size = (settings.table_font_size.floor() + 1.0).min(32.0);
+                }
+                ui.add_space(12.0);
+                let weak = ui.visuals().weak_text_color();
+                let current = settings
+                    .table_font
+                    .clone()
+                    .unwrap_or_else(|| "App font".to_owned());
+                ui.label(egui::RichText::new(current).color(weak));
+            });
+            ui.add_space(6.0);
+
+            // Live preview, rendered in the chosen table font + size.
+            let preview_font = egui::FontId::new(
+                settings.table_font_size,
+                egui::FontFamily::Name(fonts::TABLE_FONT.into()),
+            );
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(egui::RichText::new("The quick brown fox  ·  0123456789").font(preview_font));
+            });
+            ui.add_space(8.0);
+
+            ui.horizontal(|ui| {
+                // Reserve room for the checkbox on the right; the search field fills the rest.
+                let search_w = (ui.available_width() - 108.0).max(80.0);
+                ui.add(
+                    egui::TextEdit::singleline(font_search)
+                        .hint_text("Search fonts…")
+                        .desired_width(search_w),
+                );
+                ui.checkbox(mono_only, "Monospace");
+            });
+            ui.add_space(4.0);
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(170.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let row_w = ui.available_width();
+                        if menu_choice(ui, row_w, settings.table_font.is_none(), None, "App font (default)") {
+                            settings.table_font = None;
+                        }
+                        let query = font_search.to_lowercase();
+                        for (family, is_mono) in families {
+                            if *mono_only && !*is_mono {
+                                continue;
+                            }
+                            if !query.is_empty() && !family.to_lowercase().contains(&query) {
+                                continue;
+                            }
+                            let selected = settings.table_font.as_deref() == Some(family.as_str());
+                            if menu_choice(ui, row_w, selected, None, family) {
+                                settings.table_font = Some(family.clone());
+                            }
+                        }
+                    });
+            });
         });
-    if !window_open {
-        *open = false;
-    }
+    *open = window_open;
 }
 
 /// The toolbar: dialect/header/encoding overrides, sort, and find/filter controls.
@@ -1428,6 +1515,7 @@ fn parsing_menu(ui: &mut egui::Ui, loaded: &mut LoadedTable) {
     let detected = loaded.detected_delimiter;
     if menu_choice(
         ui,
+        186.0,
         loaded.delimiter_auto,
         None,
         &format!("Auto · detected {}", delimiter_label(detected)),
@@ -1444,6 +1532,7 @@ fn parsing_menu(ui: &mut egui::Ui, loaded: &mut LoadedTable) {
     ] {
         if menu_choice(
             ui,
+            186.0,
             !loaded.delimiter_auto && loaded.dialect.delimiter == byte,
             None,
             label,
@@ -1475,6 +1564,7 @@ fn parsing_menu(ui: &mut egui::Ui, loaded: &mut LoadedTable) {
     for choice in [encoding_rs::UTF_8, encoding_rs::WINDOWS_1252] {
         if menu_choice(
             ui,
+            186.0,
             std::ptr::eq(loaded.encoding, choice),
             None,
             choice.name(),
