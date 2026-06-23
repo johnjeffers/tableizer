@@ -473,7 +473,11 @@ impl egui_table::TableDelegate for GridDelegate<'_> {
         let label = if text.is_empty() {
             egui::Label::new(egui::RichText::new("—").weak().font(font))
         } else {
-            egui::Label::new(egui::RichText::new(text.as_str()).font(font))
+            egui::Label::new(
+                egui::RichText::new(text.as_str())
+                    .font(font)
+                    .color(self.palette.table_text),
+            )
         }
         .selectable(false);
         // During the auto-size (sizing) pass, measure the full text rather than truncating, so a

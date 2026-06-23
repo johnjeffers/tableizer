@@ -130,6 +130,8 @@ pub struct Palette {
     pub accent: Color32,
     pub header_bg: Color32,
     pub header_text: Color32,
+    /// Data-cell text color.
+    pub table_text: Color32,
     pub row_selected: Color32,
     pub row_hover: Color32,
     pub search_match: Color32,
@@ -251,6 +253,11 @@ pub fn build(settings: &Settings, system_dark: bool) -> (Style, Palette) {
             Color32::from_gray(165)
         } else {
             Color32::from_gray(95)
+        },
+        table_text: if dark {
+            Color32::from_gray(210)
+        } else {
+            Color32::from_gray(40)
         },
         row_selected: with_alpha(accent, if dark { 70 } else { 55 }),
         row_hover: with_alpha(accent, if dark { 28 } else { 20 }),
