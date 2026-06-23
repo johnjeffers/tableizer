@@ -1,4 +1,3 @@
-- Case-sensitive search
 - Table header stretches the entire window size
 - Parquet support
 - Package as a standard app

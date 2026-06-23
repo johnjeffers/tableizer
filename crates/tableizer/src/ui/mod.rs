@@ -45,10 +45,10 @@ pub(crate) fn toolbar(ui: &mut egui::Ui, loaded: &mut LoadedTable, focus_find: b
         if focus_find {
             find.request_focus();
         }
-        ui.checkbox(&mut view.filter_mode, "Only show matches");
-        ui.checkbox(&mut view.regex, "Regex");
+        ui.checkbox(&mut view.filter_mode, "Show matches only");
+        ui.checkbox(&mut view.regex, "Use regex");
         ui.checkbox(&mut view.case_sensitive, "Match case");
-        ui.checkbox(&mut view.invert, "Invert");
+        ui.checkbox(&mut view.invert, "Invert search");
     });
 }
 

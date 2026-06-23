@@ -121,6 +121,24 @@ pub(crate) fn grid(ui: &mut egui::Ui, loaded: &mut LoadedTable, palette: &theme:
     if let Some(row) = scroll_to {
         grid = grid.scroll_to_row(row, Some(egui::Align::Center));
     }
+
+    // Extend the header row's background + bottom hairline across the full table width. `egui_table`
+    // paints only per-column header cells, so the area to the right of the last column (when the
+    // columns don't fill the viewport) would otherwise show the plain panel background. Painting
+    // this band *before* `show` puts it under the header cells (same `header_bg`, seamless) and
+    // under any scrollbar; the body rows sit below it, so it stays put while scrolling.
+    let header_band = egui::Rect::from_min_size(
+        ui.max_rect().min,
+        egui::vec2(ui.max_rect().width(), palette.header_height),
+    );
+    ui.painter()
+        .rect_filled(header_band, egui::CornerRadius::ZERO, palette.header_bg);
+    ui.painter().hline(
+        header_band.x_range(),
+        header_band.bottom() - 0.5,
+        egui::Stroke::new(1.0, palette.border),
+    );
+
     grid.show(ui, &mut delegate);
 
     if let Some((dragged, target, after)) = delegate.pending_reorder {
