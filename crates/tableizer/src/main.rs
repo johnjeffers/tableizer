@@ -738,16 +738,17 @@ fn menu_bar(ui: &mut egui::Ui, app: &mut TableizerApp, to_open: &mut Option<Path
 
     if let View::Loaded(loaded) = &mut app.view {
         ui.menu_button("View", |ui| {
-            ui.label("Columns");
+            ui.set_min_width(190.0);
+            menu_section(ui, "COLUMNS");
             for (i, shown) in loaded.layout.visible.iter_mut().enumerate() {
                 ui.checkbox(
                     shown,
                     column_name(loaded.table.schema(), ColumnId(i as u32), loaded.encoding),
                 );
             }
-            ui.separator();
+            menu_section(ui, "FREEZE");
             ui.horizontal(|ui| {
-                ui.label("Freeze columns:");
+                ui.label("Leftmost columns:");
                 ui.add(
                     egui::DragValue::new(&mut loaded.layout.frozen)
                         .range(0..=loaded.table.schema().columns.len()),
@@ -758,10 +759,13 @@ fn menu_bar(ui: &mut egui::Ui, app: &mut TableizerApp, to_open: &mut Option<Path
     }
 
     ui.menu_button("Cache", |ui| {
+        ui.set_min_width(180.0);
+        menu_section(ui, "INDEX CACHE");
         ui.label(format!(
-            "Index cache: {}",
+            "Size on disk: {}",
             human_bytes(tableizer_core::cache::total_size())
         ));
+        ui.add_space(2.0);
         if ui.button("Clear cache").clicked() {
             tableizer_core::cache::clear();
             ui.close();
@@ -773,8 +777,9 @@ fn menu_bar(ui: &mut egui::Ui, app: &mut TableizerApp, to_open: &mut Option<Path
 
 /// The Export submenu: current view or source, as CSV or TSV, to a chosen file.
 fn export_menu(ui: &mut egui::Ui, loaded: &LoadedTable) {
+    ui.set_min_width(186.0);
     let mut request: Option<(ExportScope, u8, &str)> = None;
-    ui.label("Current view");
+    menu_section(ui, "CURRENT VIEW");
     if ui.button("as CSV…").clicked() {
         request = Some((ExportScope::CurrentView, b',', "csv"));
         ui.close();
@@ -783,8 +788,7 @@ fn export_menu(ui: &mut egui::Ui, loaded: &LoadedTable) {
         request = Some((ExportScope::CurrentView, b'\t', "tsv"));
         ui.close();
     }
-    ui.separator();
-    ui.label("Source (all rows & columns)");
+    menu_section(ui, "SOURCE (ALL DATA)");
     if ui.button("as CSV…").clicked() {
         request = Some((ExportScope::Source, b',', "csv"));
         ui.close();
@@ -806,39 +810,73 @@ fn export_menu(ui: &mut egui::Ui, loaded: &LoadedTable) {
     }
 }
 
+/// A small, uppercase, muted section header inside a dropdown menu.
+fn menu_section(ui: &mut egui::Ui, title: &str) {
+    let color = ui.visuals().weak_text_color();
+    ui.add_space(6.0);
+    ui.label(egui::RichText::new(title).size(10.5).strong().color(color));
+    ui.add_space(1.0);
+}
+
+/// A full-width menu choice row with hover + selected states (selected = accent fill + strong text),
+/// optionally led by a colored dot. Returns true when clicked.
+fn menu_choice(ui: &mut egui::Ui, selected: bool, dot: Option<egui::Color32>, text: &str) -> bool {
+    let sel_bg = ui.visuals().selection.bg_fill;
+    let hover_bg = ui.visuals().widgets.hovered.weak_bg_fill;
+    let text_color = if selected {
+        ui.visuals().strong_text_color()
+    } else {
+        ui.visuals().text_color()
+    };
+    // Fixed width — `available_width()` inside a popup is the whole window, which balloons the menu.
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(186.0, 24.0), egui::Sense::click());
+    if selected {
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(5), sel_bg);
+    } else if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(5), hover_bg);
+    }
+    let text_x = if let Some(color) = dot {
+        ui.painter()
+            .circle_filled(rect.left_center() + egui::vec2(13.0, 0.0), 5.0, color);
+        26.0
+    } else {
+        10.0
+    };
+    ui.painter().text(
+        rect.left_center() + egui::vec2(text_x, 0.0),
+        egui::Align2::LEFT_CENTER,
+        text,
+        egui::FontId::proportional(13.5),
+        text_color,
+    );
+    response.clicked()
+}
+
 /// The Settings submenu: theme mode, accent, density (live; persisted on change).
 fn settings_menu(ui: &mut egui::Ui, settings: &mut theme::Settings) {
-    ui.label("Theme");
+    ui.set_min_width(186.0);
+    menu_section(ui, "THEME");
     for mode in theme::Mode::ALL {
-        if ui
-            .selectable_label(settings.mode == mode, mode.label())
-            .clicked()
-        {
+        if menu_choice(ui, settings.mode == mode, None, mode.label()) {
             settings.mode = mode;
         }
     }
-    ui.separator();
-    ui.label("Accent");
+    menu_section(ui, "ACCENT");
     for accent in theme::Accent::ALL {
-        ui.horizontal(|ui| {
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-            ui.painter()
-                .rect_filled(rect, egui::CornerRadius::same(3), accent.color());
-            if ui
-                .selectable_label(settings.accent == accent, accent.label())
-                .clicked()
-            {
-                settings.accent = accent;
-            }
-        });
+        if menu_choice(
+            ui,
+            settings.accent == accent,
+            Some(accent.color()),
+            accent.label(),
+        ) {
+            settings.accent = accent;
+        }
     }
-    ui.separator();
-    ui.label("Density");
+    menu_section(ui, "DENSITY");
     for density in theme::Density::ALL {
-        if ui
-            .selectable_label(settings.density == density, density.label())
-            .clicked()
-        {
+        if menu_choice(ui, settings.density == density, None, density.label()) {
             settings.density = density;
         }
     }
