@@ -6,6 +6,7 @@
 //! swappable layer (see `docs/spec.md` §4). The modules here are currently design-bearing stubs;
 //! each carries the decisions it must honour when implemented.
 
+pub mod cache;
 pub mod error;
 pub mod index;
 pub mod parse;

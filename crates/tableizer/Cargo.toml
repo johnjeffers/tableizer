@@ -15,7 +15,9 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+directories = "6.0.0"
 eframe = "0.34.3"
 egui_table = "0.8.0"
+encoding_rs = "0.8.35"
 tableizer-core = { path = "../tableizer-core" }
 # eframe added via `cargo add` (the winit + wgpu + egui desktop runtime).

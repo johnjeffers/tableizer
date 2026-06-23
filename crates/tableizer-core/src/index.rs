@@ -130,6 +130,48 @@ impl OffsetIndex {
         }
         None
     }
+
+    /// Serialize the index to a compact little-endian blob for the on-disk cache (§4.7).
+    pub(crate) fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(18 + self.anchors.len() * 8);
+        out.extend_from_slice(INDEX_MAGIC);
+        out.extend_from_slice(&INDEX_VERSION.to_le_bytes());
+        out.push(self.delimiter);
+        out.push(self.quote);
+        out.extend_from_slice(&self.row_count.to_le_bytes());
+        out.extend_from_slice(&(self.anchors.len() as u64).to_le_bytes());
+        for &anchor in &self.anchors {
+            out.extend_from_slice(&anchor.to_le_bytes());
+        }
+        out
+    }
+
+    /// Reconstruct an index from [`serialize`](Self::serialize) output, or `None` if the blob is not
+    /// a recognised, intact index (bad magic/version, or truncated). Corrupt anchor counts fail
+    /// safely: anchors are only pushed as they are successfully read.
+    pub(crate) fn deserialize(bytes: &[u8]) -> Option<Self> {
+        let mut pos = 0;
+        if read_bytes(bytes, &mut pos, 4)? != INDEX_MAGIC {
+            return None;
+        }
+        if read_u32(bytes, &mut pos)? != INDEX_VERSION {
+            return None;
+        }
+        let delimiter = read_u8(bytes, &mut pos)?;
+        let quote = read_u8(bytes, &mut pos)?;
+        let row_count = read_u64(bytes, &mut pos)?;
+        let anchor_count = read_u64(bytes, &mut pos)?;
+        let mut anchors = Vec::new();
+        for _ in 0..anchor_count {
+            anchors.push(read_u64(bytes, &mut pos)?);
+        }
+        Some(Self {
+            anchors,
+            row_count,
+            delimiter,
+            quote,
+        })
+    }
 }
 
 /// A `csv` reader configured to surface every physical record (no header skipping) and to treat
@@ -155,6 +197,35 @@ fn record_offset(record: &csv::ByteRecord) -> u64 {
 /// unreachable; malformed-row *content* is not an error here.
 fn parse_io(e: csv::Error) -> Error {
     Error::Io(std::io::Error::other(e))
+}
+
+/// On-disk index format magic + version (bumped on any layout change to invalidate old caches).
+const INDEX_MAGIC: &[u8; 4] = b"TZIX";
+const INDEX_VERSION: u32 = 1;
+
+/// Little-endian read helpers for the cache format (shared with [`crate::cache`]). Each returns
+/// `None` (rather than panicking) when the buffer is too short — corrupt caches fail safely.
+pub(crate) fn read_bytes<'a>(bytes: &'a [u8], pos: &mut usize, n: usize) -> Option<&'a [u8]> {
+    let end = pos.checked_add(n)?;
+    let slice = bytes.get(*pos..end)?;
+    *pos = end;
+    Some(slice)
+}
+
+pub(crate) fn read_u8(bytes: &[u8], pos: &mut usize) -> Option<u8> {
+    Some(read_bytes(bytes, pos, 1)?[0])
+}
+
+pub(crate) fn read_u32(bytes: &[u8], pos: &mut usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        read_bytes(bytes, pos, 4)?.try_into().ok()?,
+    ))
+}
+
+pub(crate) fn read_u64(bytes: &[u8], pos: &mut usize) -> Option<u64> {
+    Some(u64::from_le_bytes(
+        read_bytes(bytes, pos, 8)?.try_into().ok()?,
+    ))
 }
 
 #[cfg(test)]
@@ -252,5 +323,28 @@ mod tests {
                 .all(|w| w[0].bytes_processed <= w[1].bytes_processed),
             "progress must be non-decreasing"
         );
+    }
+
+    #[test]
+    fn index_round_trips_through_serialization() {
+        let csv: &[u8] = b"a,b\nc,d\ne,f\n";
+        let index = OffsetIndex::build(csv, &Dialect::default()).unwrap();
+
+        let restored = OffsetIndex::deserialize(&index.serialize()).expect("valid blob");
+
+        assert_eq!(restored.row_count(), index.row_count());
+        for row in 0..index.row_count() {
+            assert_eq!(
+                restored.offset_of_row(csv, row),
+                index.offset_of_row(csv, row),
+                "row {row}"
+            );
+        }
+    }
+
+    #[test]
+    fn deserialize_rejects_a_bad_blob() {
+        assert!(OffsetIndex::deserialize(b"not an index at all").is_none());
+        assert!(OffsetIndex::deserialize(&[]).is_none());
     }
 }

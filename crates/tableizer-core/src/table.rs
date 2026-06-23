@@ -8,7 +8,7 @@
 //! never mutates them (the byte-fidelity invariant, spec §3.1).
 
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -52,6 +52,9 @@ pub struct CsvTable {
     frontier: Arc<AtomicU64>,
     /// Cancels the background builder when the table is dropped.
     cancel: CancellationToken,
+    /// Physical records that precede the data (1 if the dialect has a header row, else 0). The
+    /// header is excluded from the row count and shifts data-row → physical-record translation.
+    header_rows: u64,
 }
 
 impl CsvTable {
@@ -65,6 +68,7 @@ impl CsvTable {
             index: Arc::new(Mutex::new(Some(index))),
             source,
             schema,
+            header_rows: u64::from(dialect.has_header),
             dialect,
             cancel: CancellationToken::new(),
         })
@@ -79,15 +83,24 @@ impl CsvTable {
         let frontier = Arc::new(AtomicU64::new(0));
         let cancel = CancellationToken::new();
 
-        spawn_index_build(
-            source.clone(),
-            dialect,
-            Arc::clone(&index),
-            Arc::clone(&frontier),
-            cancel.clone(),
-        );
+        if let Some(cached) = crate::cache::load(path, &dialect) {
+            // Cache hit: fully indexed instantly, no background build (skips the O(n) rescan).
+            frontier.store(cached.row_count(), Ordering::Relaxed);
+            *index.lock().expect("index lock") = Some(cached);
+        } else {
+            // Cache miss: build in the background and persist the result for next time.
+            spawn_index_build(
+                source.clone(),
+                dialect,
+                path.to_path_buf(),
+                Arc::clone(&index),
+                Arc::clone(&frontier),
+                cancel.clone(),
+            );
+        }
 
         Ok(Self {
+            header_rows: u64::from(dialect.has_header),
             source,
             schema,
             dialect,
@@ -111,31 +124,32 @@ impl ViewportSource for CsvTable {
     }
 
     fn row_count(&self) -> RowCount {
+        let header = self.header_rows;
         match self.index.lock().expect("index lock").as_ref() {
-            Some(index) => RowCount::Exact(index.row_count()),
-            None => RowCount::AtLeast(self.frontier.load(Ordering::Relaxed)),
+            Some(index) => RowCount::Exact(index.row_count().saturating_sub(header)),
+            None => RowCount::AtLeast(self.frontier.load(Ordering::Relaxed).saturating_sub(header)),
         }
     }
 
     fn fetch(&self, request: &ViewportRequest, cancel: &CancellationToken) -> Result<Viewport> {
         let bytes = self.source.bytes();
+        // Requests are in *data* rows; the index addresses *physical* records (header included).
+        let phys_start = request.rows.start.saturating_add(self.header_rows);
         let guard = self.index.lock().expect("index lock");
         match guard.as_ref() {
-            // Index ready: O(1) random access per row.
+            // Index ready: O(1) random access per physical record.
             Some(index) => {
-                let total = index.row_count();
-                let end = request
-                    .rows
-                    .start
+                let total = index.row_count(); // physical
+                let phys_end = phys_start
                     .saturating_add(u64::from(request.rows.len))
                     .min(total);
                 let mut rows = Vec::new();
-                for row in request.rows.start..end {
+                for phys in phys_start..phys_end {
                     if cancel.is_cancelled() {
                         return Err(Error::Cancelled);
                     }
                     let offset = index
-                        .offset_of_row(bytes, row)
+                        .offset_of_row(bytes, phys)
                         .expect("a row below the total has an indexed offset");
                     let record = parse_one_record(&bytes[offset as usize..], &self.dialect)
                         .expect("a record exists at an indexed offset");
@@ -146,7 +160,16 @@ impl ViewportSource for CsvTable {
             // Index still building: serve the visible window by streaming from the head.
             None => {
                 drop(guard);
-                fetch_streaming(bytes, &self.dialect, request.rows, &request.columns, cancel)
+                fetch_streaming(
+                    bytes,
+                    &self.dialect,
+                    RowRange {
+                        start: phys_start,
+                        len: request.rows.len,
+                    },
+                    &request.columns,
+                    cancel,
+                )
             }
         }
     }
@@ -157,6 +180,7 @@ impl ViewportSource for CsvTable {
 fn spawn_index_build(
     source: Source,
     dialect: Dialect,
+    save_path: PathBuf,
     slot: Arc<Mutex<Option<OffsetIndex>>>,
     frontier: Arc<AtomicU64>,
     cancel: CancellationToken,
@@ -167,6 +191,7 @@ fn spawn_index_build(
             progress_frontier.store(p.rows_indexed, Ordering::Relaxed);
         });
         if let Ok(index) = built {
+            crate::cache::save(&save_path, &dialect, &index); // persist for the next open
             frontier.store(index.row_count(), Ordering::Relaxed);
             *slot.lock().expect("index lock") = Some(index);
         }
@@ -221,15 +246,25 @@ fn project_record(record: &csv::ByteRecord, columns: &[ColumnId]) -> Vec<Cell> {
         .collect()
 }
 
-/// Derive a positional schema from the first record's field count. Header detection (using the row
-/// as names) is a Phase 1 concern; here columns are named `col0`, `col1`, … and typed as text.
+/// Derive the schema from the first record. With a header dialect, column names are the header
+/// field bytes (preserved exactly); otherwise positional (`col0`, `col1`, …). All typed as text.
 fn derive_schema(bytes: &[u8], dialect: &Dialect) -> Schema {
-    let column_count = parse_one_record(bytes, dialect).map_or(0, |r| r.len() as u32);
-    let columns = (0..column_count)
-        .map(|i| Column {
-            id: ColumnId(i),
-            name: format!("col{i}").into_bytes().into_boxed_slice(),
-            inferred: InferredType::Text,
+    let Some(first) = parse_one_record(bytes, dialect) else {
+        return Schema::default();
+    };
+    let columns = (0..first.len())
+        .map(|i| {
+            let name: Box<[u8]> = if dialect.has_header {
+                let field: &[u8] = first.get(i).unwrap_or_default();
+                field.into()
+            } else {
+                format!("col{i}").into_bytes().into_boxed_slice()
+            };
+            Column {
+                id: ColumnId(i as u32),
+                name,
+                inferred: InferredType::Text,
+            }
         })
         .collect();
     Schema { columns }
@@ -273,6 +308,15 @@ mod tests {
         }
     }
 
+    /// A dialect that treats every physical record as data (no header), for tests that assert on
+    /// raw row contents.
+    fn no_header() -> Dialect {
+        Dialect {
+            has_header: false,
+            ..Dialect::default()
+        }
+    }
+
     /// Wait for a background build to finish (tiny test files complete almost instantly).
     fn await_indexed(table: &CsvTable) {
         for _ in 0..2000 {
@@ -286,7 +330,7 @@ mod tests {
 
     #[test]
     fn fetches_cells_as_exact_field_bytes() {
-        let table = CsvTable::from_bytes(b"a,b\nc,d\n".to_vec(), Dialect::default()).unwrap();
+        let table = CsvTable::from_bytes(b"a,b\nc,d\n".to_vec(), no_header()).unwrap();
 
         assert!(matches!(table.row_count(), RowCount::Exact(2)));
         let viewport = table
@@ -302,7 +346,7 @@ mod tests {
 
     #[test]
     fn projects_only_requested_columns_in_the_requested_order() {
-        let table = CsvTable::from_bytes(b"a,b,c\n".to_vec(), Dialect::default()).unwrap();
+        let table = CsvTable::from_bytes(b"a,b,c\n".to_vec(), no_header()).unwrap();
 
         let viewport = table
             .fetch(&request(0, 1, &[2, 0]), &CancellationToken::new())
@@ -314,7 +358,7 @@ mod tests {
 
     #[test]
     fn schema_has_one_column_per_field() {
-        let table = CsvTable::from_bytes(b"a,b,c\n1,2,3\n".to_vec(), Dialect::default()).unwrap();
+        let table = CsvTable::from_bytes(b"a,b,c\n1,2,3\n".to_vec(), no_header()).unwrap();
         assert_eq!(table.schema().columns.len(), 3);
     }
 
@@ -322,10 +366,18 @@ mod tests {
     fn opens_and_reads_a_file_via_mmap() {
         use std::io::Write;
 
+        // Isolate the index cache to a tempdir so the test never touches the real OS state dir.
+        let cache = tempfile::tempdir().unwrap();
+        // SAFETY: no other test reads/writes TABLEIZER_CACHE_DIR, so this single set is race-free.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("TABLEIZER_CACHE_DIR", cache.path());
+        }
+
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(b"x,y\n1,2\n3,4\n").unwrap();
 
-        let table = CsvTable::open(file.path(), Dialect::default()).unwrap();
+        let table = CsvTable::open(file.path(), no_header()).unwrap();
         await_indexed(&table);
 
         assert!(matches!(table.row_count(), RowCount::Exact(3)));
@@ -341,7 +393,7 @@ mod tests {
         // The progressive (pre-index) path must return byte-identical cells to the indexed path —
         // this is the regression guard for first-paint-before-index.
         let data = b"a,b\n\"c\nc\",d\ne,f\n".to_vec();
-        let dialect = Dialect::default();
+        let dialect = no_header();
         let cols = [ColumnId(0), ColumnId(1)];
 
         let table = CsvTable::from_bytes(data.clone(), dialect).unwrap();
@@ -359,5 +411,24 @@ mod tests {
 
         assert_eq!(indexed.rows, streamed.rows);
         assert_eq!(streamed.rows[0][0].0.as_ref(), b"c\nc"); // quoted embedded newline preserved
+    }
+
+    #[test]
+    fn header_row_names_columns_and_is_excluded_from_data() {
+        let table =
+            CsvTable::from_bytes(b"name,age\nbob,30\nann,25\n".to_vec(), Dialect::default())
+                .unwrap();
+
+        // The header is excluded from the data view.
+        assert!(matches!(table.row_count(), RowCount::Exact(2)));
+        // Column names come from the header row.
+        assert_eq!(table.schema().columns[0].name.as_ref(), b"name");
+        assert_eq!(table.schema().columns[1].name.as_ref(), b"age");
+        // Data row 0 is the first record *after* the header.
+        let viewport = table
+            .fetch(&request(0, 1, &[0, 1]), &CancellationToken::new())
+            .unwrap();
+        assert_eq!(viewport.rows[0][0].0.as_ref(), b"bob");
+        assert_eq!(viewport.rows[0][1].0.as_ref(), b"30");
     }
 }

@@ -46,8 +46,8 @@ belongs to exactly one class, and the class is **surfaced in the UI**.
 ### Tier A — Instant (target < 100 ms, independent of file size)
 Constant per-operation latency *after* the index exists. These never scan the whole file.
 - Open + first-screen render (stream the head forward; no global index needed for page 1).
-- Scroll / paginate / jump-to-row (one offset lookup + one seek + parse of that page).
-- Change page size; column show / hide / reorder (projection + metadata only — no data movement).
+- Scroll / jump-to-row (one offset lookup + one seek + parse of that viewport window).
+- Column show / hide / reorder (projection + metadata only — no data movement).
 - "Highlight matches" within the currently-rendered page.
 
 ### Tier B — Bounded background build (linear, one-time, persisted, cancellable)
@@ -98,11 +98,15 @@ and tunes itself. The app runs anywhere; it promises behaviour relative to what 
 - Extensible to JSON / Parquet later behind a format-reader seam (see §4.5) — designed on paper against
   one nested + one columnar format before the trait is frozen, even though only CSV/TSV ship in v1.
 
-### 3.2 Pagination
-- Custom page size. Pages are served from the **row-offset index** (§4.1) — *never* by byte-offset
-  arithmetic (variable-length quoted records make `offset = page × size` silently wrong).
-- Pagination is defined over the **active view** (post-filter, post-sort). The view pipeline order is
-  explicit (§4.4); a filtered/sorted page requires that filter/sort to be materialised first (Tier B/C).
+### 3.2 Scrolling & row access
+- The viewer is a **continuous virtualised scroll**, *not* paginated: only the visible viewport is
+  rendered and fetched, with instant random access to any row. (Pagination + a page-size control was an
+  original goal but was **dropped** — virtualised scroll is a strictly better UX, and the offset index
+  already gives O(1) access to any row, so page boundaries add nothing.)
+- Visible rows are served from the **row-offset index** (§4.1) — *never* by byte-offset arithmetic
+  (variable-length quoted records make `offset = row × width` silently wrong).
+- The visible window is defined over the **active view** (post-filter, post-sort). The view pipeline order
+  is explicit (§4.4); a filtered/sorted window requires that filter/sort to be materialised first (Tier B/C).
 
 ### 3.3 Search ("robust")
 - One **streaming-scan engine** by default — serves literal, substring, AND regex, emits matches
@@ -110,7 +114,7 @@ and tunes itself. The app runs anywhere; it promises behaviour relative to what 
 - **Regex must be linear-time / ReDoS-safe**: use the `regex` crate (NEVER `fancy-regex` or any
   backtracking engine). Linear-time is an *enforced invariant* given user-supplied patterns.
 - **Invert search** = complement of the match predicate over the scan.
-- **Highlight-only** (Tier A, in-place over the paginated view) vs **hide non-matching** (Tier C,
+- **Highlight-only** (Tier A, in-place over the scrolled view) vs **hide non-matching** (Tier C,
   a virtualised result list backed by a growing match-rownum list) are distinct, both surfaced.
 - A literal-term inverted-index accelerator is **deferred** (one streaming-scan engine covers v1: literal +
   regex + invert). Revisit only if usage shows heavy *repeated* exact-term searches on the same large file;
@@ -188,7 +192,7 @@ viewport**. The language decision was driven by engine fit; the engine lives in 
 
 ### 4.4 The view pipeline (resolves composition-order ambiguity)
 `source bytes → encoding decode → format parse (rows/cells) → filter (search-as-hide) → sort →
-paginate/window → render | export`. Each stage is tagged **Tier A/B/C** and the tier is surfaced to the user.
+window (visible viewport) → render | export`. Each stage is tagged **Tier A/B/C** and the tier is surfaced to the user.
 "Export the current view" = export the output of this pipeline.
 
 ### 4.5 Format-reader seam (page/query level, not row level)
@@ -256,7 +260,7 @@ paginate/window → render | export`. Each stage is tagged **Tier A/B/C** and th
   skip-and-flag, surfaced in a "data quality" indicator, never abort silently); resumable index build; panic/crash reporting.
 - **App lifecycle**: lightweight config in the OS *config* dir (separate from the index cache in the *state*
   dir, §4.7) — prefs, recent files, window state, default delimiter/encoding/header overrides, and **optional**
-  saved "views" (column order/sort/filters/page size as a named session). Index/sort artifacts are *not* config.
+  saved "views" (column order/sort/filters as a named session). Index/sort artifacts are *not* config.
 - **Distribution / CI from day one**: Cargo workspace, MSRV policy, `rustfmt`/`clippy`, `cargo-deny` license+advisory
   gate, three-OS build matrix (Apple-silicon + Intel, Windows signing cert, Linux AppImage/Flatpak), signing +
   notarization + auto-update (`cargo-dist`/`cargo-bundle`).
@@ -270,7 +274,7 @@ paginate/window → render | export`. Each stage is tagged **Tier A/B/C** and th
 **In:** CSV/TSV/arbitrary-separator parsing (byte-faithful, encoding-aware, malformed-resilient; UTF-8 +
 UTF-16 LE/BE + Latin-1/Windows-1252 + BOM); sparse offset index persisted to the OS state dir with
 progressive availability + change-detection-and-reload; **cache-management UI (size + clear)**; instant
-pagination + custom page size; column show/hide/reorder; page-local sort + global async sort; streaming
+**continuous virtualised scroll** (random access to any row); column show/hide/reorder; page-local sort + global async sort; streaming
 text+regex search with invert + highlight/hide; same-family export (current-view + source) with round-trip
 self-test; read-only; multi-TB hardened (mmap/stream + spill); hardware-adaptive budgets; lightweight config
 + recent-files (saved-views optional).
@@ -309,10 +313,20 @@ the same change that completes the work.
   Qt-over-FFI). The fps + drag-feel checks require eyes on a screen and cannot be done headless.
 
 ### Phase 1 — MVP
-- ☐ Real CSV/TSV/custom-delimiter parsing behind the format seam; header detection
-- ☐ Encoding handling (UTF-8/16, Latin-1/Windows-1252, BOM); malformed-row resilience
-- ☐ Pagination + custom page size; column hide/show/reorder
-- ☐ Substring-search highlight; clipboard copy; prefs/recent-files; cache-management UI (size + clear)
+- ✅ **Real CSV/TSV/custom-delimiter parsing + header detection** — `Dialect::sniff` (delimiter +
+  header heuristics) auto-detected on open; header row names the columns and is excluded from the data;
+  the app talks to a `Box<dyn ViewportSource>` (format seam, §4.5); delimiter + header are user-overridable.
+- ◐ **Encoding** — BOM detection + single-byte display decode (UTF-8 / Latin-1 / Windows-1252) via
+  `encoding_rs`, raw bytes stay canonical (byte fidelity); user-overridable. *UTF-16 parsing deferred*
+  (byte-level CSV parsing assumes single-byte delimiters; needs transcoding — documented). Malformed-row
+  *resilience* is in (ragged rows tolerated, never crash); a data-quality indicator UI is not yet surfaced.
+- ✅ Continuous virtualised scroll + column show/hide/reorder (done in Phase 0 / grid spike).
+  **Pagination dropped** — scroll supersedes it (§3.2).
+- ✅ **Search, clipboard, persistence, cache UI, recent-files.** Substring-match highlight (cell-level);
+  right-click "Copy". **Index persistence to the OS state dir** — reopening a file loads the cached index
+  instantly (skips the O(n) rescan); **strict stale-detection** (size + mtime + dialect must match, else
+  rebuild — tested: changed-file and changed-dialect both miss); **cache-management UI** (size + Clear, in
+  the Cache menu); **recent-files** persisted to the OS config dir (File menu + Empty-view list).
 
 ### Phase 2 — v1
 - ☐ Global async sort + global filter (hide non-matching) with progress/cancel
@@ -340,6 +354,9 @@ All of the original open questions are now answered (see also §1):
 - **Search mix** → defer the literal-index accelerator; one streaming-scan engine for v1 (§3.3).
 - **Encoding scope (v1)** → UTF-8 + UTF-16 (LE/BE) + Latin-1/Windows-1252 + BOM; CJK legacy deferred (§3.1).
 - **Saved views / sessions** → lightweight config + recent-files in the OS config dir; saved "views" optional (§4.7, §5).
+- **Pagination** → **dropped** in favour of continuous virtualised scroll; the offset index already gives O(1)
+  random access to any row, so page boundaries add nothing (§3.2). (Supersedes the original goals' "pagination
+  with customizable page size".)
 
 No open questions remain blocking Phase 0.
 

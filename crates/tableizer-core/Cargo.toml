@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 csv = "1.4.0"
+directories = "6.0.0"
 memmap2 = "0.9.11"
 thiserror = "2.0.18"
 # thiserror added via `cargo add`.
