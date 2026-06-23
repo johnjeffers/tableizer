@@ -1,1 +1,5 @@
+- Dark mode changes OS chrome
 - Parquet support
+- Package as a standard app
+- Create release artifacts for each OS
+- App should be allowed to be set as the default handler for CSV, TSV, etc.

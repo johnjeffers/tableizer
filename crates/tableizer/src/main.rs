@@ -985,6 +985,15 @@ impl eframe::App for TableizerApp {
             // frame's root `ui` already exists with the old style. Apply directly so the named text
             // styles resolve this frame too — otherwise the first frame panics on lookup.
             ui.set_style(style);
+            // Match the OS window chrome (title bar) to the resolved theme, so it flips along with
+            // the app colors instead of staying on the OS default.
+            ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(
+                if theme::is_dark(&self.theme, system_dark) {
+                    egui::SystemTheme::Dark
+                } else {
+                    egui::SystemTheme::Light
+                },
+            ));
         }
         // Rebuild the font atlas only when the chosen table font changes.
         if self.applied_table_font != self.theme.table_font {
