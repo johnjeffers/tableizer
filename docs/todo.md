@@ -1,4 +1,3 @@
 - main table
-  - select on click-drag instead of scroll
   - header font should be bold and a little larger
 - Parquet support

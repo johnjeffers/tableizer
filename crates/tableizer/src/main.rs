@@ -560,6 +560,36 @@ fn reorder(order: &mut Vec<ColumnId>, dragged: ColumnId, target: ColumnId, after
 }
 
 /// Sort/filter UI state for the loaded table.
+/// An inclusive range of selected display rows. `anchor` is where the selection began (a click, or
+/// the start of a click-drag); `lead` is the active end (the drag position / keyboard cursor). A
+/// single-row selection has `anchor == lead`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct RowSpan {
+    anchor: u64,
+    lead: u64,
+}
+
+impl RowSpan {
+    fn single(row: u64) -> Self {
+        Self {
+            anchor: row,
+            lead: row,
+        }
+    }
+    fn lo(self) -> u64 {
+        self.anchor.min(self.lead)
+    }
+    fn hi(self) -> u64 {
+        self.anchor.max(self.lead)
+    }
+    fn contains(self, row: u64) -> bool {
+        self.lo() <= row && row <= self.hi()
+    }
+    fn len(self) -> u64 {
+        self.hi() - self.lo() + 1
+    }
+}
+
 #[derive(Default)]
 struct ViewControls {
     /// The find/filter query (also used for in-place highlight).
@@ -576,8 +606,10 @@ struct ViewControls {
     applied: ViewSpec,
     /// Last error from applying the view (e.g. invalid regex).
     error: Option<String>,
-    /// Selected display row (click or arrow/page/home/end keys); ⌘/Ctrl+C copies it.
-    selected_row: Option<u64>,
+    /// Selected display rows (click, click-drag range, or arrow/page/home/end); ⌘/Ctrl+C copies them.
+    selected: Option<RowSpan>,
+    /// True while a click-drag row selection is in progress (cells extend it to the pointer).
+    selecting: bool,
     /// Display row under the mouse (transient; drives the hover highlight).
     hovered_row: Option<u64>,
 }
@@ -1120,7 +1152,7 @@ fn menu_bar(ui: &mut egui::Ui, app: &mut TableizerApp, to_open: &mut Option<Path
                 loaded.view.regex = false;
                 loaded.view.invert = false;
                 loaded.view.filter_mode = false;
-                loaded.view.selected_row = None;
+                loaded.view.selected = None;
                 // Drop egui_table's persisted column widths so they return to their initial size.
                 ui.ctx()
                     .data_mut(|d| d.remove_by_type::<egui_table::TableState>());
@@ -1455,12 +1487,20 @@ fn status_bar(ui: &mut egui::Ui, loaded: &LoadedTable, palette: &theme::Palette)
             ui.separator();
             ui.colored_label(palette.error, format!("filter error: {error}"));
         }
-        if let Some(row) = loaded.view.selected_row {
+        if let Some(span) = loaded.view.selected {
             ui.separator();
             let weak = ui.visuals().weak_text_color();
-            ui.label(
-                egui::RichText::new(format!("row {} selected", fmt_count(row + 1))).color(weak),
-            );
+            let label = if span.len() == 1 {
+                format!("row {} selected", fmt_count(span.lo() + 1))
+            } else {
+                format!(
+                    "rows {}–{} selected ({})",
+                    fmt_count(span.lo() + 1),
+                    fmt_count(span.hi() + 1),
+                    fmt_count(span.len())
+                )
+            };
+            ui.label(egui::RichText::new(label).color(weak));
         }
     });
 }
@@ -1512,7 +1552,7 @@ fn grid(ui: &mut egui::Ui, loaded: &mut LoadedTable, palette: &theme::Palette) {
         })
         .collect();
 
-    // Keyboard: move the selected row + ⌘/Ctrl+C to copy it (unless typing in a text field).
+    // Keyboard: move the selection (Shift extends it) + ⌘/Ctrl+C to copy it (unless typing).
     let mut scroll_to: Option<u64> = None;
     let mut copy_request = false;
     let typing = ui.ctx().memory(|m| m.focused().is_some());
@@ -1523,7 +1563,7 @@ fn grid(ui: &mut egui::Ui, loaded: &mut LoadedTable, palette: &theme::Palette) {
             if i.modifiers.command && i.key_pressed(egui::Key::C) {
                 copy_request = true;
             }
-            let current = view.selected_row;
+            let current = view.selected.map(|s| s.lead);
             let next = if i.key_pressed(egui::Key::ArrowDown) {
                 Some(current.map_or(0, |r| (r + 1).min(last)))
             } else if i.key_pressed(egui::Key::ArrowUp) {
@@ -1540,7 +1580,14 @@ fn grid(ui: &mut egui::Ui, loaded: &mut LoadedTable, palette: &theme::Palette) {
                 None
             };
             if let Some(next) = next {
-                view.selected_row = Some(next);
+                // Shift+move extends from the existing anchor; otherwise collapse to a single row.
+                view.selected = Some(match (view.selected, i.modifiers.shift) {
+                    (Some(s), true) => RowSpan {
+                        anchor: s.anchor,
+                        lead: next,
+                    },
+                    _ => RowSpan::single(next),
+                });
                 scroll_to = Some(next);
             }
         });
@@ -1554,14 +1601,18 @@ fn grid(ui: &mut egui::Ui, loaded: &mut LoadedTable, palette: &theme::Palette) {
         palette: palette.clone(),
         sort: view.sort,
         search: view.search.to_lowercase(),
-        selected_row: view.selected_row,
+        selected: view.selected,
+        drag_active: view.selecting,
         hovered_row: view.hovered_row,
         cache_start: 0,
         cache: Vec::new(),
         pending_reorder: None,
         new_hovered: None,
         clicked_row: None,
+        drag_started_row: None,
+        drag_lead_row: None,
         copy_row: None,
+        copy_selected: false,
         pending_sort: None,
     };
 
@@ -1593,31 +1644,58 @@ fn grid(ui: &mut egui::Ui, loaded: &mut LoadedTable, palette: &theme::Palette) {
             }),
         };
     }
+    // Row selection: a drag selects a range (anchor at the start, lead following the pointer); a
+    // plain click selects one row. The drag ends when the pointer is released.
+    if let Some(start) = delegate.drag_started_row {
+        view.selected = Some(RowSpan::single(start));
+        view.selecting = true;
+    } else if view.selecting
+        && let Some(lead) = delegate.drag_lead_row
+        && let Some(span) = view.selected.as_mut()
+    {
+        span.lead = lead;
+    }
     if let Some(row) = delegate.clicked_row {
-        view.selected_row = Some(row);
+        view.selected = Some(RowSpan::single(row));
+    }
+    if view.selecting && !ui.input(|i| i.pointer.primary_down()) {
+        view.selecting = false;
     }
     view.hovered_row = delegate.new_hovered;
 
-    // Copy the targeted row (context "Copy row", or ⌘/Ctrl+C on the selection) as a TSV line.
-    let copy_target = delegate.copy_row.or(if copy_request {
-        view.selected_row
-    } else {
-        None
-    });
-    if let Some(row) = copy_target {
+    // Copy the targeted rows as TSV lines: "Copy Row" → one row; "Copy Selected" or ⌘/Ctrl+C → the
+    // whole selection.
+    let copy_span = delegate.copy_row.map(RowSpan::single).or(
+        if copy_request || delegate.copy_selected {
+            view.selected
+        } else {
+            None
+        },
+    );
+    if let Some(span) = copy_span {
         let request = ViewportRequest {
-            rows: RowRange { start: row, len: 1 },
+            rows: RowRange {
+                start: span.lo(),
+                len: u32::try_from(span.len()).unwrap_or(u32::MAX),
+            },
             columns: delegate.columns.clone(),
         };
-        if let Ok(viewport) = delegate.table.fetch(&request, &CancellationToken::new())
-            && let Some(cells) = viewport.rows.first()
-        {
-            let line = cells
+        if let Ok(viewport) = delegate.table.fetch(&request, &CancellationToken::new()) {
+            let text = viewport
+                .rows
                 .iter()
-                .map(|cell| decode_field(&cell.0, delegate.encoding))
+                .map(|cells| {
+                    cells
+                        .iter()
+                        .map(|cell| decode_field(&cell.0, delegate.encoding))
+                        .collect::<Vec<_>>()
+                        .join("\t")
+                })
                 .collect::<Vec<_>>()
-                .join("\t");
-            ui.ctx().copy_text(line);
+                .join("\n");
+            if !text.is_empty() {
+                ui.ctx().copy_text(text);
+            }
         }
     }
 }
@@ -1770,8 +1848,10 @@ struct GridDelegate<'a> {
     sort: Option<SortKey>,
     /// Lowercased search query; cells containing it are highlighted (empty = no highlight).
     search: String,
-    /// Selected display row to highlight, if any.
-    selected_row: Option<u64>,
+    /// Selected display rows to highlight, if any.
+    selected: Option<RowSpan>,
+    /// Whether a row-selection drag is in progress (cells extend the selection to the pointer).
+    drag_active: bool,
     /// Row under the mouse last frame (painted as hovered).
     hovered_row: Option<u64>,
     cache_start: u64,
@@ -1783,8 +1863,14 @@ struct GridDelegate<'a> {
     new_hovered: Option<u64>,
     /// Row whose cell was left-clicked this frame (read back to update the selection).
     clicked_row: Option<u64>,
-    /// Row to copy as TSV (from the "Copy row" context item); handled after `show`.
+    /// Row where a selection drag began this frame (read back to anchor the selection).
+    drag_started_row: Option<u64>,
+    /// Row under the pointer during an active drag (read back to extend the selection).
+    drag_lead_row: Option<u64>,
+    /// Row to copy as TSV (from the "Copy Row" context item); handled after `show`.
     copy_row: Option<u64>,
+    /// Set by the "Copy Selected" context item: copy the whole selection after `show`.
+    copy_selected: bool,
     /// Column whose header was clicked this frame (read back to cycle the sort).
     pending_sort: Option<ColumnId>,
 }
@@ -1958,15 +2044,28 @@ impl egui_table::TableDelegate for GridDelegate<'_> {
 
         let cell_rect = ui.max_rect();
 
-        // Whole-cell interaction: left-click selects the row, hover drives the row highlight,
-        // right-click opens the copy menu.
+        // Whole-cell interaction: left-click selects the row; click-drag selects a range (the cell
+        // claims the drag, so the table doesn't scroll); hover drives the highlight; right-click
+        // opens the copy menu.
         let response = ui.interact(
             cell_rect,
             ui.id().with((cell.row_nr, cell.col_nr)),
-            egui::Sense::click(),
+            egui::Sense::click_and_drag(),
         );
         if response.clicked() {
             self.clicked_row = Some(cell.row_nr);
+        }
+        if response.drag_started() {
+            self.drag_started_row = Some(cell.row_nr);
+        }
+        // While dragging, the cell under the pointer is the selection's lead (geometric test, since
+        // egui ties `dragged()` to the cell where the drag began, not the one now under the cursor).
+        if self.drag_active
+            && ui
+                .input(|i| i.pointer.interact_pos())
+                .is_some_and(|p| cell_rect.contains(p))
+        {
+            self.drag_lead_row = Some(cell.row_nr);
         }
         if response.hovered() {
             self.new_hovered = Some(cell.row_nr);
@@ -1981,7 +2080,7 @@ impl egui_table::TableDelegate for GridDelegate<'_> {
             ui.painter()
                 .rect_filled(cell_rect, egui::CornerRadius::ZERO, self.palette.row_hover);
         }
-        if Some(cell.row_nr) == self.selected_row {
+        if self.selected.is_some_and(|s| s.contains(cell.row_nr)) {
             ui.painter().rect_filled(
                 cell_rect,
                 egui::CornerRadius::ZERO,
@@ -2037,14 +2136,21 @@ impl egui_table::TableDelegate for GridDelegate<'_> {
             ui.add_space(10.0);
         });
 
-        // Right-click: copy this cell, or the whole row as TSV (handled after `show`).
+        // Right-click: copy this cell, the whole row, or the current selection (handled after `show`).
         response.context_menu(|ui| {
-            if ui.button("Copy cell").clicked() {
+            if ui.button("Copy Cell").clicked() {
                 ui.ctx().copy_text(text.clone());
                 ui.close();
             }
-            if ui.button("Copy row").clicked() {
+            if ui.button("Copy Row").clicked() {
                 self.copy_row = Some(cell.row_nr);
+                ui.close();
+            }
+            if ui
+                .add_enabled(self.selected.is_some(), egui::Button::new("Copy Selected"))
+                .clicked()
+            {
+                self.copy_selected = true;
                 ui.close();
             }
         });
@@ -2081,6 +2187,29 @@ mod tests {
         let mut order = vec![ColumnId(0), ColumnId(1)];
         reorder(&mut order, ColumnId(1), ColumnId(1), false);
         assert_eq!(order, vec![ColumnId(0), ColumnId(1)]);
+    }
+
+    #[test]
+    fn row_span_covers_the_range_regardless_of_drag_direction() {
+        let down = RowSpan {
+            anchor: 2,
+            lead: 5,
+        };
+        assert_eq!((down.lo(), down.hi(), down.len()), (2, 5, 4));
+        assert!(down.contains(2) && down.contains(4) && down.contains(5));
+        assert!(!down.contains(1) && !down.contains(6));
+
+        // Dragging upward (lead < anchor) selects the same rows.
+        let up = RowSpan {
+            anchor: 5,
+            lead: 2,
+        };
+        assert_eq!((up.lo(), up.hi(), up.len()), (2, 5, 4));
+        assert!(up.contains(3));
+
+        let single = RowSpan::single(7);
+        assert_eq!(single.len(), 1);
+        assert!(single.contains(7) && !single.contains(8));
     }
 
     #[test]
