@@ -191,12 +191,15 @@ mod theme {
         visuals.window_corner_radius = CornerRadius::same(8);
         visuals.menu_corner_radius = CornerRadius::same(6);
 
+        // Keep all metrics on the integer pixel grid — fractional spacing renders blurry text and
+        // trips egui's "unaligned" debug overlay.
         let scale = if comfortable { 1.0 } else { 0.65 };
+        let round = |v: f32| (v * scale).round();
         let spacing = Spacing {
-            item_spacing: Vec2::new(8.0 * scale, 6.0 * scale),
-            button_padding: Vec2::new(8.0 * scale, 4.0 * scale),
-            menu_margin: Margin::same((6.0 * scale) as i8),
-            window_margin: Margin::same((8.0 * scale) as i8),
+            item_spacing: Vec2::new(round(8.0), round(6.0)),
+            button_padding: Vec2::new(round(8.0), round(4.0)),
+            menu_margin: Margin::same(round(6.0) as i8),
+            window_margin: Margin::same(round(8.0) as i8),
             interact_size: Vec2::new(
                 Spacing::default().interact_size.x,
                 if comfortable { 24.0 } else { 20.0 },
@@ -230,6 +233,9 @@ mod theme {
             ..Style::default()
         };
 
+        // Row height tracks the data-cell font size + density padding, so large fonts don't clip.
+        let row_height = (settings.table_font_size + if comfortable { 12.0 } else { 7.0 }).round();
+
         let palette = Palette {
             accent,
             header_bg: if dark {
@@ -261,8 +267,9 @@ mod theme {
             } else {
                 Color32::from_black_alpha(28)
             },
-            row_height: if comfortable { 26.0 } else { 20.0 },
-            header_height: if comfortable { 30.0 } else { 24.0 },
+            row_height,
+            // Keep the header at least as tall as a row (so big fonts don't make rows overshoot it).
+            header_height: row_height.max(if comfortable { 30.0 } else { 24.0 }),
             table_font: FontId::new(
                 settings.table_font_size,
                 FontFamily::Name(crate::fonts::TABLE_FONT.into()),
@@ -1285,16 +1292,15 @@ fn settings_window(
                 ui.label("Size");
                 ui.spacing_mut().item_spacing.x = 4.0;
                 let h = ui.spacing().interact_size.y;
-                // Snap to whole points so stepping reads cleanly (e.g. 13.5 → 14 → 15).
                 if ui.button(egui::RichText::new("−").size(15.0)).clicked() {
-                    settings.table_font_size = (settings.table_font_size.ceil() - 1.0).max(8.0);
+                    settings.table_font_size = (settings.table_font_size - 0.5).max(8.0);
                 }
                 ui.add_sized(
                     egui::vec2(48.0, h),
                     egui::Label::new(format!("{:.1} pt", settings.table_font_size)),
                 );
                 if ui.button(egui::RichText::new("+").size(15.0)).clicked() {
-                    settings.table_font_size = (settings.table_font_size.floor() + 1.0).min(32.0);
+                    settings.table_font_size = (settings.table_font_size + 0.5).min(32.0);
                 }
                 ui.add_space(12.0);
                 let weak = ui.visuals().weak_text_color();

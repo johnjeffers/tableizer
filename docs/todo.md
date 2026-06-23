@@ -1,7 +1,8 @@
 - main table
-  - double-click separator to auto-size to largest value
   - cmd/ctrl+f focuses Find
   - select on click-drag instead of scroll
   - row height should be based on font size + compact/comfortable
   - header font should be bold and a little larger
   - Add a Reset button that resets column width, column order, column visibility, sort order, search filters, etc to default
+- move Cache info and clear into Settings
+- change the View menu to Columns, and remove the Freeze option entirely
