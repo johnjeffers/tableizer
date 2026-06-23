@@ -293,14 +293,40 @@ fn open_table(path: &Path, dialect: Dialect) -> Result<Box<dyn ViewportSource>, 
         .map_err(|e| e.to_string())
 }
 
-fn delimiter_name(delimiter: u8) -> &'static str {
-    match delimiter {
-        b',' => "Comma",
-        b'\t' => "Tab",
-        b';' => "Semicolon",
-        b'|' => "Pipe",
-        _ => "Custom",
+/// Render a delimiter byte for the custom field: a printable ASCII char as itself, anything else
+/// (tab, control chars) as a `0x..` hex byte the user can read and re-enter.
+fn delimiter_display(delimiter: u8) -> String {
+    if delimiter.is_ascii_graphic() || delimiter == b' ' {
+        (delimiter as char).to_string()
+    } else {
+        format!("0x{delimiter:02x}")
     }
+}
+
+/// A friendly name for a delimiter byte (for the "Auto · detected …" label).
+fn delimiter_label(delimiter: u8) -> String {
+    match delimiter {
+        b',' => "comma".to_string(),
+        b'\t' => "tab".to_string(),
+        b';' => "semicolon".to_string(),
+        b'|' => "pipe".to_string(),
+        _ => delimiter_display(delimiter),
+    }
+}
+
+/// Parse the custom-delimiter field: a single ASCII character, or a hex byte as `0xNN` / `\xNN`.
+/// Returns `None` for anything that isn't a single byte (so the field can be edited mid-entry).
+fn parse_delimiter(input: &str) -> Option<u8> {
+    if let Some(hex) = input.strip_prefix("0x").or_else(|| input.strip_prefix("\\x"))
+        && hex.len() == 2
+    {
+        return u8::from_str_radix(hex, 16).ok();
+    }
+    let bytes = input.as_bytes();
+    if bytes.len() == 1 && bytes[0].is_ascii() {
+        return Some(bytes[0]);
+    }
+    None
 }
 
 fn column_name(schema: &Schema, id: ColumnId, encoding: &'static Encoding) -> String {
@@ -410,11 +436,14 @@ struct SavedView {
     sort: Option<(u32, bool)>,
     /// (query, regex, invert) — present only when a hide-non-matching filter is active.
     filter: Option<(String, bool, bool)>,
+    /// Explicit delimiter override; `None` = auto-detect (the default).
+    #[serde(default)]
+    delimiter: Option<u8>,
 }
 
 impl SavedView {
-    /// Snapshot the current layout + controls.
-    fn snapshot(layout: &GridLayout, view: &ViewControls) -> Self {
+    /// Snapshot the current layout + controls. `delimiter` is the explicit override (or `None` = auto).
+    fn snapshot(layout: &GridLayout, view: &ViewControls, delimiter: Option<u8>) -> Self {
         Self {
             order: layout.order.iter().map(|c| c.0).collect(),
             visible: layout.visible.clone(),
@@ -424,6 +453,7 @@ impl SavedView {
                 .map(|s| (s.column.0, s.direction == Direction::Ascending)),
             filter: (view.filter_mode && !view.search.is_empty())
                 .then(|| (view.search.clone(), view.regex, view.invert)),
+            delimiter,
         }
     }
 
@@ -462,6 +492,12 @@ struct LoadedTable {
     encoding: &'static Encoding,
     view: ViewControls,
     saved: SavedView,
+    /// Text in the Parsing menu's custom-delimiter field (a char like `:` or a hex byte like `0x01`).
+    delimiter_input: String,
+    /// The delimiter `Dialect::sniff` detected on open — what "Auto" resolves to.
+    detected_delimiter: u8,
+    /// Whether the delimiter is auto-detected (the default) vs an explicit user override.
+    delimiter_auto: bool,
 }
 
 /// What the window is currently showing.
@@ -609,19 +645,31 @@ impl TableizerApp {
     }
 
     fn open_path(&mut self, path: PathBuf) {
-        let dialect = sniff_file(&path);
+        let mut dialect = sniff_file(&path);
+        let detected_delimiter = dialect.delimiter;
+        // A persisted delimiter override must be applied *before* opening (it changes the column
+        // structure); the rest of the saved view (layout/sort/filter) is applied after.
+        let saved = views::load(&path).unwrap_or_default();
+        let delimiter_auto = match saved.delimiter {
+            Some(byte) => {
+                dialect.delimiter = byte;
+                false
+            }
+            None => true,
+        };
         // UTF-16 is transcoded to UTF-8 by the engine; single-byte encodings default to UTF-8 here and
-        // can be switched to Windows-1252 via the Encoding menu.
+        // can be switched to Windows-1252 via the Parsing menu.
         let encoding: &'static Encoding = encoding_rs::UTF_8;
         self.view = match open_table(&path, dialect) {
             Ok(table) => {
                 let mut layout = GridLayout::new(table.schema().columns.len());
                 let mut view = ViewControls::default();
-                // Reapply this file's saved view (column order/visibility/freeze + sort + filter).
-                let saved = views::load(&path).unwrap_or_default();
                 saved.apply(&mut layout, &mut view);
                 recent::add(&mut self.recent, &path);
                 View::Loaded(Box::new(LoadedTable {
+                    delimiter_input: delimiter_display(dialect.delimiter),
+                    detected_delimiter,
+                    delimiter_auto,
                     path,
                     table,
                     layout,
@@ -684,7 +732,8 @@ impl eframe::App for TableizerApp {
                         Err(error) => Some(error.to_string()),
                     };
                 }
-                let current = SavedView::snapshot(&loaded.layout, &loaded.view);
+                let delimiter = (!loaded.delimiter_auto).then_some(loaded.dialect.delimiter);
+                let current = SavedView::snapshot(&loaded.layout, &loaded.view, delimiter);
                 if current != loaded.saved {
                     views::save(&loaded.path, &current);
                     loaded.saved = current;
@@ -741,6 +790,7 @@ fn menu_bar(ui: &mut egui::Ui, app: &mut TableizerApp, to_open: &mut Option<Path
     });
 
     if let View::Loaded(loaded) = &mut app.view {
+        ui.menu_button("Parsing", |ui| parsing_menu(ui, loaded));
         ui.menu_button("View", |ui| {
             ui.set_min_width(190.0);
             menu_section(ui, "COLUMNS");
@@ -890,16 +940,11 @@ fn settings_menu(ui: &mut egui::Ui, settings: &mut theme::Settings) {
 fn toolbar(ui: &mut egui::Ui, loaded: &mut LoadedTable) {
     let LoadedTable {
         table,
-        dialect,
         encoding,
         view,
         ..
     } = loaded;
     ui.horizontal_wrapped(|ui| {
-        dialect_menu(ui, dialect);
-        ui.checkbox(&mut dialect.has_header, "Header");
-        encoding_menu(ui, encoding);
-        ui.separator();
         sort_menu(ui, table.schema(), encoding, &mut view.sort);
         ui.separator();
         ui.label("Find:");
@@ -1112,40 +1157,70 @@ fn fmt_count(n: u64) -> String {
     out
 }
 
-fn dialect_menu(ui: &mut egui::Ui, dialect: &mut Dialect) {
-    ui.menu_button(
-        format!("Delimiter: {}", delimiter_name(dialect.delimiter)),
-        |ui| {
-            for (label, byte) in [
-                ("Comma", b','),
-                ("Tab", b'\t'),
-                ("Semicolon", b';'),
-                ("Pipe", b'|'),
-            ] {
-                if ui
-                    .selectable_label(dialect.delimiter == byte, label)
-                    .clicked()
-                {
-                    dialect.delimiter = byte;
-                    ui.close();
-                }
-            }
-        },
-    );
-}
+/// The Parsing menu: delimiter (presets + custom), header row, and display encoding. Changing the
+/// delimiter or header re-opens the file (column structure may change); encoding is display-only.
+fn parsing_menu(ui: &mut egui::Ui, loaded: &mut LoadedTable) {
+    ui.set_min_width(196.0);
 
-fn encoding_menu(ui: &mut egui::Ui, encoding: &mut &'static Encoding) {
-    ui.menu_button(format!("Encoding: {}", encoding.name()), |ui| {
-        for choice in [encoding_rs::UTF_8, encoding_rs::WINDOWS_1252] {
-            if ui
-                .selectable_label(std::ptr::eq(*encoding, choice), choice.name())
-                .clicked()
-            {
-                *encoding = choice;
-                ui.close();
-            }
+    menu_section(ui, "DELIMITER");
+    // Auto is the default; presets/custom are explicit overrides for when sniffing guessed wrong.
+    let detected = loaded.detected_delimiter;
+    if menu_choice(
+        ui,
+        loaded.delimiter_auto,
+        None,
+        &format!("Auto · detected {}", delimiter_label(detected)),
+    ) {
+        loaded.dialect.delimiter = detected;
+        loaded.delimiter_auto = true;
+        loaded.delimiter_input = delimiter_display(detected);
+    }
+    for (label, byte) in [
+        ("Comma", b','),
+        ("Tab", b'\t'),
+        ("Semicolon", b';'),
+        ("Pipe", b'|'),
+    ] {
+        if menu_choice(
+            ui,
+            !loaded.delimiter_auto && loaded.dialect.delimiter == byte,
+            None,
+            label,
+        ) {
+            loaded.dialect.delimiter = byte;
+            loaded.delimiter_auto = false;
+            loaded.delimiter_input = delimiter_display(byte);
+        }
+    }
+    ui.horizontal(|ui| {
+        ui.label("Custom:");
+        ui.add(
+            egui::TextEdit::singleline(&mut loaded.delimiter_input)
+                .desired_width(54.0)
+                .hint_text(": or 0x01"),
+        );
+        if ui.button("Set").clicked()
+            && let Some(byte) = parse_delimiter(&loaded.delimiter_input)
+        {
+            loaded.dialect.delimiter = byte;
+            loaded.delimiter_auto = false;
         }
     });
+
+    menu_section(ui, "HEADER");
+    ui.checkbox(&mut loaded.dialect.has_header, "First row is a header");
+
+    menu_section(ui, "ENCODING");
+    for choice in [encoding_rs::UTF_8, encoding_rs::WINDOWS_1252] {
+        if menu_choice(
+            ui,
+            std::ptr::eq(loaded.encoding, choice),
+            None,
+            choice.name(),
+        ) {
+            loaded.encoding = choice;
+        }
+    }
 }
 
 fn sort_menu(
@@ -1479,5 +1554,23 @@ mod tests {
         assert!(cell_matches("Hello World", "world"));
         assert!(!cell_matches("Hello", "xyz"));
         assert!(!cell_matches("Hello", "")); // empty query highlights nothing
+    }
+
+    #[test]
+    fn parses_single_char_and_hex_delimiters() {
+        assert_eq!(parse_delimiter(","), Some(b','));
+        assert_eq!(parse_delimiter(":"), Some(b':'));
+        assert_eq!(parse_delimiter("0x01"), Some(1)); // Hive/Unix Ctrl-A
+        assert_eq!(parse_delimiter("\\x09"), Some(b'\t'));
+        assert_eq!(parse_delimiter(""), None); // mid-entry: not yet a delimiter
+        assert_eq!(parse_delimiter("ab"), None); // not a single byte
+        assert_eq!(parse_delimiter("é"), None); // multi-byte char isn't a single delimiter
+    }
+
+    #[test]
+    fn delimiter_display_round_trips_through_parse() {
+        for byte in [b',', b'\t', b'|', 1u8, 0x1f] {
+            assert_eq!(parse_delimiter(&delimiter_display(byte)), Some(byte));
+        }
     }
 }
