@@ -121,6 +121,20 @@ pub(crate) fn delimiter_display(delimiter: u8) -> String {
     }
 }
 
+/// A human-readable name for the loaded file's format (for the status bar). A delimited file is
+/// named by its delimiter — comma → CSV, tab → TSV, anything else → "Delimited · <delimiter>".
+pub(crate) fn format_label(format: Format, dialect: &Dialect) -> String {
+    match format {
+        Format::Parquet => "Parquet".to_string(),
+        Format::Ndjson => "NDJSON".to_string(),
+        Format::Delimited => match dialect.delimiter {
+            b',' => "CSV".to_string(),
+            b'\t' => "TSV".to_string(),
+            other => format!("Delimited · {}", delimiter_label(other)),
+        },
+    }
+}
+
 /// A friendly name for a delimiter byte (for the "Auto · detected …" label).
 pub(crate) fn delimiter_label(delimiter: u8) -> String {
     match delimiter {
@@ -385,6 +399,28 @@ mod tests {
         assert_eq!(
             detect_format(Path::new("x.unknown_ext_zz")),
             Format::Delimited
+        );
+    }
+
+    #[test]
+    fn format_label_names_each_format() {
+        let comma = Dialect::default();
+        assert_eq!(format_label(Format::Parquet, &comma), "Parquet");
+        assert_eq!(format_label(Format::Ndjson, &comma), "NDJSON");
+        // Delimited is named by its delimiter.
+        assert_eq!(format_label(Format::Delimited, &comma), "CSV");
+        let tab = Dialect {
+            delimiter: b'\t',
+            ..Dialect::default()
+        };
+        assert_eq!(format_label(Format::Delimited, &tab), "TSV");
+        let semi = Dialect {
+            delimiter: b';',
+            ..Dialect::default()
+        };
+        assert_eq!(
+            format_label(Format::Delimited, &semi),
+            "Delimited · semicolon"
         );
     }
 

@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use eframe::egui;
 use tableizer_core::RowCount;
 
-use crate::model::LoadedTable;
+use crate::model::{LoadedTable, format_label};
 use crate::theme;
 
 /// egui's standard menu look (`menu_style`) with roomier horizontal item padding, so the highlight
@@ -52,21 +52,34 @@ pub(crate) fn toolbar(ui: &mut egui::Ui, loaded: &mut LoadedTable, focus_find: b
     });
 }
 
-/// The bottom status bar: path, row count, indexing/view-build progress, data-quality, errors.
+/// The bottom status bar: path · format · cols/rows · indexing/view-build progress · data-quality ·
+/// errors · selection.
 pub(crate) fn status_bar(ui: &mut egui::Ui, loaded: &LoadedTable, palette: &theme::Palette) {
     let (total, indexing) = match loaded.table.row_count() {
         RowCount::Exact(n) => (n, false),
         RowCount::AtLeast(n) => (n, true),
     };
+    let cols = loaded.table.schema().columns.len() as u64;
     ui.horizontal(|ui| {
         ui.label(loaded.path.display().to_string());
         ui.separator();
+        ui.label(format_label(loaded.format, &loaded.dialect));
+        ui.separator();
+        // "n cols, n rows" — the row count is a growing lower bound (≥) while the index builds.
         if indexing {
-            ui.label(format!("indexing… ≥ {} rows", fmt_count(total)));
+            ui.label(format!(
+                "{} cols, ≥ {} rows",
+                fmt_count(cols),
+                fmt_count(total)
+            ));
             ui.spinner();
             ui.ctx().request_repaint();
         } else {
-            ui.label(format!("{} rows", fmt_count(total)));
+            ui.label(format!(
+                "{} cols, {} rows",
+                fmt_count(cols),
+                fmt_count(total)
+            ));
         }
         let quality = loaded.table.data_quality();
         if quality.complete && quality.ragged_rows > 0 {
