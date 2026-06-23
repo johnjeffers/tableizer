@@ -3,4 +3,3 @@
   - row height should be based on font size + compact/comfortable
   - header font should be bold and a little larger
 - move Cache info and clear into Settings
-- change the View menu to Columns, and remove the Freeze option entirely

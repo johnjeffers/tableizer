@@ -1095,20 +1095,6 @@ fn menu_bar(ui: &mut egui::Ui, app: &mut TableizerApp, to_open: &mut Option<Path
         ui.menu_button("Export", |ui| export_menu(ui, loaded));
     }
 
-    ui.menu_button("Cache", |ui| {
-        ui.set_min_width(180.0);
-        menu_section(ui, "INDEX CACHE");
-        ui.label(format!(
-            "Size on disk: {}",
-            human_bytes(tableizer_core::cache::total_size())
-        ));
-        ui.add_space(2.0);
-        if ui.button("Clear cache").clicked() {
-            tableizer_core::cache::clear();
-            ui.close();
-        }
-    });
-
     // Settings opens a window (not a dropdown), so it's a plain menu-bar button.
     if ui.add(egui::Button::new("Settings").frame(false)).clicked() {
         app.settings_open = !app.settings_open;
@@ -1369,6 +1355,20 @@ fn settings_window(
                         }
                     });
             });
+
+            ui.add_space(12.0);
+            settings_section(ui, "Index cache");
+            ui.label(
+                egui::RichText::new(format!(
+                    "Size on disk: {}",
+                    human_bytes(tableizer_core::cache::total_size())
+                ))
+                .color(ui.visuals().weak_text_color()),
+            );
+            ui.add_space(4.0);
+            if ui.button("Clear cache").clicked() {
+                tableizer_core::cache::clear();
+            }
         });
     *open = window_open;
 }
