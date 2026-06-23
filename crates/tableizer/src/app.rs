@@ -5,10 +5,11 @@ use std::path::PathBuf;
 
 use eframe::egui;
 use encoding_rs::Encoding;
+use tableizer_core::parse::Dialect;
 
 use crate::model::{
-    GridLayout, LoadedTable, SavedView, View, ViewControls, delimiter_display, open_table,
-    sniff_file,
+    Format, GridLayout, LoadedTable, SavedView, View, ViewControls, delimiter_display,
+    detect_format, open_table, sniff_file,
 };
 use crate::persist::{prefs, recent, views};
 use crate::ui::{empty_view, grid, menu_bar, settings_window, status_bar, toolbar};
@@ -78,22 +79,33 @@ impl TableizerApp {
     }
 
     fn open_path(&mut self, path: PathBuf) {
-        let mut dialect = sniff_file(&path);
-        let detected_delimiter = dialect.delimiter;
-        // A persisted delimiter override must be applied *before* opening (it changes the column
-        // structure); the rest of the saved view (layout/sort/filter) is applied after.
+        let format = detect_format(&path);
+        // The saved view (column layout/sort/filter) applies to every format; only the delimiter
+        // override within it is delimited-specific.
         let saved = views::load(&path).unwrap_or_default();
-        let delimiter_auto = match saved.delimiter {
-            Some(byte) => {
-                dialect.delimiter = byte;
-                false
+        // Delimiter sniffing + override only make sense for delimited text; the other formats carry
+        // their own schema, so they use a default dialect (header on → exports include column names).
+        let (dialect, detected_delimiter, delimiter_auto) = match format {
+            Format::Delimited => {
+                let mut dialect = sniff_file(&path);
+                let detected_delimiter = dialect.delimiter;
+                // A persisted delimiter override must be applied *before* opening (it changes the
+                // column structure); the rest of the saved view is applied after.
+                let delimiter_auto = match saved.delimiter {
+                    Some(byte) => {
+                        dialect.delimiter = byte;
+                        false
+                    }
+                    None => true,
+                };
+                (dialect, detected_delimiter, delimiter_auto)
             }
-            None => true,
+            Format::Ndjson | Format::Parquet => (Dialect::default(), b',', true),
         };
         // UTF-16 is transcoded to UTF-8 by the engine; single-byte encodings default to UTF-8 here and
         // can be switched to Windows-1252 via the Parsing menu.
         let encoding: &'static Encoding = encoding_rs::UTF_8;
-        self.view = match open_table(&path, dialect) {
+        self.view = match open_table(&path, format, dialect) {
             Ok(table) => {
                 let mut layout = GridLayout::new(table.schema().columns.len());
                 let mut view = ViewControls::default();
@@ -103,6 +115,7 @@ impl TableizerApp {
                     delimiter_input: delimiter_display(dialect.delimiter),
                     detected_delimiter,
                     delimiter_auto,
+                    format,
                     path,
                     table,
                     layout,
@@ -188,7 +201,7 @@ impl eframe::App for TableizerApp {
         // filter/sort view and persist the per-file saved view.
         if let View::Loaded(loaded) = &mut self.view {
             if Some(loaded.dialect) != dialect_before {
-                if let Ok(reopened) = open_table(&loaded.path, loaded.dialect) {
+                if let Ok(reopened) = open_table(&loaded.path, loaded.format, loaded.dialect) {
                     loaded.table = reopened;
                     loaded.layout = GridLayout::new(loaded.table.schema().columns.len());
                 }

@@ -47,7 +47,13 @@ impl Matcher {
 
     /// Whether `record` matches: any field matches the pattern, XOR-ed with `invert`.
     pub fn matches(&self, record: &csv::ByteRecord) -> bool {
-        let any = record.iter().any(|field| self.regex.is_match(field));
+        self.matches_any(record.iter())
+    }
+
+    /// Whether any field in `fields` matches the pattern, XOR-ed with `invert`. The format-agnostic
+    /// form used by non-delimited sources (NDJSON, Parquet) whose records aren't `csv::ByteRecord`s.
+    pub fn matches_any<'a>(&self, fields: impl IntoIterator<Item = &'a [u8]>) -> bool {
+        let any = fields.into_iter().any(|field| self.regex.is_match(field));
         any ^ self.invert
     }
 }

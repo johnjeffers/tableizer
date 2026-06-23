@@ -10,6 +10,8 @@ pub mod cache;
 pub mod error;
 pub mod export;
 pub mod index;
+pub mod ndjson;
+pub mod parquet;
 pub mod parse;
 pub mod search;
 pub mod sort;
@@ -17,11 +19,14 @@ pub mod table;
 pub mod viewport;
 
 mod cancel;
+mod source;
 
 pub use cancel::CancellationToken;
 pub use error::{Error, Result};
 pub use export::ExportScope;
 pub use index::Progress;
+pub use ndjson::NdjsonTable;
+pub use parquet::ParquetTable;
 pub use search::FilterSpec;
 pub use sort::{Direction, SortKey};
 pub use table::CsvTable;

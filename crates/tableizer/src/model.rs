@@ -7,9 +7,44 @@ use std::path::{Path, PathBuf};
 
 use encoding_rs::Encoding;
 use tableizer_core::{
-    ColumnId, CsvTable, Direction, FilterSpec, Schema, SortKey, ViewSpec, ViewportSource,
-    parse::Dialect,
+    ColumnId, CsvTable, Direction, FilterSpec, NdjsonTable, ParquetTable, Schema, SortKey,
+    ViewSpec, ViewportSource, parse::Dialect,
 };
+
+/// The file format behind a [`ViewportSource`]. Detected on open; selects which engine reader to
+/// build and which UI affordances apply (only the delimited format exposes the Parsing menu).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Format {
+    /// CSV / TSV / arbitrary-separator text (the dialect-driven path).
+    Delimited,
+    /// NDJSON / JSON Lines.
+    Ndjson,
+    /// Apache Parquet.
+    Parquet,
+}
+
+/// Detect a file's format: by extension first (explicit + cheap), then Parquet's `PAR1` magic bytes
+/// as a fallback for a mis-named file. Anything else is treated as delimited text (the default).
+pub(crate) fn detect_format(path: &Path) -> Format {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("parquet" | "pqt") => Format::Parquet,
+        Some("ndjson" | "jsonl") => Format::Ndjson,
+        _ if file_starts_with(path, b"PAR1") => Format::Parquet,
+        _ => Format::Delimited,
+    }
+}
+
+/// Whether `path` begins with `magic` (best-effort; a read failure reads as "no").
+fn file_starts_with(path: &Path, magic: &[u8]) -> bool {
+    let mut head = vec![0u8; magic.len()];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut head).map(|()| head == magic))
+        .unwrap_or(false)
+}
 
 /// Read a head sample and auto-detect the dialect (delimiter + header); fall back to the default.
 pub(crate) fn sniff_file(path: &Path) -> Dialect {
@@ -41,11 +76,39 @@ pub(crate) fn cell_matches(text: &str, query: &str, case_sensitive: bool) -> boo
     }
 }
 
-/// Open `path` behind the `ViewportSource` seam (the app is format-agnostic).
-pub(crate) fn open_table(path: &Path, dialect: Dialect) -> Result<Box<dyn ViewportSource>, String> {
-    CsvTable::open(path, dialect)
-        .map(|t| Box::new(t) as Box<dyn ViewportSource>)
-        .map_err(|e| e.to_string())
+/// The Open-file dialog, pre-filtered to the formats Tableizer reads, with an all-files escape hatch
+/// (detection still works on any file — the filter is only the dialog's default view).
+pub(crate) fn pick_file() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .add_filter(
+            "Tabular data",
+            &[
+                "csv", "tsv", "tab", "txt", "ndjson", "jsonl", "parquet", "pqt",
+            ],
+        )
+        .add_filter("All files", &["*"])
+        .pick_file()
+}
+
+/// Open `path` behind the `ViewportSource` seam (the rest of the app is format-agnostic). The
+/// `dialect` is consulted only for [`Format::Delimited`]; the other readers carry their own schema.
+pub(crate) fn open_table(
+    path: &Path,
+    format: Format,
+    dialect: Dialect,
+) -> Result<Box<dyn ViewportSource>, String> {
+    let boxed = |t: Box<dyn ViewportSource>| t;
+    match format {
+        Format::Delimited => CsvTable::open(path, dialect)
+            .map(|t| boxed(Box::new(t)))
+            .map_err(|e| e.to_string()),
+        Format::Ndjson => NdjsonTable::open(path)
+            .map(|t| boxed(Box::new(t)))
+            .map_err(|e| e.to_string()),
+        Format::Parquet => ParquetTable::open(path)
+            .map(|t| boxed(Box::new(t)))
+            .map_err(|e| e.to_string()),
+    }
 }
 
 /// Render a delimiter byte for the custom field: a printable ASCII char as itself, anything else
@@ -284,6 +347,8 @@ pub(crate) struct LoadedTable {
     pub(crate) path: PathBuf,
     pub(crate) table: Box<dyn ViewportSource>,
     pub(crate) layout: GridLayout,
+    /// The detected file format. Gates the delimited-only UI (the Parsing menu).
+    pub(crate) format: Format,
     pub(crate) dialect: Dialect,
     pub(crate) encoding: &'static Encoding,
     pub(crate) view: ViewControls,
@@ -306,6 +371,35 @@ pub(crate) enum View {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detect_format_dispatches_on_extension() {
+        // Extension wins (case-insensitively), regardless of whether the file exists.
+        assert_eq!(detect_format(Path::new("x.parquet")), Format::Parquet);
+        assert_eq!(detect_format(Path::new("x.PQT")), Format::Parquet);
+        assert_eq!(detect_format(Path::new("x.ndjson")), Format::Ndjson);
+        assert_eq!(detect_format(Path::new("x.JSONL")), Format::Ndjson);
+        // Delimited is the fallback for the text extensions and for anything unrecognised.
+        assert_eq!(detect_format(Path::new("x.csv")), Format::Delimited);
+        assert_eq!(detect_format(Path::new("x.tsv")), Format::Delimited);
+        assert_eq!(
+            detect_format(Path::new("x.unknown_ext_zz")),
+            Format::Delimited
+        );
+    }
+
+    #[test]
+    fn detect_format_falls_back_to_parquet_magic_bytes() {
+        // A Parquet file mis-named without a known extension is still recognised by its `PAR1` magic.
+        let mut file = tempfile::NamedTempFile::with_suffix(".bin").unwrap();
+        std::io::Write::write_all(&mut file, b"PAR1\x00\x00datatrailer").unwrap();
+        assert_eq!(detect_format(file.path()), Format::Parquet);
+
+        // A non-Parquet file with an unknown extension reads as delimited.
+        let mut other = tempfile::NamedTempFile::with_suffix(".bin").unwrap();
+        std::io::Write::write_all(&mut other, b"a,b,c\n1,2,3\n").unwrap();
+        assert_eq!(detect_format(other.path()), Format::Delimited);
+    }
 
     #[test]
     fn reorder_moves_a_column_before_the_target() {

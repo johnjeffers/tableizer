@@ -1,6 +1,5 @@
-- Table header stretches the entire window size
-- Parquet support
+- Footer shows
+  - file path | detected format | n cols, n rows | row(s) n selected
 - Package as a standard app
 - Create release artifacts for each OS
 - App should be allowed to be set as the default handler for CSV, TSV, etc.
-- Multiple window support? Tabs?

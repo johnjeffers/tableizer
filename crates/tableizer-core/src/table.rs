@@ -7,39 +7,19 @@
 //! Cells hold the exact field bytes the parser yields — type inference is presentational only and
 //! never mutates them (the byte-fidelity invariant, spec §3.1).
 
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use memmap2::Mmap;
-
 use crate::index::{OffsetIndex, record_reader};
 use crate::parse::Dialect;
 use crate::search::Matcher;
+use crate::source::{Source, map_file};
 use crate::{
     CancellationToken, Cell, Column, ColumnId, DataQuality, Error, InferredType, Result, RowCount,
     RowRange, Schema, SortKey, ViewSpec, ViewStatus, Viewport, ViewportRequest, ViewportSource,
 };
-
-/// The byte source backing a table: either owned in-memory bytes or a memory-mapped file. Both
-/// deref to `&[u8]`, so the rest of the engine is agnostic to which it is. Cheap to clone (the
-/// background index builder holds its own `Arc` to keep the bytes alive).
-#[derive(Clone)]
-enum Source {
-    Bytes(Arc<[u8]>),
-    Mmap(Arc<Mmap>),
-}
-
-impl Source {
-    fn bytes(&self) -> &[u8] {
-        match self {
-            Source::Bytes(b) => b,
-            Source::Mmap(m) => m,
-        }
-    }
-}
 
 /// A read-only, byte-faithful table view over a delimited file. Implements [`ViewportSource`] so any
 /// GUI can request small row slices, and never blocks on a full scan to show the first screen.
@@ -536,16 +516,6 @@ fn open_source(path: &Path) -> Result<Source> {
         return Ok(Source::Bytes(Arc::from(utf8.into_owned().into_bytes())));
     }
     Ok(Source::Mmap(Arc::new(mmap)))
-}
-
-/// Memory-map a file read-only.
-#[allow(unsafe_code)] // SAFETY justified at the `Mmap::map` call below.
-fn map_file(path: &Path) -> Result<Mmap> {
-    let file = File::open(path)?;
-    // SAFETY: we map a read-only view of `file` and never mutate the mapping. Documented risk:
-    // another process truncating the file could cause SIGBUS on later access (spec §4.2); Phase 0
-    // accepts this — a SIGBUS guard / positioned-read fallback is planned.
-    Ok(unsafe { Mmap::map(&file)? })
 }
 
 #[cfg(test)]

@@ -11,11 +11,17 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+arrow = "59.0.0"
 csv = "1.4.0"
 directories = "6.0.0"
 encoding_rs = "0.8.35"
+memchr = "2.8.2"
 memmap2 = "0.9.11"
+parquet = "59.0.0"
 regex = "1.12.4"
+# preserve_order: NDJSON columns follow first-seen object-key order, not serde_json's default
+# alphabetical sort (which would shuffle the table's columns relative to the source).
+serde_json = { version = "1.0.150", features = ["preserve_order"] }
 thiserror = "2.0.18"
 # thiserror added via `cargo add`.
 
@@ -25,7 +31,10 @@ thiserror = "2.0.18"
 #   memmap2         — memory-mapped reads (guarded; see §4.2)
 #   encoding_rs     — BOM-aware decoding (UTF-8/16, Latin-1, Windows-1252)
 #   regex           — linear-time, ReDoS-safe search (NEVER fancy-regex)
-#   memchr          — fast literal substring search
+#   memchr          — fast literal substring search / newline (NDJSON record) boundaries
+#   serde_json      — NDJSON value parsing (the nested format-reader seam, §4.5)
+#   arrow, parquet  — Parquet decode + Arrow value rendering (the columnar seam, §4.5); per §4.3
+#                     their decode/interchange may be reused but the external sort stays ours
 #   rayon           — data-parallel index build / external-sort run generation
 
 [dev-dependencies]

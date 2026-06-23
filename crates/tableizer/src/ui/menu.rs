@@ -6,7 +6,8 @@ use tableizer_core::{CancellationToken, ColumnId, ExportScope, ViewportSource, p
 
 use crate::app::{QUIT_SHORTCUT, SETTINGS_SHORTCUT, TableizerApp};
 use crate::model::{
-    GridLayout, LoadedTable, View, column_name, delimiter_display, delimiter_label, parse_delimiter,
+    Format, GridLayout, LoadedTable, View, column_name, delimiter_display, delimiter_label,
+    parse_delimiter,
 };
 use crate::theme;
 use std::path::PathBuf;
@@ -16,7 +17,7 @@ pub(crate) fn menu_bar(ui: &mut egui::Ui, app: &mut TableizerApp, to_open: &mut 
     ui.menu_button("File", |ui| {
         ui.set_min_width(150.0);
         if ui.button("Open…").clicked() {
-            if let Some(path) = rfd::FileDialog::new().pick_file() {
+            if let Some(path) = crate::model::pick_file() {
                 *to_open = Some(path);
             }
             ui.close();
@@ -83,7 +84,11 @@ pub(crate) fn menu_bar(ui: &mut egui::Ui, app: &mut TableizerApp, to_open: &mut 
     });
 
     if let View::Loaded(loaded) = &mut app.view {
-        ui.menu_button("Parsing", |ui| parsing_menu(ui, loaded));
+        // The Parsing menu (delimiter / header / encoding) is delimited-text only — NDJSON and
+        // Parquet carry their own schema, so there is nothing to re-parse.
+        if loaded.format == Format::Delimited {
+            ui.menu_button("Parsing", |ui| parsing_menu(ui, loaded));
+        }
         ui.menu_button("Columns", |ui| {
             ui.set_min_width(190.0);
             menu_section(ui, "VISIBLE");
