@@ -3,3 +3,6 @@
   - support clicking column headers for sort (asc, desc, none)
   - double-click separator to auto-size to largest value
   - select on click-drag instead of scroll
+  - row height should be based on font size + compact/comfortable
+  - header font should be bold and a little larger
+  - Add a Reset button that resets column width, column order, column visibility, sort order, search filters, etc to default

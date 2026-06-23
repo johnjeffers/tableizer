@@ -140,6 +140,7 @@ mod theme {
     /// Extra colors + metrics the custom grid/toolbar painting needs (beyond the egui [`Style`]).
     #[derive(Clone)]
     pub struct Palette {
+        pub accent: Color32,
         pub header_bg: Color32,
         pub header_text: Color32,
         pub row_selected: Color32,
@@ -230,6 +231,7 @@ mod theme {
         };
 
         let palette = Palette {
+            accent,
             header_bg: if dark {
                 Color32::from_gray(38)
             } else {
@@ -541,10 +543,10 @@ impl GridLayout {
     }
 }
 
-/// Move `dragged` to just before `before` in display order. Pure so the reorder logic is verified
-/// independently of the drag-and-drop UI.
-fn reorder(order: &mut Vec<ColumnId>, dragged: ColumnId, before: ColumnId) {
-    if dragged == before {
+/// Move `dragged` next to `target` in display order — before it, or after it when `after` is set.
+/// Pure so the reorder logic is verified independently of the drag-and-drop UI.
+fn reorder(order: &mut Vec<ColumnId>, dragged: ColumnId, target: ColumnId, after: bool) {
+    if dragged == target {
         return;
     }
     let Some(from) = order.iter().position(|&c| c == dragged) else {
@@ -553,8 +555,9 @@ fn reorder(order: &mut Vec<ColumnId>, dragged: ColumnId, before: ColumnId) {
     let col = order.remove(from);
     let insert_at = order
         .iter()
-        .position(|&c| c == before)
-        .unwrap_or(order.len());
+        .position(|&c| c == target)
+        .map_or(order.len(), |i| i + usize::from(after))
+        .min(order.len());
     order.insert(insert_at, col);
 }
 
@@ -1539,8 +1542,8 @@ fn grid(ui: &mut egui::Ui, loaded: &mut LoadedTable, palette: &theme::Palette) {
     }
     grid.show(ui, &mut delegate);
 
-    if let Some((dragged, before)) = delegate.pending_reorder {
-        reorder(&mut layout.order, dragged, before);
+    if let Some((dragged, target, after)) = delegate.pending_reorder {
+        reorder(&mut layout.order, dragged, target, after);
     }
     if let Some(row) = delegate.clicked_row {
         view.selected_row = Some(row);
@@ -1767,7 +1770,8 @@ struct GridDelegate<'a> {
     cache_start: u64,
     cache: Vec<Vec<Cell>>,
     /// Set by `header_cell_ui` when a column header is dropped onto another; applied after `show`.
-    pending_reorder: Option<(ColumnId, ColumnId)>,
+    /// `(dragged, target, after)` — drop the dragged column before/after the target on release.
+    pending_reorder: Option<(ColumnId, ColumnId, bool)>,
     /// Row whose cell was hovered this frame (read back after `show` to update the hover state).
     new_hovered: Option<u64>,
     /// Row whose cell was left-clicked this frame (read back to update the selection).
@@ -1815,32 +1819,74 @@ impl egui_table::TableDelegate for GridDelegate<'_> {
             rect.bottom() - 0.5,
             egui::Stroke::new(1.0, self.palette.border),
         );
-        // The header is a drag source carrying its column id, and a drop target for reordering.
-        // Small, uppercase, muted label — the modern data-table header look.
-        let response = ui
-            .dnd_drag_source(egui::Id::new(("tz-col", col_id.0)), col_id, |ui| {
-                ui.set_min_width(ui.available_width()); // make the whole header cell draggable
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    ui.add_space(10.0);
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(name.to_uppercase())
-                                .color(self.palette.header_text)
-                                .size(11.0),
-                        )
-                        .selectable(false)
-                        .truncate(),
-                    );
-                });
+        let handle_id = egui::Id::new(("tz-col-handle", col_id.0));
+        let grip_color = self.palette.header_text;
+        let cell_h = rect.height();
+
+        // A small ⋮-style grip on the left is the ONLY draggable area; the rest of the header is free
+        // for other interactions. The grip is *painted* (three dots) — a glyph would be font-dependent
+        // (and a text label would steal the drag as a text selection). Then the muted column name.
+        ui.add_space(3.0);
+        let handle = ui
+            .dnd_drag_source(handle_id, col_id, |ui| {
+                let (grip, _) =
+                    ui.allocate_exact_size(egui::vec2(12.0, cell_h), egui::Sense::hover());
+                let c = grip.center();
+                for dy in [-4.0, 0.0, 4.0] {
+                    ui.painter()
+                        .circle_filled(egui::pos2(c.x, c.y + dy), 1.4, grip_color);
+                }
             })
             .response;
-        if response.hovered() {
+        if handle.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
         }
-        if let Some(dragged) = response.dnd_release_payload::<ColumnId>()
+        ui.add_space(2.0);
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(name.to_uppercase())
+                    .color(self.palette.header_text)
+                    .size(11.0),
+            )
+            .selectable(false)
+            .truncate(),
+        );
+
+        // Dim the column currently being dragged.
+        if ui.ctx().is_being_dragged(handle_id) {
+            ui.painter()
+                .rect_filled(rect, egui::CornerRadius::ZERO, self.palette.row_hover);
+        }
+
+        // The whole cell is a drop target. The dragged column lands on the *far* side of this column
+        // from where it came: if it's currently to our left (dragging right) it drops after us, else
+        // before — so the insertion jumps a whole column the moment the cursor crosses a border.
+        let drop = ui.interact(
+            rect,
+            egui::Id::new(("tz-col-drop", col_id.0)),
+            egui::Sense::hover(),
+        );
+        if let Some(dragged) = drop.dnd_hover_payload::<ColumnId>()
             && *dragged != col_id
         {
-            self.pending_reorder = Some((*dragged, col_id));
+            let after = self
+                .columns
+                .iter()
+                .position(|&c| c == *dragged)
+                .is_some_and(|src| src < idx);
+            let x = if after { rect.right() - 1.5 } else { rect.left() + 1.5 };
+            ui.painter()
+                .vline(x, rect.y_range(), egui::Stroke::new(3.0, self.palette.accent));
+        }
+        if let Some(dragged) = drop.dnd_release_payload::<ColumnId>()
+            && *dragged != col_id
+        {
+            let after = self
+                .columns
+                .iter()
+                .position(|&c| c == *dragged)
+                .is_some_and(|src| src < idx);
+            self.pending_reorder = Some((*dragged, col_id, after));
         }
     }
 
@@ -1949,7 +1995,7 @@ mod tests {
     #[test]
     fn reorder_moves_a_column_before_the_target() {
         let mut order = vec![ColumnId(0), ColumnId(1), ColumnId(2), ColumnId(3)];
-        reorder(&mut order, ColumnId(3), ColumnId(1));
+        reorder(&mut order, ColumnId(3), ColumnId(1), false);
         assert_eq!(
             order,
             vec![ColumnId(0), ColumnId(3), ColumnId(1), ColumnId(2)]
@@ -1957,9 +2003,20 @@ mod tests {
     }
 
     #[test]
+    fn reorder_after_the_target_inserts_to_its_right() {
+        // Drag column 0 to *after* column 2 (right half of the target).
+        let mut order = vec![ColumnId(0), ColumnId(1), ColumnId(2), ColumnId(3)];
+        reorder(&mut order, ColumnId(0), ColumnId(2), true);
+        assert_eq!(
+            order,
+            vec![ColumnId(1), ColumnId(2), ColumnId(0), ColumnId(3)]
+        );
+    }
+
+    #[test]
     fn reorder_dragging_onto_itself_is_a_noop() {
         let mut order = vec![ColumnId(0), ColumnId(1)];
-        reorder(&mut order, ColumnId(1), ColumnId(1));
+        reorder(&mut order, ColumnId(1), ColumnId(1), false);
         assert_eq!(order, vec![ColumnId(0), ColumnId(1)]);
     }
 
@@ -1967,7 +2024,7 @@ mod tests {
     fn displayed_columns_respect_visibility_and_order() {
         let mut layout = GridLayout::new(3);
         layout.visible[1] = false;
-        reorder(&mut layout.order, ColumnId(2), ColumnId(0));
+        reorder(&mut layout.order, ColumnId(2), ColumnId(0), false);
         assert_eq!(layout.displayed(), vec![ColumnId(2), ColumnId(0)]);
     }
 
