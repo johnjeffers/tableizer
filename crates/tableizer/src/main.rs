@@ -937,14 +937,37 @@ impl eframe::App for TableizerApp {
 /// The menu bar (File / View / Export / Cache / Settings).
 fn menu_bar(ui: &mut egui::Ui, app: &mut TableizerApp, to_open: &mut Option<PathBuf>) {
     ui.menu_button("File", |ui| {
-        if app.recent.is_empty() {
-            ui.label("(no recent files)");
-        }
-        for path in &app.recent {
-            if ui.button(path.display().to_string()).clicked() {
-                *to_open = Some(path.clone());
-                ui.close();
+        ui.set_min_width(150.0);
+        if ui.button("Open…").clicked() {
+            if let Some(path) = rfd::FileDialog::new().pick_file() {
+                *to_open = Some(path);
             }
+            ui.close();
+        }
+        ui.menu_button("Recent", |ui| {
+            if app.recent.is_empty() {
+                ui.label("(none)");
+            }
+            for path in &app.recent {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                if ui
+                    .button(name)
+                    .on_hover_text(path.display().to_string())
+                    .clicked()
+                {
+                    *to_open = Some(path.clone());
+                    ui.close();
+                }
+            }
+        });
+        ui.separator();
+        let loaded = matches!(app.view, View::Loaded(_));
+        if ui.add_enabled(loaded, egui::Button::new("Close")).clicked() {
+            app.view = View::Empty;
+            ui.close();
         }
     });
 
