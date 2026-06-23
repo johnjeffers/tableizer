@@ -36,6 +36,14 @@ pub mod recent {
             .join("\n");
         let _ = std::fs::write(f, body);
     }
+
+    /// Empty the recent-files list and delete its on-disk store.
+    pub fn clear(recent: &mut Vec<PathBuf>) {
+        recent.clear();
+        if let Some(f) = file() {
+            let _ = std::fs::remove_file(f);
+        }
+    }
 }
 
 /// Saved-view persistence in the OS config dir, keyed by source path.

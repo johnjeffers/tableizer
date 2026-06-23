@@ -99,7 +99,6 @@ pub(crate) fn status_bar(ui: &mut egui::Ui, loaded: &LoadedTable, palette: &them
 pub(crate) fn empty_view(ui: &mut egui::Ui, recent: &[PathBuf], to_open: &mut Option<PathBuf>) {
     ui.add_space(40.0);
     ui.vertical_centered(|ui| {
-        ui.heading("Tableizer");
         ui.label("Open a delimited file to get started.");
         ui.add_space(12.0);
         if ui.button("Open File…").clicked()

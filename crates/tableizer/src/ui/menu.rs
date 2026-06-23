@@ -39,6 +39,13 @@ pub(crate) fn menu_bar(ui: &mut egui::Ui, app: &mut TableizerApp, to_open: &mut 
                     ui.close();
                 }
             }
+            if !app.recent.is_empty() {
+                ui.separator();
+                if ui.button("Clear Recents").clicked() {
+                    crate::persist::recent::clear(&mut app.recent);
+                    ui.close();
+                }
+            }
         });
         let loaded = matches!(app.view, View::Loaded(_));
         ui.add_enabled_ui(loaded, |ui| {
