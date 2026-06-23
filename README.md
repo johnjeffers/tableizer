@@ -1,9 +1,6 @@
 # Tableizer
 
-View structured data formats (CSV, TSV, arbitrary separators) as tables — including very large
-(multi-TB) files — in a cross-platform desktop app for macOS, Windows, and Linux.
-
-**Status:** early scaffold. See [docs/spec.md](docs/spec.md) for the full specification and roadmap.
+View structured data files (CSV, TSV) as tables in a cross-platform desktop app for macOS, Windows, and Linux.
 
 ## Workspace layout
 
