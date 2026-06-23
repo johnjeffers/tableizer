@@ -929,6 +929,10 @@ impl eframe::App for TableizerApp {
         };
         // ⌘/Ctrl+F focuses the Find field.
         let focus_find = ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F));
+        // ⌘Q / Ctrl+Q quits the app.
+        if ctx.input_mut(|i| i.consume_shortcut(&QUIT_SHORTCUT)) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
 
         egui::Panel::top("menu_bar").show_inside(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| menu_bar(ui, self, &mut to_open));
@@ -993,8 +997,8 @@ impl eframe::App for TableizerApp {
                 View::Loaded(loaded) => grid(ui, loaded, &palette),
             });
 
-        // Settings window: toggled by the menu-bar item and ⌘/Ctrl+, ; closed by its ✕ or Esc.
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma)) {
+        // Settings window: toggled by the File ▸ Settings item and ⌘/Ctrl+, ; closed by its ✕ or Esc.
+        if ctx.input_mut(|i| i.consume_shortcut(&SETTINGS_SHORTCUT)) {
             self.settings_open = !self.settings_open;
         }
         if self.settings_open
@@ -1028,7 +1032,14 @@ impl eframe::App for TableizerApp {
     }
 }
 
-/// The menu bar (File / View / Export / Cache / Settings).
+/// Quit — the standard per-OS shortcut (⌘Q on macOS, Ctrl+Q elsewhere).
+const QUIT_SHORTCUT: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Q);
+/// Open the Settings window (⌘, / Ctrl+,).
+const SETTINGS_SHORTCUT: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Comma);
+
+/// The menu bar (File / Parsing / Columns).
 fn menu_bar(ui: &mut egui::Ui, app: &mut TableizerApp, to_open: &mut Option<PathBuf>) {
     ui.menu_button("File", |ui| {
         ui.set_min_width(150.0);
@@ -1066,8 +1077,25 @@ fn menu_bar(ui: &mut egui::Ui, app: &mut TableizerApp, to_open: &mut Option<Path
             });
         });
         ui.separator();
+        let settings_sc = ui.ctx().format_shortcut(&SETTINGS_SHORTCUT);
+        if ui
+            .add(egui::Button::new("Settings…").shortcut_text(settings_sc))
+            .clicked()
+        {
+            app.settings_open = true;
+            ui.close();
+        }
+        ui.separator();
         if ui.add_enabled(loaded, egui::Button::new("Close")).clicked() {
             app.view = View::Empty;
+            ui.close();
+        }
+        let quit_sc = ui.ctx().format_shortcut(&QUIT_SHORTCUT);
+        if ui
+            .add(egui::Button::new("Exit").shortcut_text(quit_sc))
+            .clicked()
+        {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
             ui.close();
         }
     });
@@ -1099,11 +1127,6 @@ fn menu_bar(ui: &mut egui::Ui, app: &mut TableizerApp, to_open: &mut Option<Path
                 ui.close();
             }
         });
-    }
-
-    // Settings opens a window (not a dropdown), so it's a plain menu-bar button.
-    if ui.add(egui::Button::new("Settings").frame(false)).clicked() {
-        app.settings_open = !app.settings_open;
     }
 }
 

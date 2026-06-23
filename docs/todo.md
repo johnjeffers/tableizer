@@ -1,5 +1,4 @@
 - main table
   - select on click-drag instead of scroll
-  - row height should be based on font size + compact/comfortable
   - header font should be bold and a little larger
-- move Cache info and clear into Settings
+- Parquet support
