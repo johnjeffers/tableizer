@@ -35,6 +35,19 @@ mod theme {
     use serde::{Deserialize, Serialize};
     use std::collections::BTreeMap;
 
+    /// App-wide named text styles. Their sizes are registered in `text_styles` by [`build`], so call
+    /// sites select a style by name and no font size is hard-coded outside this module.
+    pub const MENU_SECTION: &str = "menu_section";
+    pub const MENU_ITEM: &str = "menu_item";
+    pub const SETTINGS_HEADING: &str = "settings_heading";
+    pub const COLUMN_HEADER: &str = "column_header";
+    pub const STEPPER: &str = "stepper";
+
+    /// The [`TextStyle`] for one of the named styles above (e.g. [`MENU_SECTION`]).
+    pub fn text_style(name: &str) -> TextStyle {
+        TextStyle::Name(name.into())
+    }
+
     /// Light/dark selection.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
     pub enum Mode {
@@ -95,7 +108,7 @@ mod theme {
     }
 
     impl Density {
-        pub const ALL: [Density; 2] = [Density::Comfortable, Density::Compact];
+        pub const ALL: [Density; 2] = [Density::Compact, Density::Comfortable];
         pub fn label(self) -> &'static str {
             match self {
                 Density::Comfortable => "Comfortable",
@@ -212,18 +225,39 @@ mod theme {
                 TextStyle::Small,
                 FontId::new(11.0, FontFamily::Proportional),
             ),
-            (TextStyle::Body, FontId::new(13.5, FontFamily::Proportional)),
+            (TextStyle::Body, FontId::new(13.0, FontFamily::Proportional)),
             (
                 TextStyle::Button,
-                FontId::new(13.5, FontFamily::Proportional),
+                FontId::new(12.0, FontFamily::Proportional),
             ),
             (
                 TextStyle::Heading,
-                FontId::new(19.0, FontFamily::Proportional),
+                FontId::new(12.0, FontFamily::Proportional),
             ),
             (
                 TextStyle::Monospace,
-                FontId::new(12.5, FontFamily::Monospace),
+                FontId::new(12.0, FontFamily::Monospace),
+            ),
+            // Named chrome styles — the single source of truth for these font sizes.
+            (
+                text_style(MENU_SECTION),
+                FontId::new(12.0, FontFamily::Proportional),
+            ),
+            (
+                text_style(MENU_ITEM),
+                FontId::new(12.0, FontFamily::Proportional),
+            ),
+            (
+                text_style(SETTINGS_HEADING),
+                FontId::new(12.0, FontFamily::Proportional),
+            ),
+            (
+                text_style(COLUMN_HEADER),
+                FontId::new(12.0, FontFamily::Proportional),
+            ),
+            (
+                text_style(STEPPER),
+                FontId::new(12.0, FontFamily::Proportional),
             ),
         ]);
         let style = Style {
@@ -945,8 +979,12 @@ impl eframe::App for TableizerApp {
         let system_dark = ctx.system_theme().is_none_or(|t| t == egui::Theme::Dark);
         let (style, palette) = theme::build(&self.theme, system_dark);
         if self.applied_theme.as_ref() != Some(&(self.theme.clone(), system_dark)) {
-            ctx.set_global_style(style);
+            ctx.set_global_style(style.clone());
             self.applied_theme = Some((self.theme.clone(), system_dark));
+            // `set_global_style` only reaches uis created afterwards (and ctx-level popups), but this
+            // frame's root `ui` already exists with the old style. Apply directly so the named text
+            // styles resolve this frame too — otherwise the first frame panics on lookup.
+            ui.set_style(style);
         }
         // Rebuild the font atlas only when the chosen table font changes.
         if self.applied_table_font != self.theme.table_font {
@@ -1201,7 +1239,12 @@ fn export_menu(ui: &mut egui::Ui, loaded: &LoadedTable) {
 fn menu_section(ui: &mut egui::Ui, title: &str) {
     let color = ui.visuals().weak_text_color();
     ui.add_space(6.0);
-    ui.label(egui::RichText::new(title).size(10.5).strong().color(color));
+    ui.label(
+        egui::RichText::new(title)
+            .text_style(theme::text_style(theme::MENU_SECTION))
+            .strong()
+            .color(color),
+    );
     ui.add_space(1.0);
 }
 
@@ -1242,7 +1285,7 @@ fn menu_choice(
         rect.left_center() + egui::vec2(text_x, 0.0),
         egui::Align2::LEFT_CENTER,
         text,
-        egui::FontId::proportional(13.5),
+        theme::text_style(theme::MENU_ITEM).resolve(ui.style()),
         text_color,
     );
     response.clicked()
@@ -1251,7 +1294,11 @@ fn menu_choice(
 /// A section heading inside the Settings window.
 fn settings_section(ui: &mut egui::Ui, title: &str) {
     ui.add_space(2.0);
-    ui.label(egui::RichText::new(title).strong().size(14.0));
+    ui.label(
+        egui::RichText::new(title.to_uppercase())
+            .strong()
+            .text_style(theme::text_style(theme::SETTINGS_HEADING)),
+    );
     ui.add_space(6.0);
 }
 
@@ -1342,14 +1389,20 @@ fn settings_window(
                 ui.label("Size");
                 ui.spacing_mut().item_spacing.x = 4.0;
                 let h = ui.spacing().interact_size.y;
-                if ui.button(egui::RichText::new("−").size(15.0)).clicked() {
+                if ui
+                    .button(egui::RichText::new("−").text_style(theme::text_style(theme::STEPPER)))
+                    .clicked()
+                {
                     settings.table_font_size = (settings.table_font_size - 0.5).max(8.0);
                 }
                 ui.add_sized(
                     egui::vec2(48.0, h),
                     egui::Label::new(format!("{:.1} pt", settings.table_font_size)),
                 );
-                if ui.button(egui::RichText::new("+").size(15.0)).clicked() {
+                if ui
+                    .button(egui::RichText::new("+").text_style(theme::text_style(theme::STEPPER)))
+                    .clicked()
+                {
                     settings.table_font_size = (settings.table_font_size + 0.5).min(32.0);
                 }
                 ui.add_space(12.0);
@@ -1665,13 +1718,15 @@ fn grid(ui: &mut egui::Ui, loaded: &mut LoadedTable, palette: &theme::Palette) {
 
     // Copy the targeted rows as TSV lines: "Copy Row" → one row; "Copy Selected" or ⌘/Ctrl+C → the
     // whole selection.
-    let copy_span = delegate.copy_row.map(RowSpan::single).or(
-        if copy_request || delegate.copy_selected {
-            view.selected
-        } else {
-            None
-        },
-    );
+    let copy_span =
+        delegate
+            .copy_row
+            .map(RowSpan::single)
+            .or(if copy_request || delegate.copy_selected {
+                view.selected
+            } else {
+                None
+            });
     if let Some(span) = copy_span {
         let request = ViewportRequest {
             rows: RowRange {
@@ -1939,8 +1994,8 @@ impl egui_table::TableDelegate for GridDelegate<'_> {
         ui.add_space(2.0);
         let name_label = egui::Label::new(
             egui::RichText::new(name.to_uppercase())
-                .color(self.palette.header_text)
-                .size(11.0),
+                .strong()
+                .text_style(theme::text_style(theme::COLUMN_HEADER)),
         )
         .selectable(false);
         // Auto-size (double-click separator) must also fit the header name → measure it in full.
@@ -2191,19 +2246,13 @@ mod tests {
 
     #[test]
     fn row_span_covers_the_range_regardless_of_drag_direction() {
-        let down = RowSpan {
-            anchor: 2,
-            lead: 5,
-        };
+        let down = RowSpan { anchor: 2, lead: 5 };
         assert_eq!((down.lo(), down.hi(), down.len()), (2, 5, 4));
         assert!(down.contains(2) && down.contains(4) && down.contains(5));
         assert!(!down.contains(1) && !down.contains(6));
 
         // Dragging upward (lead < anchor) selects the same rows.
-        let up = RowSpan {
-            anchor: 5,
-            lead: 2,
-        };
+        let up = RowSpan { anchor: 5, lead: 2 };
         assert_eq!((up.lo(), up.hi(), up.len()), (2, 5, 4));
         assert!(up.contains(3));
 

@@ -1,3 +1,1 @@
-- main table
-  - header font should be bold and a little larger
 - Parquet support
