@@ -1,7 +1,6 @@
 - main table
-  - remove padding around main table
-  - support clicking column headers for sort (asc, desc, none)
   - double-click separator to auto-size to largest value
+  - cmd/ctrl+f focuses Find
   - select on click-drag instead of scroll
   - row height should be based on font size + compact/comfortable
   - header font should be bold and a little larger

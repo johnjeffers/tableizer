@@ -979,17 +979,22 @@ impl eframe::App for TableizerApp {
             });
         }
 
-        egui::CentralPanel::default().show_inside(ui, |ui| match &mut self.view {
-            View::Empty => empty_view(ui, &self.recent, &mut to_open),
-            View::Failed { path, error } => {
-                ui.add_space(40.0);
-                ui.vertical_centered(|ui| {
-                    ui.heading("Could not open file");
-                    ui.label(format!("{}: {error}", path.display()));
-                });
-            }
-            View::Loaded(loaded) => grid(ui, loaded, &palette),
-        });
+        // No inner margin: the table fills the central area edge-to-edge (the empty/failed views
+        // center their own content, so they're unaffected).
+        let central_frame = egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::ZERO);
+        egui::CentralPanel::default()
+            .frame(central_frame)
+            .show_inside(ui, |ui| match &mut self.view {
+                View::Empty => empty_view(ui, &self.recent, &mut to_open),
+                View::Failed { path, error } => {
+                    ui.add_space(40.0);
+                    ui.vertical_centered(|ui| {
+                        ui.heading("Could not open file");
+                        ui.label(format!("{}: {error}", path.display()));
+                    });
+                }
+                View::Loaded(loaded) => grid(ui, loaded, &palette),
+            });
 
         // Settings window: toggled by the menu-bar item and ⌘/Ctrl+, ; closed by its ✕ or Esc.
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma)) {
