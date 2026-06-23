@@ -299,9 +299,14 @@ the same change that completes the work.
   the index lands, then O(1) random access. The app renders via egui `ScrollArea::show_rows`, fetching only the
   visible rows. **Time-to-first-page is sub-ms regardless of file size** (measured by `examples/bench_load.rs`;
   the index-build O(n) scan runs off the UI thread). Synthetic-file generator: `examples/gen_csv.rs`. 11 engine tests.
-- ☐ **Grid spike — needs a human run:** wire `egui_table` and measure 60 fps under a synthetic scan on a 4K display
-  (ideally Windows) → go/no-go vs Plan B. The virtualized data path + large-file generator are ready; the fps
-  measurement requires eyes on a screen and cannot be done headless.
+- ☐ **Grid spike — `egui_table` wired ✅ (incl. drag-reorder); awaiting your go/no-go.** The app renders a
+  virtualised `egui_table` grid: sticky header, sticky/pinned first column, resizable columns, column show/hide,
+  and **header drag-to-reorder** (built on egui's DnD primitives + a unit-tested `reorder` fn — ~40 lines, *not* a
+  framework limitation; `egui_table` not shipping reorder ≠ egui can't). `egui_table` 0.8 resolves to the same
+  `egui` 0.34 as eframe (single version). Observed so far (macOS): **scrolling + interactions feel good**.
+  **Remaining (yours):** run `cargo run --release -p tableizer -- <big.csv>`, confirm 60 fps under scroll on a 4K
+  display (ideally Windows) and that the reorder drag *feels* right → **go** (egui_table) / **no-go** (Plan B:
+  Qt-over-FFI). The fps + drag-feel checks require eyes on a screen and cannot be done headless.
 
 ### Phase 1 — MVP
 - ☐ Real CSV/TSV/custom-delimiter parsing behind the format seam; header detection

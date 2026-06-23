@@ -1,0 +1,48 @@
+# Tableizer dev commands — run `just` to list, `just <recipe>` to run.
+# Requires `just` (cargo install just); `dev` also needs `cargo-watch`.
+
+# List available recipes
+default:
+    @just --list
+
+# Open a file in the desktop app (release build)
+run file:
+    cargo run --release -p tableizer -- "{{file}}"
+
+# UI dev loop: auto-rebuild + re-run on save (debug build = fastest rebuilds)
+dev file:
+    cargo watch -x 'run -p tableizer -- {{file}}'
+
+# Run all tests
+test:
+    cargo test --workspace
+
+# Run one engine test by name (fast inner loop), e.g. `just test-one offset`
+test-one name:
+    cargo test -p tableizer-core {{name}}
+
+# Format the whole workspace
+fmt:
+    cargo fmt --all
+
+# Lint with warnings-as-errors
+lint:
+    cargo clippy --workspace --all-targets -- -D warnings
+
+# Full pre-commit gate (mirrors CI): format check + lint + tests
+ci:
+    cargo fmt --all --check
+    cargo clippy --workspace --all-targets -- -D warnings
+    cargo test --workspace
+
+# Generate a synthetic CSV, e.g. `just gen /tmp/big.csv 5000000`
+gen file rows:
+    cargo run --release -p tableizer-core --example gen_csv -- "{{file}}" {{rows}}
+
+# Time the load path on a file (perf harness)
+bench file:
+    cargo run --release -p tableizer-core --example bench_load -- "{{file}}"
+
+# License + advisory audit (needs cargo-deny)
+deny:
+    cargo deny check
