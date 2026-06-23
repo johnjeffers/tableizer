@@ -6,8 +6,6 @@ use eframe::egui;
 use crate::fonts;
 use crate::theme;
 
-use super::menu_choice;
-
 /// Format a byte count for the cache display.
 fn human_bytes(n: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
@@ -176,29 +174,33 @@ pub(crate) fn settings_window(
                     .max_height(170.0)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        let row_w = ui.available_width();
-                        if menu_choice(
-                            ui,
-                            row_w,
-                            settings.table_font.is_none(),
-                            None,
-                            "App font (default)",
-                        ) {
-                            settings.table_font = None;
-                        }
-                        let query = font_search.to_lowercase();
-                        for (family, is_mono) in families {
-                            if *mono_only && !*is_mono {
-                                continue;
+                        // Full-width, left-aligned rows rendered with the native selectable widget
+                        // (the same text path as every other menu/list item — see `ui` module docs).
+                        ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+                            if ui
+                                .selectable_label(
+                                    settings.table_font.is_none(),
+                                    "App font (default)",
+                                )
+                                .clicked()
+                            {
+                                settings.table_font = None;
                             }
-                            if !query.is_empty() && !family.to_lowercase().contains(&query) {
-                                continue;
+                            let query = font_search.to_lowercase();
+                            for (family, is_mono) in families {
+                                if *mono_only && !*is_mono {
+                                    continue;
+                                }
+                                if !query.is_empty() && !family.to_lowercase().contains(&query) {
+                                    continue;
+                                }
+                                let selected =
+                                    settings.table_font.as_deref() == Some(family.as_str());
+                                if ui.selectable_label(selected, family.as_str()).clicked() {
+                                    settings.table_font = Some(family.clone());
+                                }
                             }
-                            let selected = settings.table_font.as_deref() == Some(family.as_str());
-                            if menu_choice(ui, row_w, selected, None, family) {
-                                settings.table_font = Some(family.clone());
-                            }
-                        }
+                        });
                     });
             });
 

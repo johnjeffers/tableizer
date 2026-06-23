@@ -1,5 +1,11 @@
-//! The egui rendering layer: top-level window panels (toolbar, status bar, empty state), small
-//! shared widgets, and — via submodules — the menu bar, Settings window, and data grid.
+//! The egui rendering layer: top-level window panels (toolbar, status bar, empty state) and — via
+//! submodules — the menu bar, Settings window, and data grid.
+//!
+//! Invariant: menu and list item text is rendered with native egui widgets (`Button`,
+//! `SelectableLabel`, `Label`, …), never hand-painted with `Painter::text`. Text painted directly
+//! into a menu popup renders at a different size than the surrounding native widgets (a real bug we
+//! hit once), so the data grid — which has no native-widget equivalent — is the only place allowed
+//! to paint text by hand.
 
 mod grid;
 mod menu;
@@ -16,49 +22,6 @@ use tableizer_core::RowCount;
 
 use crate::model::LoadedTable;
 use crate::theme;
-
-/// A full-width menu choice row with hover + selected states (selected = accent fill + strong text),
-/// optionally led by a colored dot. Returns true when clicked.
-fn menu_choice(
-    ui: &mut egui::Ui,
-    width: f32,
-    selected: bool,
-    dot: Option<egui::Color32>,
-    text: &str,
-) -> bool {
-    let sel_bg = ui.visuals().selection.bg_fill;
-    let hover_bg = ui.visuals().widgets.hovered.weak_bg_fill;
-    let text_color = if selected {
-        ui.visuals().strong_text_color()
-    } else {
-        ui.visuals().text_color()
-    };
-    // In a menu popup, callers must pass a fixed width — `available_width()` there is the whole
-    // window and would balloon the menu; in a window, `available_width()` is correct.
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 24.0), egui::Sense::click());
-    if selected {
-        ui.painter()
-            .rect_filled(rect, egui::CornerRadius::same(5), sel_bg);
-    } else if response.hovered() {
-        ui.painter()
-            .rect_filled(rect, egui::CornerRadius::same(5), hover_bg);
-    }
-    let text_x = if let Some(color) = dot {
-        ui.painter()
-            .circle_filled(rect.left_center() + egui::vec2(13.0, 0.0), 5.0, color);
-        26.0
-    } else {
-        10.0
-    };
-    ui.painter().text(
-        rect.left_center() + egui::vec2(text_x, 0.0),
-        egui::Align2::LEFT_CENTER,
-        text,
-        theme::text_style(theme::MENU_ITEM).resolve(ui.style()),
-        text_color,
-    );
-    response.clicked()
-}
 
 /// The toolbar: the find/filter controls. `focus_find` requests focus on the Find field (⌘/Ctrl+F).
 pub(crate) fn toolbar(ui: &mut egui::Ui, loaded: &mut LoadedTable, focus_find: bool) {

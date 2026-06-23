@@ -13,7 +13,6 @@ use std::collections::BTreeMap;
 /// App-wide named text styles. Their sizes are registered in `text_styles` by [`build`], so call
 /// sites select a style by name and no font size is hard-coded outside this module.
 pub const MENU_SECTION: &str = "menu_section";
-pub const MENU_ITEM: &str = "menu_item";
 pub const SETTINGS_HEADING: &str = "settings_heading";
 pub const COLUMN_HEADER: &str = "column_header";
 pub const STEPPER: &str = "stepper";
@@ -216,10 +215,6 @@ pub fn build(settings: &Settings, system_dark: bool) -> (Style, Palette) {
         // Named chrome styles — the single source of truth for these font sizes.
         (
             text_style(MENU_SECTION),
-            FontId::new(12.0, FontFamily::Proportional),
-        ),
-        (
-            text_style(MENU_ITEM),
             FontId::new(12.0, FontFamily::Proportional),
         ),
         (

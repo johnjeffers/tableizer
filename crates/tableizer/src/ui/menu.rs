@@ -11,8 +11,6 @@ use crate::model::{
 use crate::theme;
 use std::path::PathBuf;
 
-use super::menu_choice;
-
 /// The menu bar (File / Parsing / Columns).
 pub(crate) fn menu_bar(ui: &mut egui::Ui, app: &mut TableizerApp, to_open: &mut Option<PathBuf>) {
     ui.menu_button("File", |ui| {
@@ -60,13 +58,16 @@ pub(crate) fn menu_bar(ui: &mut egui::Ui, app: &mut TableizerApp, to_open: &mut 
             ui.close();
         }
         ui.separator();
-        if ui.add_enabled(loaded, egui::Button::new("Close")).clicked() {
+        if ui
+            .add_enabled(loaded, egui::Button::new("Close File"))
+            .clicked()
+        {
             app.view = View::Empty;
             ui.close();
         }
         let quit_sc = ui.ctx().format_shortcut(&QUIT_SHORTCUT);
         if ui
-            .add(egui::Button::new("Exit").shortcut_text(quit_sc))
+            .add(egui::Button::new("Quit").shortcut_text(quit_sc))
             .clicked()
         {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
@@ -159,65 +160,66 @@ fn parsing_menu(ui: &mut egui::Ui, loaded: &mut LoadedTable) {
 
     ui.checkbox(&mut loaded.dialect.has_header, "Header row");
 
-    ui.menu_button("Delimiter", |ui| {
-        ui.set_min_width(196.0);
-        // Auto is the default; presets/custom are explicit overrides for when sniffing guessed wrong.
-        let detected = loaded.detected_delimiter;
-        if menu_choice(
-            ui,
-            186.0,
-            loaded.delimiter_auto,
-            None,
-            &format!("Auto · detected {}", delimiter_label(detected)),
-        ) {
-            loaded.dialect.delimiter = detected;
-            loaded.delimiter_auto = true;
-            loaded.delimiter_input = delimiter_display(detected);
-        }
-        for (label, byte) in [
-            ("Comma", b','),
-            ("Tab", b'\t'),
-            ("Semicolon", b';'),
-            ("Pipe", b'|'),
-        ] {
-            if menu_choice(
-                ui,
-                186.0,
-                !loaded.delimiter_auto && loaded.dialect.delimiter == byte,
-                None,
-                label,
-            ) {
-                loaded.dialect.delimiter = byte;
-                loaded.delimiter_auto = false;
-                loaded.delimiter_input = delimiter_display(byte);
-            }
-        }
-        ui.horizontal(|ui| {
-            ui.label("Custom:");
-            ui.add(
-                egui::TextEdit::singleline(&mut loaded.delimiter_input)
-                    .desired_width(54.0)
-                    .hint_text(": or 0x01"),
-            );
-            if ui.button("Set").clicked()
-                && let Some(byte) = parse_delimiter(&loaded.delimiter_input)
+    // Use `CloseOnClickOutside` rather than the menu default (`CloseOnClick`): otherwise the click
+    // that focuses the Custom text field counts as a menu click and dismisses the menu before you
+    // can type. With this, clicks inside the submenu (presets, the text field) keep it open; a click
+    // outside or Esc closes it.
+    egui::containers::menu::SubMenuButton::new("Delimiter")
+        .config(
+            egui::containers::menu::MenuConfig::new()
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+        )
+        .ui(ui, |ui| {
+            ui.set_min_width(196.0);
+            // Auto is the default; presets/custom are explicit overrides for when sniffing guessed wrong.
+            let detected = loaded.detected_delimiter;
+            if ui
+                .selectable_label(
+                    loaded.delimiter_auto,
+                    format!("Auto ({})", delimiter_label(detected)),
+                )
+                .clicked()
             {
-                loaded.dialect.delimiter = byte;
-                loaded.delimiter_auto = false;
+                loaded.dialect.delimiter = detected;
+                loaded.delimiter_auto = true;
+                loaded.delimiter_input = delimiter_display(detected);
             }
+            for (label, byte) in [
+                ("Comma", b','),
+                ("Pipe", b'|'),
+                ("Semicolon", b';'),
+                ("Tab", b'\t'),
+            ] {
+                let selected = !loaded.delimiter_auto && loaded.dialect.delimiter == byte;
+                if ui.selectable_label(selected, label).clicked() {
+                    loaded.dialect.delimiter = byte;
+                    loaded.delimiter_auto = false;
+                    loaded.delimiter_input = delimiter_display(byte);
+                }
+            }
+            ui.horizontal(|ui| {
+                ui.label("Custom:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut loaded.delimiter_input)
+                        .desired_width(54.0)
+                        .hint_text(": or 0x01"),
+                );
+                if ui.button("Set").clicked()
+                    && let Some(byte) = parse_delimiter(&loaded.delimiter_input)
+                {
+                    loaded.dialect.delimiter = byte;
+                    loaded.delimiter_auto = false;
+                }
+            });
         });
-    });
 
     ui.menu_button("Encoding", |ui| {
         ui.set_min_width(160.0);
         for choice in [encoding_rs::UTF_8, encoding_rs::WINDOWS_1252] {
-            if menu_choice(
-                ui,
-                150.0,
-                std::ptr::eq(loaded.encoding, choice),
-                None,
-                choice.name(),
-            ) {
+            if ui
+                .selectable_label(std::ptr::eq(loaded.encoding, choice), choice.name())
+                .clicked()
+            {
                 loaded.encoding = choice;
             }
         }
