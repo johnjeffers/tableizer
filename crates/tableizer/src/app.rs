@@ -100,7 +100,7 @@ impl TableizerApp {
                 };
                 (dialect, detected_delimiter, delimiter_auto)
             }
-            Format::Ndjson | Format::Parquet => (Dialect::default(), b',', true),
+            Format::Json | Format::Parquet => (Dialect::default(), b',', true),
         };
         // UTF-16 is transcoded to UTF-8 by the engine; single-byte encodings default to UTF-8 here and
         // can be switched to Windows-1252 via the Parsing menu.

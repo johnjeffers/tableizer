@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 
 use encoding_rs::Encoding;
 use tableizer_core::{
-    ColumnId, CsvTable, Direction, FilterSpec, NdjsonTable, ParquetTable, Schema, SortKey,
-    ViewSpec, ViewportSource, parse::Dialect,
+    ColumnId, CsvTable, Direction, FilterSpec, JsonTable, ParquetTable, Schema, SortKey, ViewSpec,
+    ViewportSource, parse::Dialect,
 };
 
 /// The file format behind a [`ViewportSource`]. Detected on open; selects which engine reader to
@@ -17,33 +17,44 @@ use tableizer_core::{
 pub(crate) enum Format {
     /// CSV / TSV / arbitrary-separator text (the dialect-driven path).
     Delimited,
-    /// NDJSON / JSON Lines.
-    Ndjson,
+    /// JSON — NDJSON / JSON Lines, or a single top-level JSON array.
+    Json,
     /// Apache Parquet.
     Parquet,
 }
 
-/// Detect a file's format: by extension first (explicit + cheap), then Parquet's `PAR1` magic bytes
-/// as a fallback for a mis-named file. Anything else is treated as delimited text (the default).
+/// Detect a file's format from its **content**, not just its extension — extensions lie (a `.json`
+/// holding NDJSON, or a mis-named Parquet). Order: Parquet's `PAR1` magic, then a JSON shape sniff
+/// (NDJSON or a top-level array), then the extension as a fallback for content that didn't classify
+/// (e.g. an empty file), else delimited text.
 pub(crate) fn detect_format(path: &Path) -> Format {
-    let ext = path
+    let head = read_head(path, 64 * 1024);
+    if head.starts_with(b"PAR1") {
+        return Format::Parquet;
+    }
+    if tableizer_core::json::sniff(&head).is_some() {
+        return Format::Json;
+    }
+    match path
         .extension()
         .and_then(|e| e.to_str())
-        .map(str::to_ascii_lowercase);
-    match ext.as_deref() {
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
         Some("parquet" | "pqt") => Format::Parquet,
-        Some("ndjson" | "jsonl") => Format::Ndjson,
-        _ if file_starts_with(path, b"PAR1") => Format::Parquet,
+        Some("ndjson" | "jsonl") => Format::Json,
         _ => Format::Delimited,
     }
 }
 
-/// Whether `path` begins with `magic` (best-effort; a read failure reads as "no").
-fn file_starts_with(path: &Path, magic: &[u8]) -> bool {
-    let mut head = vec![0u8; magic.len()];
-    std::fs::File::open(path)
-        .and_then(|mut f| f.read_exact(&mut head).map(|()| head == magic))
-        .unwrap_or(false)
+/// Read up to `max` leading bytes of `path` (best-effort; a read failure yields an empty buffer).
+fn read_head(path: &Path, max: usize) -> Vec<u8> {
+    let mut head = vec![0u8; max];
+    let read = std::fs::File::open(path)
+        .and_then(|mut f| f.read(&mut head))
+        .unwrap_or(0);
+    head.truncate(read);
+    head
 }
 
 /// Read a head sample and auto-detect the dialect (delimiter + header); fall back to the default.
@@ -88,7 +99,7 @@ pub(crate) fn open_table(
         Format::Delimited => CsvTable::open(path, dialect)
             .map(|t| boxed(Box::new(t)))
             .map_err(|e| e.to_string()),
-        Format::Ndjson => NdjsonTable::open(path)
+        Format::Json => JsonTable::open(path)
             .map(|t| boxed(Box::new(t)))
             .map_err(|e| e.to_string()),
         Format::Parquet => ParquetTable::open(path)
@@ -112,7 +123,7 @@ pub(crate) fn delimiter_display(delimiter: u8) -> String {
 pub(crate) fn format_label(format: Format, dialect: &Dialect) -> String {
     match format {
         Format::Parquet => "Parquet".to_string(),
-        Format::Ndjson => "NDJSON".to_string(),
+        Format::Json => "JSON".to_string(),
         Format::Delimited => match dialect.delimiter {
             b',' => "CSV".to_string(),
             b'\t' => "TSV".to_string(),
@@ -372,18 +383,41 @@ pub(crate) enum View {
 mod tests {
     use super::*;
 
+    /// Write `content` to a temp file with the given extension and detect its format.
+    fn detect_with(extension: &str, content: &[u8]) -> Format {
+        let suffix = format!(".{extension}");
+        let mut file = tempfile::Builder::new().suffix(&suffix).tempfile().unwrap();
+        std::io::Write::write_all(&mut file, content).unwrap();
+        detect_format(file.path())
+    }
+
     #[test]
-    fn detect_format_dispatches_on_extension() {
-        // Extension wins (case-insensitively), regardless of whether the file exists.
-        assert_eq!(detect_format(Path::new("x.parquet")), Format::Parquet);
-        assert_eq!(detect_format(Path::new("x.PQT")), Format::Parquet);
-        assert_eq!(detect_format(Path::new("x.ndjson")), Format::Ndjson);
-        assert_eq!(detect_format(Path::new("x.JSONL")), Format::Ndjson);
-        // Delimited is the fallback for the text extensions and for anything unrecognised.
-        assert_eq!(detect_format(Path::new("x.csv")), Format::Delimited);
-        assert_eq!(detect_format(Path::new("x.tsv")), Format::Delimited);
+    fn detect_format_falls_back_to_extension_for_empty_content() {
+        // With no content to sniff, the extension decides (these files are empty on disk).
+        assert_eq!(detect_with("parquet", b""), Format::Parquet);
+        assert_eq!(detect_with("PQT", b""), Format::Parquet);
+        assert_eq!(detect_with("ndjson", b""), Format::Json);
+        assert_eq!(detect_with("JSONL", b""), Format::Json);
+        assert_eq!(detect_with("csv", b""), Format::Delimited);
+        assert_eq!(detect_with("unknown_ext_zz", b""), Format::Delimited);
+    }
+
+    #[test]
+    fn detect_format_routes_json_by_content_regardless_of_extension() {
+        // The reported bug: NDJSON content in a `.json` file must be JSON, not CSV.
+        assert_eq!(detect_with("json", b"{\"a\":1}\n{\"a\":2}\n"), Format::Json);
+        // A top-level array in a `.json` file is JSON too.
+        assert_eq!(detect_with("json", b"[{\"a\":1},{\"a\":2}]"), Format::Json);
+        // Content wins over a misleading extension (NDJSON named `.csv`).
+        assert_eq!(detect_with("csv", b"{\"a\":1}\n{\"a\":2}\n"), Format::Json);
+        // Real delimited content stays delimited even with a `.json` extension.
         assert_eq!(
-            detect_format(Path::new("x.unknown_ext_zz")),
+            detect_with("json", b"name,age\nbob,30\n"),
+            Format::Delimited
+        );
+        // A `[`-leading CSV is not mistaken for a JSON array.
+        assert_eq!(
+            detect_with("csv", b"[id],name\n[1],bob\n"),
             Format::Delimited
         );
     }
@@ -392,7 +426,7 @@ mod tests {
     fn format_label_names_each_format() {
         let comma = Dialect::default();
         assert_eq!(format_label(Format::Parquet, &comma), "Parquet");
-        assert_eq!(format_label(Format::Ndjson, &comma), "NDJSON");
+        assert_eq!(format_label(Format::Json, &comma), "JSON");
         // Delimited is named by its delimiter.
         assert_eq!(format_label(Format::Delimited, &comma), "CSV");
         let tab = Dialect {
