@@ -2,8 +2,7 @@
 //! Export submenu, and writing exports to disk.
 
 use eframe::egui;
-use encoding_rs::Encoding;
-use tableizer_core::{CancellationToken, ColumnId, ExportScope, ViewportSource, parse::Dialect};
+use tableizer_core::{CancellationToken, ColumnId, ExportScope};
 
 use crate::app::{CLOSE_SHORTCUT, OPEN_SHORTCUT, QUIT_SHORTCUT, SETTINGS_SHORTCUT, TableizerApp};
 use crate::model::{
@@ -220,52 +219,60 @@ fn reset_view(loaded: &mut LoadedTable, ctx: &egui::Context) {
     ctx.data_mut(|d| d.remove_by_type::<egui_table::TableState>());
 }
 
-/// The Export submenu: current view or source, as CSV or TSV, to a chosen file.
-fn export_menu(ui: &mut egui::Ui, loaded: &LoadedTable) {
-    ui.set_min_width(186.0);
-    let mut request: Option<(ExportScope, u8, &str)> = None;
-    menu_section(ui, "CURRENT VIEW");
-    if ui.button("as CSV…").clicked() {
-        request = Some((ExportScope::CurrentView, b',', "csv"));
-        ui.close();
+/// One of the formats the Export submenu offers.
+#[derive(Clone, Copy)]
+enum ExportKind {
+    Csv,
+    Tsv,
+    Ndjson,
+    Parquet,
+}
+
+impl ExportKind {
+    fn label(self) -> &'static str {
+        match self {
+            ExportKind::Csv => "CSV",
+            ExportKind::Tsv => "TSV",
+            ExportKind::Ndjson => "NDJSON",
+            ExportKind::Parquet => "Parquet",
+        }
     }
-    if ui.button("as TSV…").clicked() {
-        request = Some((ExportScope::CurrentView, b'\t', "tsv"));
-        ui.close();
-    }
-    menu_section(ui, "SOURCE (ALL DATA)");
-    if ui.button("as CSV…").clicked() {
-        request = Some((ExportScope::Source, b',', "csv"));
-        ui.close();
-    }
-    if ui.button("as TSV…").clicked() {
-        request = Some((ExportScope::Source, b'\t', "tsv"));
-        ui.close();
-    }
-    if let Some((scope, delimiter, extension)) = request {
-        export_to_file(
-            loaded.table.as_ref(),
-            &loaded.dialect,
-            loaded.encoding,
-            &loaded.layout,
-            scope,
-            delimiter,
-            extension,
-        );
+
+    fn extension(self) -> &'static str {
+        match self {
+            ExportKind::Csv => "csv",
+            ExportKind::Tsv => "tsv",
+            ExportKind::Ndjson => "ndjson",
+            ExportKind::Parquet => "parquet",
+        }
     }
 }
 
-/// A small, uppercase, muted section header inside a dropdown menu.
-fn menu_section(ui: &mut egui::Ui, title: &str) {
-    let color = ui.visuals().weak_text_color();
-    ui.add_space(6.0);
-    ui.label(
-        egui::RichText::new(title)
-            .text_style(theme::text_style(theme::MENU_SECTION))
-            .strong()
-            .color(color),
-    );
-    ui.add_space(1.0);
+/// The Export submenu: one entry per format, each offering the current view or the whole source.
+fn export_menu(ui: &mut egui::Ui, loaded: &LoadedTable) {
+    let mut request: Option<(ExportScope, ExportKind)> = None;
+    for kind in [
+        ExportKind::Csv,
+        ExportKind::Tsv,
+        ExportKind::Ndjson,
+        ExportKind::Parquet,
+    ] {
+        ui.menu_button(kind.label(), |ui| {
+            ui.set_min_width(180.0);
+            for (label, scope) in [
+                ("Current view…", ExportScope::CurrentView),
+                ("Source (all data)…", ExportScope::Source),
+            ] {
+                if ui.button(label).clicked() {
+                    request = Some((scope, kind));
+                    ui.close();
+                }
+            }
+        });
+    }
+    if let Some((scope, kind)) = request {
+        export_to_file(loaded, scope, kind);
+    }
 }
 
 /// The Parsing menu: delimiter (presets + custom), header row, and display encoding. Changing the
@@ -343,45 +350,59 @@ fn parsing_menu(ui: &mut egui::Ui, loaded: &mut LoadedTable) {
 }
 
 /// Export the table to a user-chosen file (native save dialog). Errors are reported to stderr.
-fn export_to_file(
-    table: &dyn ViewportSource,
-    dialect: &Dialect,
-    encoding: &'static Encoding,
-    layout: &GridLayout,
-    scope: ExportScope,
-    delimiter: u8,
-    extension: &str,
-) {
+fn export_to_file(loaded: &LoadedTable, scope: ExportScope, kind: ExportKind) {
+    use tableizer_core::export;
+
+    let table = loaded.table.as_ref();
     let schema = table.schema();
     let columns: Vec<ColumnId> = match scope {
-        ExportScope::CurrentView => layout.displayed(),
+        ExportScope::CurrentView => loaded.layout.displayed(),
         ExportScope::Source => (0..schema.columns.len() as u32).map(ColumnId).collect(),
     };
-    // Write a header row only if the source had one (otherwise column names are synthetic).
-    let header: Option<Vec<Vec<u8>>> = dialect.has_header.then(|| {
-        columns
-            .iter()
-            .map(|&c| column_name(schema, c, encoding).into_bytes())
-            .collect()
-    });
+    // Column names: NDJSON keys / Parquet column names / the CSV header row.
+    let names: Vec<Vec<u8>> = columns
+        .iter()
+        .map(|&c| column_name(schema, c, loaded.encoding).into_bytes())
+        .collect();
+
     let Some(path) = rfd::FileDialog::new()
-        .set_file_name(format!("export.{extension}"))
+        .set_file_name(format!("export.{}", kind.extension()))
         .save_file()
     else {
         return; // user cancelled
     };
+
+    let cancel = CancellationToken::new();
     let result = std::fs::File::create(&path)
         .map_err(|e| e.to_string())
         .and_then(|file| {
-            tableizer_core::export::export_csv(
-                table,
-                std::io::BufWriter::new(file),
-                delimiter,
-                scope,
-                &columns,
-                header.as_deref(),
-                &CancellationToken::new(),
-            )
+            let writer = std::io::BufWriter::new(file);
+            match kind {
+                ExportKind::Csv | ExportKind::Tsv => {
+                    let delimiter = if matches!(kind, ExportKind::Tsv) {
+                        b'\t'
+                    } else {
+                        b','
+                    };
+                    // Write a header row only if the source had one (else names are synthetic).
+                    let header = loaded.dialect.has_header.then(|| names.clone());
+                    export::export_csv(
+                        table,
+                        writer,
+                        delimiter,
+                        scope,
+                        &columns,
+                        header.as_deref(),
+                        &cancel,
+                    )
+                }
+                ExportKind::Ndjson => {
+                    export::export_ndjson(table, writer, scope, &columns, &names, &cancel)
+                }
+                ExportKind::Parquet => {
+                    export::export_parquet(table, writer, scope, &columns, &names, &cancel)
+                }
+            }
             .map_err(|e| e.to_string())
         });
     if let Err(error) = result {

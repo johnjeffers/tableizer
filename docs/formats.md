@@ -78,7 +78,12 @@ the sort stays ours.
 ## Export
 
 Export runs through the seam, so it works from any source: **current view** (filter + sort + visible
-columns, in display order) or **source** (every row/column, view-bypassing), written as CSV or TSV via
-the `csv` writer with correct re-quoting (a round-trip self-test asserts byte/field equivalence on the
-source path). Cross-format export (→ JSON / Parquet, with documented coercion rules) and a
-user-chosen delimiter are tracked in [`todo.md`](todo.md).
+columns, in display order) or **source** (every row/column, view-bypassing), in any of four formats —
+**CSV**, **TSV**, **NDJSON**, or **Parquet**. By the time export runs, cells are already rendered text,
+so values are written as their displayed text with no type coercion, preserving the exact bytes: CSV/TSV
+go through the `csv` writer with correct re-quoting (a round-trip self-test asserts byte/field
+equivalence on the source path); NDJSON writes one object per row with every value as a JSON string (a
+numeric-looking id keeps its leading zeros); Parquet writes one UTF-8 string column per column (a
+round-trip self-test re-reads it through the Parquet reader). **Typed** NDJSON/Parquet export (numbers,
+booleans, nulls — with documented coercion rules) and a user-chosen delimiter are tracked in
+[`todo.md`](todo.md).
