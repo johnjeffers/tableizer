@@ -331,9 +331,9 @@ impl eframe::App for TableizerApp {
         let panel_open = self.panel_open;
         egui::Panel::right("side_panel")
             .resizable(true)
-            .default_size(340.0)
-            .min_size(240.0)
-            .max_size(560.0)
+            .default_size(280.0)
+            .min_size(280.0)
+            .max_size(500.0)
             .show_animated_inside(ui, panel_open, |ui| self.side_panel_contents(ui));
 
         // React to edits from the toolbar (filter/sort) and the side panel (Parsing → dialect,

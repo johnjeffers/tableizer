@@ -1,9 +1,8 @@
-//! The Settings panel tab: appearance (theme / accent / density), the table-font picker with live
-//! preview, and the index-cache size/clear control. Everything applies live and persists on change.
+//! The Settings panel tab: appearance (theme / accent / density), the table-font picker, and the
+//! index-cache size/clear control. Everything applies live to the app and persists on change.
 
 use eframe::egui;
 
-use crate::fonts;
 use crate::theme;
 
 /// Format a byte count for the cache display.
@@ -68,8 +67,8 @@ fn accent_swatches(ui: &mut egui::Ui, current: &mut theme::Accent) {
     });
 }
 
-/// The Settings panel tab: appearance (theme/accent/density), the table font (size + live preview +
-/// searchable family list), and the index cache. Everything applies live and persists on change.
+/// The Settings panel tab: appearance (theme/accent/density), the table font (size + searchable
+/// family list), and the index cache. Everything applies live to the app and persists on change.
 /// Rendered into the right panel; scrolls when the panel is shorter than its content.
 pub(crate) fn settings_tab(
     ui: &mut egui::Ui,
@@ -130,74 +129,71 @@ pub(crate) fn settings_tab(
                 {
                     settings.table_font_size = (settings.table_font_size + 0.5).min(32.0);
                 }
-                ui.add_space(12.0);
-                let weak = ui.visuals().weak_text_color();
-                let current = settings
-                    .table_font
-                    .clone()
-                    .unwrap_or_else(|| "App font".to_owned());
-                ui.label(egui::RichText::new(current).color(weak));
-            });
-            ui.add_space(6.0);
-
-            // Live preview, rendered in the chosen table font + size.
-            let preview_font = egui::FontId::new(
-                settings.table_font_size,
-                egui::FontFamily::Name(fonts::TABLE_FONT.into()),
-            );
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(
-                    egui::RichText::new("The quick brown fox  ·  0123456789").font(preview_font),
-                );
             });
             ui.add_space(8.0);
 
-            ui.horizontal(|ui| {
-                // Reserve room for the checkbox on the right; the search field fills the rest.
-                let search_w = (ui.available_width() - 108.0).max(80.0);
-                ui.add(
-                    egui::TextEdit::singleline(font_search)
-                        .hint_text("Search fonts…")
-                        .desired_width(search_w),
-                );
-                ui.checkbox(mono_only, "Monospace");
-            });
-            ui.add_space(4.0);
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .max_height(170.0)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        // Full-width, left-aligned rows rendered with the native selectable widget
-                        // (the same text path as every other menu/list item — see `ui` module docs).
-                        ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
-                            if ui
-                                .selectable_label(
-                                    settings.table_font.is_none(),
-                                    "App font (default)",
-                                )
-                                .clicked()
-                            {
-                                settings.table_font = None;
-                            }
-                            let query = font_search.to_lowercase();
-                            for (family, is_mono) in families {
-                                if *mono_only && !*is_mono {
-                                    continue;
-                                }
-                                if !query.is_empty() && !family.to_lowercase().contains(&query) {
-                                    continue;
-                                }
-                                let selected =
-                                    settings.table_font.as_deref() == Some(family.as_str());
-                                if ui.selectable_label(selected, family.as_str()).clicked() {
-                                    settings.table_font = Some(family.clone());
-                                }
-                            }
+            // A single searchable dropdown: the collapsed button shows the current font; the popup
+            // holds a pinned search field + monospace filter and a scrollable, filtered family list.
+            let current = settings
+                .table_font
+                .clone()
+                .unwrap_or_else(|| "App font (default)".to_owned());
+            egui::ComboBox::from_id_salt("table_font_picker")
+                .selected_text(current)
+                .width(ui.available_width())
+                // Generous popup height so the combo's own (outer) scroll never engages; the inner
+                // scroll handles the list, which keeps the search field pinned at the top.
+                .height(360.0)
+                // A click on the search field would otherwise count as a selection and dismiss the
+                // popup — only a click outside (or Esc) should close it.
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                .show_ui(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(font_search)
+                            .hint_text("Search fonts…")
+                            .desired_width(ui.available_width()),
+                    );
+                    ui.checkbox(mono_only, "Monospace only");
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .max_height(240.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            // Full-width, left-aligned rows via the native selectable widget (same
+                            // text path as every other list item — see the `ui` module docs).
+                            ui.with_layout(
+                                egui::Layout::top_down_justified(egui::Align::LEFT),
+                                |ui| {
+                                    if ui
+                                        .selectable_label(
+                                            settings.table_font.is_none(),
+                                            "App font (default)",
+                                        )
+                                        .clicked()
+                                    {
+                                        settings.table_font = None;
+                                    }
+                                    let query = font_search.to_lowercase();
+                                    for (family, is_mono) in families {
+                                        if *mono_only && !*is_mono {
+                                            continue;
+                                        }
+                                        if !query.is_empty()
+                                            && !family.to_lowercase().contains(&query)
+                                        {
+                                            continue;
+                                        }
+                                        let selected =
+                                            settings.table_font.as_deref() == Some(family.as_str());
+                                        if ui.selectable_label(selected, family.as_str()).clicked()
+                                        {
+                                            settings.table_font = Some(family.clone());
+                                        }
+                                    }
+                                },
+                            );
                         });
-                    });
-            });
+                });
 
             ui.add_space(12.0);
             settings_section(ui, "Index cache");
