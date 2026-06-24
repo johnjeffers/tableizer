@@ -1,8 +1,8 @@
-//! The menu bar (File / Parsing + the Columns-panel toggle), the right-side Columns panel, the
-//! Export submenu, and writing exports to disk.
+//! The menu bar (File / Parsing + the Columns-panel toggle), the right-side Columns panel, and the
+//! Export submenu (which only records the request; the app runs the write off the UI thread).
 
 use eframe::egui;
-use tableizer_core::{CancellationToken, ColumnId, ExportScope};
+use tableizer_core::{ColumnId, ExportScope, RowCount};
 
 use crate::app::{
     CLOSE_SHORTCUT, OPEN_SHORTCUT, PanelTab, QUIT_SHORTCUT, SETTINGS_SHORTCUT, TableizerApp,
@@ -13,8 +13,16 @@ use crate::model::{
 use crate::theme;
 use std::path::PathBuf;
 
+/// A requested export, set by the Export submenu and carried out (off the UI thread) by the app.
+pub(crate) type ExportRequest = (ExportScope, ExportKind);
+
 /// The menu bar: File / Parsing on the left, the Columns-panel toggle pinned to the right.
-pub(crate) fn menu_bar(ui: &mut egui::Ui, app: &mut TableizerApp, to_open: &mut Option<PathBuf>) {
+pub(crate) fn menu_bar(
+    ui: &mut egui::Ui,
+    app: &mut TableizerApp,
+    to_open: &mut Option<PathBuf>,
+    to_export: &mut Option<ExportRequest>,
+) {
     ui.menu_button("File", |ui| {
         ui.set_min_width(150.0);
         let open_sc = ui.ctx().format_shortcut(&OPEN_SHORTCUT);
@@ -54,13 +62,18 @@ pub(crate) fn menu_bar(ui: &mut egui::Ui, app: &mut TableizerApp, to_open: &mut 
             }
         });
         let loaded = matches!(app.view, View::Loaded(_));
-        ui.add_enabled_ui(loaded, |ui| {
-            ui.menu_button("Export", |ui| {
-                if let View::Loaded(loaded) = &app.view {
-                    export_menu(ui, loaded);
-                }
-            });
+        // Export is gated on a *complete* index: exporting mid-build would silently write only the
+        // rows indexed so far. Parquet/JSON-array are exact from open, so they're never blocked.
+        let exportable =
+            matches!(&app.view, View::Loaded(l) if matches!(l.table.row_count(), RowCount::Exact(_)));
+        let export = ui.add_enabled_ui(exportable, |ui| {
+            ui.menu_button("Export", |ui| export_menu(ui, to_export));
         });
+        if loaded && !exportable {
+            export
+                .response
+                .on_hover_text("Available once indexing finishes");
+        }
         ui.separator();
         let settings_sc = ui.ctx().format_shortcut(&SETTINGS_SHORTCUT);
         if ui
@@ -226,7 +239,7 @@ fn reset_view(loaded: &mut LoadedTable, ctx: &egui::Context) {
 
 /// One of the formats the Export submenu offers.
 #[derive(Clone, Copy)]
-enum ExportKind {
+pub(crate) enum ExportKind {
     Csv,
     Tsv,
     Ndjson,
@@ -243,7 +256,8 @@ impl ExportKind {
         }
     }
 
-    fn extension(self) -> &'static str {
+    /// File extension for the save dialog's default name.
+    pub(crate) fn extension(self) -> &'static str {
         match self {
             ExportKind::Csv => "csv",
             ExportKind::Tsv => "tsv",
@@ -253,9 +267,9 @@ impl ExportKind {
     }
 }
 
-/// The Export submenu: one entry per format, each offering the current view or the whole source.
-fn export_menu(ui: &mut egui::Ui, loaded: &LoadedTable) {
-    let mut request: Option<(ExportScope, ExportKind)> = None;
+/// The Export submenu: one entry per format, each offering the current view or the whole source. The
+/// chosen export is recorded in `to_export`; the app runs it off the UI thread (`app.rs`).
+fn export_menu(ui: &mut egui::Ui, to_export: &mut Option<ExportRequest>) {
     for kind in [
         ExportKind::Csv,
         ExportKind::Tsv,
@@ -269,14 +283,11 @@ fn export_menu(ui: &mut egui::Ui, loaded: &LoadedTable) {
                 ("Source (all data)…", ExportScope::Source),
             ] {
                 if ui.button(label).clicked() {
-                    request = Some((scope, kind));
+                    *to_export = Some((scope, kind));
                     ui.close();
                 }
             }
         });
-    }
-    if let Some((scope, kind)) = request {
-        export_to_file(loaded, scope, kind);
     }
 }
 
@@ -345,65 +356,4 @@ pub(crate) fn parsing_tab(ui: &mut egui::Ui, loaded: &mut LoadedTable) {
                 }
             }
         });
-}
-
-/// Export the table to a user-chosen file (native save dialog). Errors are reported to stderr.
-fn export_to_file(loaded: &LoadedTable, scope: ExportScope, kind: ExportKind) {
-    use tableizer_core::export;
-
-    let table = loaded.table.as_ref();
-    let schema = table.schema();
-    let columns: Vec<ColumnId> = match scope {
-        ExportScope::CurrentView => loaded.layout.displayed(),
-        ExportScope::Source => (0..schema.columns.len() as u32).map(ColumnId).collect(),
-    };
-    // Column names: NDJSON keys / Parquet column names / the CSV header row.
-    let names: Vec<Vec<u8>> = columns
-        .iter()
-        .map(|&c| column_name(schema, c, loaded.encoding).into_bytes())
-        .collect();
-
-    let Some(path) = rfd::FileDialog::new()
-        .set_file_name(format!("export.{}", kind.extension()))
-        .save_file()
-    else {
-        return; // user cancelled
-    };
-
-    let cancel = CancellationToken::new();
-    let result = std::fs::File::create(&path)
-        .map_err(|e| e.to_string())
-        .and_then(|file| {
-            let writer = std::io::BufWriter::new(file);
-            match kind {
-                ExportKind::Csv | ExportKind::Tsv => {
-                    let delimiter = if matches!(kind, ExportKind::Tsv) {
-                        b'\t'
-                    } else {
-                        b','
-                    };
-                    // Write a header row only if the source had one (else names are synthetic).
-                    let header = loaded.dialect.has_header.then(|| names.clone());
-                    export::export_csv(
-                        table,
-                        writer,
-                        delimiter,
-                        scope,
-                        &columns,
-                        header.as_deref(),
-                        &cancel,
-                    )
-                }
-                ExportKind::Ndjson => {
-                    export::export_ndjson(table, writer, scope, &columns, &names, &cancel)
-                }
-                ExportKind::Parquet => {
-                    export::export_parquet(table, writer, scope, &columns, &names, &cancel)
-                }
-            }
-            .map_err(|e| e.to_string())
-        });
-    if let Err(error) = result {
-        eprintln!("export failed: {error}");
-    }
 }

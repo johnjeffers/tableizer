@@ -3,13 +3,19 @@
 
 use eframe::egui;
 use encoding_rs::Encoding;
+use tableizer_core::search::Matcher;
 use tableizer_core::{
     CancellationToken, Cell, ColumnId, Direction, InferredType, RowCount, RowRange, SortKey,
     ViewportRequest, ViewportSource,
 };
 
-use crate::model::{LoadedTable, RowSpan, cell_matches, column_name, decode_field, reorder};
+use crate::model::{LoadedTable, RowSpan, column_name, decode_field, highlight_matcher, reorder};
 use crate::theme;
+
+/// Cap on how many rows a single copy materialises, so "select everything → ⌘C" on a huge file can't
+/// freeze the UI or exhaust memory building one giant string. The selection itself is unbounded; only
+/// what a copy pulls is limited.
+const MAX_COPY_ROWS: u64 = 1_000_000;
 
 /// The virtualised grid, plus keyboard navigation and column-reorder application.
 pub(crate) fn grid(ui: &mut egui::Ui, loaded: &mut LoadedTable, palette: &theme::Palette) {
@@ -101,12 +107,7 @@ pub(crate) fn grid(ui: &mut egui::Ui, loaded: &mut LoadedTable, palette: &theme:
         encoding,
         palette: palette.clone(),
         sort: view.sort,
-        search: if view.case_sensitive {
-            view.search.clone()
-        } else {
-            view.search.to_lowercase()
-        },
-        search_case_sensitive: view.case_sensitive,
+        highlight: highlight_matcher(view),
         selected: view.selected,
         drag_active: view.selecting,
         hovered_row: view.hovered_row,
@@ -199,10 +200,12 @@ pub(crate) fn grid(ui: &mut egui::Ui, loaded: &mut LoadedTable, palette: &theme:
                 None
             });
     if let Some(span) = copy_span {
+        // Bound the pull so an enormous selection can't freeze the UI; copies the first rows of it.
+        let copy_len = span.len().min(MAX_COPY_ROWS);
         let request = ViewportRequest {
             rows: RowRange {
                 start: span.lo(),
-                len: u32::try_from(span.len()).unwrap_or(u32::MAX),
+                len: u32::try_from(copy_len).unwrap_or(u32::MAX),
             },
             columns: delegate.columns.clone(),
         };
@@ -239,11 +242,10 @@ struct GridDelegate<'a> {
     palette: theme::Palette,
     /// Active sort (for the header indicator), if any.
     sort: Option<SortKey>,
-    /// Search query for the highlight: raw when `search_case_sensitive`, else lowercased (the cell
-    /// text is lowercased to match). Cells containing it are highlighted (empty = no highlight).
-    search: String,
-    /// Whether the highlight match is case-sensitive.
-    search_case_sensitive: bool,
+    /// Compiled find matcher for the in-place highlight (literal or regex, honouring case); `None`
+    /// when nothing should be highlighted. Tested per cell on the raw bytes, so it agrees with the
+    /// row filter.
+    highlight: Option<Matcher>,
     /// Selected display rows to highlight, if any.
     selected: Option<RowSpan>,
     /// Whether a row-selection drag is in progress (cells extend the selection to the pointer).
@@ -495,7 +497,12 @@ impl egui_table::TableDelegate for GridDelegate<'_> {
                 self.palette.row_selected,
             );
         }
-        if cell_matches(&text, &self.search, self.search_case_sensitive) {
+        // Highlight on the raw cell bytes (what the filter matches), so highlight and filter agree.
+        if self
+            .highlight
+            .as_ref()
+            .is_some_and(|m| m.matches_any([cell_value.0.as_ref()]))
+        {
             ui.painter().rect_filled(
                 cell_rect,
                 egui::CornerRadius::ZERO,

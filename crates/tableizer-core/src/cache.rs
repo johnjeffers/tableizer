@@ -3,9 +3,7 @@
 //! mtime + dialect). A stale index would show *silently-wrong rows*, so validation is strict: any
 //! mismatch (missing, stale, different dialect, corrupt) returns `None` and the index is rebuilt.
 
-use std::collections::hash_map::DefaultHasher;
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -28,9 +26,7 @@ pub fn cache_dir() -> Option<PathBuf> {
 }
 
 fn cache_file_in(dir: &Path, source: &Path) -> PathBuf {
-    let mut hasher = DefaultHasher::new();
-    source.hash(&mut hasher);
-    dir.join(format!("{:016x}.idx", hasher.finish()))
+    dir.join(format!("{:016x}.idx", crate::stable_hash(source)))
 }
 
 /// Source-file identity for invalidation: byte size + modification time.

@@ -49,15 +49,12 @@ pub mod recent {
 /// Saved-view persistence in the OS config dir, keyed by source path.
 pub mod views {
     use crate::model::SavedView;
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
     use std::path::{Path, PathBuf};
 
     fn file(source: &Path) -> Option<PathBuf> {
         let base = directories::BaseDirs::new()?;
-        let mut hasher = DefaultHasher::new();
-        source.hash(&mut hasher);
-        let name = format!("{:016x}.json", hasher.finish());
+        // A toolchain-stable hash so a compiler upgrade never orphans a file's saved view.
+        let name = format!("{:016x}.json", tableizer_core::stable_hash(source));
         Some(base.config_dir().join("tableizer").join("views").join(name))
     }
 

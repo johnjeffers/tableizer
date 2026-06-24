@@ -64,7 +64,6 @@ define_class!(
         ) {
             let paths = decode_paths(event);
             if !paths.is_empty() {
-                eprintln!("[tableizer] open event: {paths:?}");
                 PENDING.lock().expect("open-queue lock").extend(paths);
                 if let Some(ctx) = REPAINT.get() {
                     ctx.request_repaint();

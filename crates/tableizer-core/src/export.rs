@@ -10,6 +10,7 @@
 
 use std::io::Write;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
@@ -31,12 +32,15 @@ pub enum ExportScope {
 }
 
 /// Pull the export's rows in batches (honouring `scope` and `cancel`), invoking `on_batch` for each
-/// non-empty batch of materialised rows. The single fetch loop shared by every export format.
+/// non-empty batch of materialised rows. The single fetch loop shared by every export format. After
+/// each batch the running row count is published to `progress` so a UI can show how far along the
+/// (Tier-C, cancellable, off-thread) export is.
 fn for_each_batch(
     table: &dyn ViewportSource,
     scope: ExportScope,
     columns: &[ColumnId],
     cancel: &CancellationToken,
+    progress: &AtomicU64,
     mut on_batch: impl FnMut(&[Vec<Cell>]) -> Result<()>,
 ) -> Result<()> {
     let total = match table.row_count() {
@@ -62,12 +66,16 @@ fn for_each_batch(
         }
         on_batch(&viewport.rows)?;
         start += viewport.rows.len() as u64;
+        progress.store(start, Ordering::Relaxed);
     }
     Ok(())
 }
 
 /// Write `table` to `writer` as delimited text. `columns` are exported in order; `header`, if given,
-/// is written first. Honours `cancel`.
+/// is written first. Honours `cancel` and reports row progress.
+// Delimiter + optional header make this one past the lint's arg ceiling; the alternatives (a params
+// struct, or dropping the shared `for_each_batch`) cost more clarity than they buy.
+#[allow(clippy::too_many_arguments)]
 pub fn export_csv<W: Write>(
     table: &dyn ViewportSource,
     writer: W,
@@ -76,6 +84,7 @@ pub fn export_csv<W: Write>(
     columns: &[ColumnId],
     header: Option<&[Vec<u8>]>,
     cancel: &CancellationToken,
+    progress: &AtomicU64,
 ) -> Result<()> {
     let mut writer = csv::WriterBuilder::new()
         .delimiter(delimiter)
@@ -85,7 +94,7 @@ pub fn export_csv<W: Write>(
             .write_record(header.iter().map(Vec::as_slice))
             .map_err(csv_io)?;
     }
-    for_each_batch(table, scope, columns, cancel, |rows| {
+    for_each_batch(table, scope, columns, cancel, progress, |rows| {
         for row in rows {
             writer
                 .write_record(row.iter().map(|cell| cell.0.as_ref()))
@@ -106,13 +115,14 @@ pub fn export_ndjson<W: Write>(
     columns: &[ColumnId],
     names: &[Vec<u8>],
     cancel: &CancellationToken,
+    progress: &AtomicU64,
 ) -> Result<()> {
     let keys: Vec<String> = names
         .iter()
         .enumerate()
         .map(|(i, n)| field_name(n, i))
         .collect();
-    for_each_batch(table, scope, columns, cancel, |rows| {
+    for_each_batch(table, scope, columns, cancel, progress, |rows| {
         for row in rows {
             // `serde_json::Map` keeps insertion (column) order — the crate has `preserve_order` on.
             let mut obj = serde_json::Map::with_capacity(row.len());
@@ -139,6 +149,7 @@ pub fn export_parquet<W: Write + Send>(
     columns: &[ColumnId],
     names: &[Vec<u8>],
     cancel: &CancellationToken,
+    progress: &AtomicU64,
 ) -> Result<()> {
     let fields: Vec<Field> = names
         .iter()
@@ -148,7 +159,7 @@ pub fn export_parquet<W: Write + Send>(
     let schema = Arc::new(ArrowSchema::new(fields));
     let mut parquet = ArrowWriter::try_new(writer, schema.clone(), None).map_err(parquet_io)?;
     let ncols = columns.len();
-    for_each_batch(table, scope, columns, cancel, |rows| {
+    for_each_batch(table, scope, columns, cancel, progress, |rows| {
         let mut cols: Vec<Vec<Option<String>>> = vec![Vec::with_capacity(rows.len()); ncols];
         for row in rows {
             for (c, col) in cols.iter_mut().enumerate() {
@@ -233,6 +244,7 @@ mod tests {
             &columns,
             None,
             &CancellationToken::new(),
+            &AtomicU64::new(0),
         )
         .unwrap();
 
@@ -264,6 +276,7 @@ mod tests {
             &columns,
             &names,
             &CancellationToken::new(),
+            &AtomicU64::new(0),
         )
         .unwrap();
 
@@ -290,6 +303,7 @@ mod tests {
             &columns,
             &names,
             &CancellationToken::new(),
+            &AtomicU64::new(0),
         )
         .unwrap();
 

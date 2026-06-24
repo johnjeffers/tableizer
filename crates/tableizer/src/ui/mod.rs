@@ -13,7 +13,7 @@ mod menu;
 mod settings;
 
 pub(crate) use grid::grid;
-pub(crate) use menu::{columns_tab, menu_bar, parsing_tab};
+pub(crate) use menu::{ExportKind, ExportRequest, columns_tab, menu_bar, parsing_tab};
 pub(crate) use settings::settings_tab;
 
 use std::path::PathBuf;
@@ -152,7 +152,7 @@ pub(crate) fn empty_view(ui: &mut egui::Ui, recent: &[PathBuf], to_open: &mut Op
 }
 
 /// Format a row count with thousands separators.
-fn fmt_count(n: u64) -> String {
+pub(crate) fn fmt_count(n: u64) -> String {
     let digits = n.to_string();
     let bytes = digits.as_bytes();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);

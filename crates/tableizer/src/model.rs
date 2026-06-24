@@ -4,12 +4,19 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use encoding_rs::Encoding;
+use tableizer_core::search::Matcher;
 use tableizer_core::{
     ColumnId, CsvTable, Direction, FilterSpec, JsonTable, ParquetTable, Schema, SortKey, ViewSpec,
     ViewportSource, parse::Dialect,
 };
+
+/// A table behind the [`ViewportSource`] seam, shared (`Arc`) so a background export thread can hold
+/// its own handle while the UI keeps rendering from the same engine. `Send + Sync` because the engine
+/// readers already are (their state is `Arc`/`Mutex`/atomics).
+pub(crate) type SharedTable = Arc<dyn ViewportSource + Send + Sync>;
 
 /// The file format behind a [`ViewportSource`]. Detected on open; selects which engine reader to
 /// build and which UI affordances apply (only the delimited format exposes the Parsing tab).
@@ -73,18 +80,22 @@ pub(crate) fn decode_field(bytes: &[u8], encoding: &'static Encoding) -> String 
     text.strip_prefix('\u{feff}').unwrap_or(&text).to_owned()
 }
 
-/// Substring match for the in-place highlight. When `case_sensitive` is false the caller must pass a
-/// lowercased `query` (the cell text is lowercased here to match); when true, `query` is compared
-/// as-is. An empty query never matches, so an empty search box highlights nothing.
-pub(crate) fn cell_matches(text: &str, query: &str, case_sensitive: bool) -> bool {
-    if query.is_empty() {
-        return false;
+/// Compile the in-place highlight matcher from the find controls, or `None` when there's nothing to
+/// highlight (empty query, or an invalid regex while the user is still typing it). It mirrors the
+/// filter exactly — same regex/literal and case rules — except it never inverts: highlight marks the
+/// cells that *match*, regardless of "Invert search". Returns a [`Matcher`] tested per cell on the
+/// raw bytes (the same bytes the filter matches), so highlight and filter never disagree.
+pub(crate) fn highlight_matcher(view: &ViewControls) -> Option<Matcher> {
+    if view.search.is_empty() {
+        return None;
     }
-    if case_sensitive {
-        text.contains(query)
-    } else {
-        text.to_lowercase().contains(query)
-    }
+    Matcher::compile(&FilterSpec {
+        query: view.search.clone(),
+        regex: view.regex,
+        invert: false,
+        case_sensitive: view.case_sensitive,
+    })
+    .ok()
 }
 
 /// Open `path` behind the `ViewportSource` seam (the rest of the app is format-agnostic). The
@@ -93,17 +104,16 @@ pub(crate) fn open_table(
     path: &Path,
     format: Format,
     dialect: Dialect,
-) -> Result<Box<dyn ViewportSource>, String> {
-    let boxed = |t: Box<dyn ViewportSource>| t;
+) -> Result<SharedTable, String> {
     match format {
         Format::Delimited => CsvTable::open(path, dialect)
-            .map(|t| boxed(Box::new(t)))
+            .map(|t| Arc::new(t) as SharedTable)
             .map_err(|e| e.to_string()),
         Format::Json => JsonTable::open(path)
-            .map(|t| boxed(Box::new(t)))
+            .map(|t| Arc::new(t) as SharedTable)
             .map_err(|e| e.to_string()),
         Format::Parquet => ParquetTable::open(path)
-            .map(|t| boxed(Box::new(t)))
+            .map(|t| Arc::new(t) as SharedTable)
             .map_err(|e| e.to_string()),
     }
 }
@@ -356,7 +366,7 @@ impl SavedView {
 /// A loaded table and all its per-file UI state.
 pub(crate) struct LoadedTable {
     pub(crate) path: PathBuf,
-    pub(crate) table: Box<dyn ViewportSource>,
+    pub(crate) table: SharedTable,
     pub(crate) layout: GridLayout,
     /// The detected file format. Gates the delimited-only UI (the Parsing tab).
     pub(crate) format: Format,
@@ -526,16 +536,38 @@ mod tests {
         );
     }
 
+    /// A `ViewControls` with just the find fields set, for the highlight-matcher tests.
+    fn find(search: &str, regex: bool, case_sensitive: bool) -> ViewControls {
+        ViewControls {
+            search: search.to_owned(),
+            regex,
+            case_sensitive,
+            ..ViewControls::default()
+        }
+    }
+
+    fn highlights(view: &ViewControls, cell: &str) -> bool {
+        highlight_matcher(view).is_some_and(|m| m.matches_any([cell.as_bytes()]))
+    }
+
     #[test]
-    fn cell_matches_handles_case_and_empty_query() {
-        // Case-insensitive: caller passes a lowercased query; cell text is lowercased to match.
-        assert!(cell_matches("Hello World", "world", false));
-        assert!(!cell_matches("Hello", "xyz", false));
-        assert!(!cell_matches("Hello", "", false)); // empty query highlights nothing
+    fn highlight_matcher_handles_case_and_empty_query() {
+        assert!(highlights(&find("world", false, false), "Hello World")); // case-insensitive default
+        assert!(!highlights(&find("xyz", false, false), "Hello"));
+        assert!(highlight_matcher(&find("", false, false)).is_none()); // empty query → no highlight
         // Case-sensitive: compared as-is.
-        assert!(cell_matches("Hello World", "World", true));
-        assert!(!cell_matches("Hello World", "world", true));
-        assert!(!cell_matches("Hello", "", true));
+        assert!(highlights(&find("World", false, true), "Hello World"));
+        assert!(!highlights(&find("world", false, true), "Hello World"));
+    }
+
+    #[test]
+    fn highlight_matcher_respects_regex_mode() {
+        // In regex mode the highlight uses the pattern, not a literal substring of the pattern text.
+        let view = find(r"^\d{3}$", true, false);
+        assert!(highlights(&view, "123"));
+        assert!(!highlights(&view, "12"));
+        // An invalid regex (mid-typing) compiles to nothing rather than erroring.
+        assert!(highlight_matcher(&find("(", true, false)).is_none());
     }
 
     #[test]

@@ -15,7 +15,7 @@
 //! decoded value, so byte-fidelity is a faithful *rendering* the [`Cell`] then carries unchanged
 //! through search / sort / export.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -252,7 +252,7 @@ impl ViewportSource for JsonTable {
                 None => contiguous_rows(request.rows),
             }
         };
-        self.fetch_data_rows(&data_rows, &request.columns, request.rows.start, cancel)
+        self.fetch_data_rows(&data_rows, &request.columns, cancel)
     }
 
     fn fetch_source(
@@ -261,7 +261,7 @@ impl ViewportSource for JsonTable {
         cancel: &CancellationToken,
     ) -> Result<Viewport> {
         let data_rows = contiguous_rows(request.rows);
-        self.fetch_data_rows(&data_rows, &request.columns, request.rows.start, cancel)
+        self.fetch_data_rows(&data_rows, &request.columns, cancel)
     }
 
     fn data_quality(&self) -> DataQuality {
@@ -299,10 +299,13 @@ impl ViewportSource for JsonTable {
         let building = Arc::clone(&self.view_building);
         thread::spawn(move || {
             let built = build_view(source.bytes(), records, &columns, matcher, sort, &cancel);
-            if let Ok(rows) = built
-                && !cancel.is_cancelled()
-            {
-                *view.lock().expect("view lock") = Some(rows);
+            if let Ok(rows) = built {
+                // Re-check cancellation under the view lock so a cancelled build can't overwrite a
+                // view the user just cleared (clear/identity-set_view cancel then lock to set None).
+                let mut guard = view.lock().expect("view lock");
+                if !cancel.is_cancelled() {
+                    *guard = Some(rows);
+                }
             }
             building.store(false, Ordering::Relaxed);
         });
@@ -329,60 +332,53 @@ impl JsonTable {
         &self,
         data_rows: &[u64],
         columns: &[ColumnId],
-        stream_start: u64,
         cancel: &CancellationToken,
     ) -> Result<Viewport> {
         let bytes = self.source.bytes();
         let guard = self.index.lock().expect("index lock");
         let Some(index) = guard.as_ref() else {
             drop(guard);
-            let len = u32::try_from(data_rows.len()).unwrap_or(u32::MAX);
-            return Ok(self.fetch_streaming(
-                RowRange {
-                    start: stream_start,
-                    len,
-                },
-                columns,
-                cancel,
-            ));
+            return Ok(self.fetch_streaming(data_rows, columns, cancel));
         };
         let total = index.row_count;
-        let mut rows = Vec::new();
+        let mut rows = Vec::with_capacity(data_rows.len());
         for &data_row in data_rows {
             if cancel.is_cancelled() {
                 return Err(Error::Cancelled);
             }
-            if data_row >= total {
-                continue;
-            }
-            let offset = index
-                .offset_of_row(bytes, self.records, data_row)
-                .expect("a row below the total has an indexed offset");
-            let value = record_value(bytes, self.records, offset);
-            rows.push(project(value.as_ref(), columns, &self.columns));
+            // Degrade to an empty row rather than panicking if a (stale-index) offset can't resolve.
+            let cells = (data_row < total)
+                .then(|| index.offset_of_row(bytes, self.records, data_row))
+                .flatten()
+                .map_or_else(
+                    || empty_row(columns),
+                    |offset| {
+                        let value = record_value(bytes, self.records, offset);
+                        project(value.as_ref(), columns, &self.columns)
+                    },
+                );
+            rows.push(cells);
         }
         Ok(Viewport { rows })
     }
 
-    /// Serve `rows` by scanning forward from the head — used before the index is ready.
+    /// Serve the requested `data_rows` by scanning forward from the head — used before the index is
+    /// ready. Resolves by record index, so an active filter/sort view is correct in the gap too.
     fn fetch_streaming(
         &self,
-        rows: RowRange,
+        data_rows: &[u64],
         columns: &[ColumnId],
         cancel: &CancellationToken,
     ) -> Viewport {
+        let Some(&max_data_row) = data_rows.iter().max() else {
+            return Viewport::default();
+        };
+        let wanted: HashSet<u64> = data_rows.iter().copied().collect();
+        let mut found: HashMap<u64, Vec<Cell>> = HashMap::with_capacity(data_rows.len());
         let bytes = self.source.bytes();
         let mut pos = self.records.body_start;
-        let mut skipped = 0u64;
-        while skipped < rows.start {
-            match self.records.next(bytes, pos) {
-                Some((_, _, next)) => pos = next,
-                None => return Viewport::default(),
-            }
-            skipped += 1;
-        }
-        let mut out = Vec::new();
-        for _ in 0..rows.len {
+        let mut row = 0u64;
+        while row <= max_data_row {
             if cancel.is_cancelled() {
                 break;
             }
@@ -390,10 +386,17 @@ impl JsonTable {
                 break;
             };
             pos = next;
-            let value = serde_json::from_slice::<Value>(&bytes[start..end]).ok();
-            out.push(project(value.as_ref(), columns, &self.columns));
+            if wanted.contains(&row) {
+                let value = serde_json::from_slice::<Value>(&bytes[start..end]).ok();
+                found.insert(row, project(value.as_ref(), columns, &self.columns));
+            }
+            row += 1;
         }
-        Viewport { rows: out }
+        let rows = data_rows
+            .iter()
+            .map(|dr| found.get(dr).cloned().unwrap_or_else(|| empty_row(columns)))
+            .collect();
+        Viewport { rows }
     }
 }
 
@@ -487,6 +490,12 @@ fn render_column(value: Option<&Value>, columns: &[ColumnKey], column: ColumnId)
         },
         None => value.map(render_value).unwrap_or_default(),
     }
+}
+
+/// A row of empty cells, one per requested column — the placeholder for a row that can't be served
+/// (missing from a streamed window, or a stale-index offset that failed to resolve).
+fn empty_row(columns: &[ColumnId]) -> Vec<Cell> {
+    columns.iter().map(|_| Cell(Box::default())).collect()
 }
 
 /// Project a parsed record onto the requested columns, in order, as rendered text cells.

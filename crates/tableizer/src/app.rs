@@ -1,21 +1,43 @@
 //! The eframe application: window state, theme/font installation, file opening, and the per-frame
 //! update loop that lays out the menu bar, toolbar, table, and status bar.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use eframe::egui;
 use encoding_rs::Encoding;
-use tableizer_core::parse::Dialect;
+use tableizer_core::{
+    CancellationToken, ColumnId, ExportScope, RowCount, Schema, ViewportSource, parse::Dialect,
+};
 
 use crate::model::{
-    Format, GridLayout, LoadedTable, SavedView, View, ViewControls, delimiter_display,
+    Format, GridLayout, LoadedTable, SavedView, SharedTable, View, ViewControls, delimiter_display,
     detect_format, open_table, sniff_file,
 };
 use crate::persist::{prefs, recent, views};
 use crate::ui::{
-    columns_tab, empty_view, grid, menu_bar, parsing_tab, settings_tab, status_bar, toolbar,
+    ExportKind, ExportRequest, columns_tab, empty_view, fmt_count, grid, menu_bar, parsing_tab,
+    settings_tab, status_bar, toolbar,
 };
 use crate::{fonts, theme};
+
+/// A running (or just-finished) export, driven on a background thread so a multi-GB write never
+/// blocks the UI (the Tier-C contract: async, progress within ~100 ms, cancellable). The UI polls
+/// `progress`/`outcome` each frame and offers a Cancel button (see [`TableizerApp::show_export`]).
+struct ExportJob {
+    /// File name being written, for the progress dialog.
+    file_name: String,
+    /// Rows written so far (published by the engine's export loop).
+    progress: Arc<AtomicU64>,
+    /// Total rows to write (known up front — export is gated on a complete index).
+    total: u64,
+    /// Cancels the export thread when the user hits Cancel (or a new export starts).
+    cancel: CancellationToken,
+    /// `None` while running; `Some(Ok)` on success, `Some(Err)` with a message on failure.
+    outcome: Arc<Mutex<Option<Result<(), String>>>>,
+}
 
 pub(crate) struct TableizerApp {
     pub(crate) view: View,
@@ -39,6 +61,8 @@ pub(crate) struct TableizerApp {
     pub(crate) panel_open: bool,
     /// Which tab the right-side panel shows.
     pub(crate) panel_tab: PanelTab,
+    /// The in-flight (or just-finished) export, if any — driven on a background thread.
+    export_job: Option<ExportJob>,
 }
 
 /// Which tab the right-side panel shows. Columns and Parsing need a loaded file (Parsing only for
@@ -89,6 +113,7 @@ impl TableizerApp {
             font_mono_only: false,
             panel_open: false,
             panel_tab: PanelTab::default(),
+            export_job: None,
         };
         if let Some(path) = path {
             app.open_path(path);
@@ -219,6 +244,138 @@ impl TableizerApp {
             ),
         }
     }
+
+    /// Whether an export thread is still running (its outcome isn't in yet).
+    fn export_running(&self) -> bool {
+        self.export_job
+            .as_ref()
+            .is_some_and(|j| j.outcome.lock().expect("export outcome lock").is_none())
+    }
+
+    /// Begin exporting the loaded table to a user-chosen file, on a background thread. The columns +
+    /// names are gathered here (they need the loaded table); the native save dialog runs on the UI
+    /// thread; then the actual write — potentially minutes on a huge file — happens off-thread,
+    /// reporting progress and cancellable, per the Tier-C contract.
+    fn start_export(&mut self, scope: ExportScope, kind: ExportKind, ctx: &egui::Context) {
+        if self.export_running() {
+            return; // one export at a time
+        }
+        let View::Loaded(loaded) = &self.view else {
+            return;
+        };
+        let schema = loaded.table.schema();
+        let columns: Vec<ColumnId> = match scope {
+            ExportScope::CurrentView => loaded.layout.displayed(),
+            ExportScope::Source => (0..schema.columns.len() as u32).map(ColumnId).collect(),
+        };
+        // Names (CSV header / NDJSON keys / Parquet columns) are the *raw* source bytes, so they
+        // match the exported cells (also raw bytes) regardless of the display encoding.
+        let names: Vec<Vec<u8>> = columns.iter().map(|&c| raw_name(schema, c)).collect();
+        let has_header = loaded.dialect.has_header;
+        let total = match loaded.table.row_count() {
+            RowCount::Exact(n) | RowCount::AtLeast(n) => n,
+        };
+        let table: SharedTable = Arc::clone(&loaded.table);
+
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name(format!("export.{}", kind.extension()))
+            .save_file()
+        else {
+            return; // user cancelled the save dialog
+        };
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+
+        let cancel = CancellationToken::new();
+        let progress = Arc::new(AtomicU64::new(0));
+        let outcome: Arc<Mutex<Option<Result<(), String>>>> = Arc::new(Mutex::new(None));
+        self.export_job = Some(ExportJob {
+            file_name,
+            progress: Arc::clone(&progress),
+            total,
+            cancel: cancel.clone(),
+            outcome: Arc::clone(&outcome),
+        });
+
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = run_export(
+                table.as_ref(),
+                &path,
+                kind,
+                scope,
+                &columns,
+                &names,
+                has_header,
+                &cancel,
+                &progress,
+            );
+            *outcome.lock().expect("export outcome lock") = Some(result);
+            ctx.request_repaint(); // wake the idle UI to show the result
+        });
+    }
+
+    /// Render the export dialog (progress + Cancel while running; result + dismiss when done).
+    fn show_export(&mut self, ctx: &egui::Context) {
+        let Some(job) = &self.export_job else {
+            return;
+        };
+        let outcome = job.outcome.lock().expect("export outcome lock").clone();
+        let mut dismiss = false;
+        egui::Window::new("Export")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_width(280.0);
+                match &outcome {
+                    None => {
+                        let done = job.progress.load(Ordering::Relaxed);
+                        ui.label(format!("Exporting {}…", job.file_name));
+                        ui.add_space(4.0);
+                        let frac = if job.total > 0 {
+                            done as f32 / job.total as f32
+                        } else {
+                            0.0
+                        };
+                        ui.add(egui::ProgressBar::new(frac).show_percentage());
+                        ui.add_space(2.0);
+                        ui.label(format!(
+                            "{} / {} rows",
+                            fmt_count(done),
+                            fmt_count(job.total)
+                        ));
+                        ui.add_space(6.0);
+                        if ui.button("Cancel").clicked() {
+                            job.cancel.cancel();
+                        }
+                        ctx.request_repaint(); // keep the progress bar moving
+                    }
+                    Some(Ok(())) => {
+                        ui.label(format!("Exported {}.", job.file_name));
+                        ui.add_space(6.0);
+                        dismiss = ui.button("Done").clicked();
+                    }
+                    Some(Err(error)) => {
+                        if job.cancel.is_cancelled() {
+                            ui.label("Export cancelled.");
+                        } else {
+                            ui.colored_label(
+                                ui.visuals().error_fg_color,
+                                format!("Export failed: {error}"),
+                            );
+                        }
+                        ui.add_space(6.0);
+                        dismiss = ui.button("Close").clicked();
+                    }
+                }
+            });
+        if dismiss {
+            self.export_job = None;
+        }
+    }
 }
 
 impl eframe::App for TableizerApp {
@@ -231,6 +388,9 @@ impl eframe::App for TableizerApp {
             self.font_families = families;
             self.font_rx = None;
         }
+
+        // A running/finished export shows its own progress dialog (cancellable, off the UI thread).
+        self.show_export(&ctx);
 
         // Resolve the theme (following the OS for `Auto`) and restyle only when it changes.
         let system_dark = ctx.system_theme().is_none_or(|t| t == egui::Theme::Dark);
@@ -258,6 +418,7 @@ impl eframe::App for TableizerApp {
         }
 
         let mut to_open: Option<PathBuf> = None;
+        let mut to_export: Option<ExportRequest> = None;
         let theme_before = self.theme.clone();
         let dialect_before = match &self.view {
             View::Loaded(loaded) => Some(loaded.dialect),
@@ -305,7 +466,7 @@ impl eframe::App for TableizerApp {
             egui::MenuBar::new()
                 .style(crate::ui::wide_menu)
                 .config(egui::containers::menu::MenuConfig::new().style(crate::ui::wide_menu))
-                .ui(ui, |ui| menu_bar(ui, self, &mut to_open));
+                .ui(ui, |ui| menu_bar(ui, self, &mut to_open, &mut to_export));
         });
 
         if matches!(self.view, View::Loaded(_)) {
@@ -343,8 +504,14 @@ impl eframe::App for TableizerApp {
         if let View::Loaded(loaded) = &mut self.view {
             if Some(loaded.dialect) != dialect_before {
                 if let Ok(reopened) = open_table(&loaded.path, loaded.format, loaded.dialect) {
+                    // Keep the user's column order/visibility across a re-open when the column count
+                    // is unchanged (e.g. toggling the header row). Only reset the layout when the new
+                    // dialect actually changed the column structure (e.g. a different delimiter).
+                    let new_count = reopened.schema().columns.len();
+                    if new_count != loaded.layout.order.len() {
+                        loaded.layout = GridLayout::new(new_count);
+                    }
                     loaded.table = reopened;
-                    loaded.layout = GridLayout::new(loaded.table.schema().columns.len());
                 }
             } else {
                 let desired = loaded.view.desired();
@@ -397,6 +564,9 @@ impl eframe::App for TableizerApp {
             // order/visibility live in our own `GridLayout`, so they're unaffected.
             ctx.data_mut(|d| d.remove_by_type::<egui_table::TableState>());
         }
+        if let Some((scope, kind)) = to_export {
+            self.start_export(scope, kind, &ctx);
+        }
     }
 
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
@@ -425,6 +595,74 @@ fn close_button(ui: &mut egui::Ui) -> egui::Response {
     ui.painter()
         .line_segment([c + egui::vec2(-r, r), c + egui::vec2(r, -r)], stroke);
     response.on_hover_text("Close panel")
+}
+
+/// Create the export file and run the chosen writer (off the UI thread), reporting `progress` and
+/// honouring `cancel`. On any failure — including cancellation — the partial file is removed, so a
+/// cancelled or failed export never leaves a truncated file behind.
+#[allow(clippy::too_many_arguments)]
+fn run_export(
+    table: &dyn ViewportSource,
+    path: &Path,
+    kind: ExportKind,
+    scope: ExportScope,
+    columns: &[ColumnId],
+    names: &[Vec<u8>],
+    has_header: bool,
+    cancel: &CancellationToken,
+    progress: &AtomicU64,
+) -> Result<(), String> {
+    use tableizer_core::export;
+    let result = std::fs::File::create(path)
+        .map_err(|e| e.to_string())
+        .and_then(|file| {
+            let writer = std::io::BufWriter::new(file);
+            match kind {
+                ExportKind::Csv | ExportKind::Tsv => {
+                    let delimiter = if matches!(kind, ExportKind::Tsv) {
+                        b'\t'
+                    } else {
+                        b','
+                    };
+                    // Write a header row only if the source had one (else names are synthetic).
+                    let header = has_header.then(|| names.to_vec());
+                    export::export_csv(
+                        table,
+                        writer,
+                        delimiter,
+                        scope,
+                        columns,
+                        header.as_deref(),
+                        cancel,
+                        progress,
+                    )
+                }
+                ExportKind::Ndjson => {
+                    export::export_ndjson(table, writer, scope, columns, names, cancel, progress)
+                }
+                ExportKind::Parquet => {
+                    export::export_parquet(table, writer, scope, columns, names, cancel, progress)
+                }
+            }
+            .map_err(|e| e.to_string())
+        });
+    if result.is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+    result
+}
+
+/// The raw source bytes of column `id`'s name, with a leading UTF-8 BOM stripped (the BOM is a file
+/// marker, not part of the name). Empty for an unknown column — `export.rs` falls back to `colN`.
+fn raw_name(schema: &Schema, id: ColumnId) -> Vec<u8> {
+    let Some(col) = schema.columns.get(id.0 as usize) else {
+        return Vec::new();
+    };
+    let bytes = col.name.as_ref();
+    bytes
+        .strip_prefix(&[0xEF, 0xBB, 0xBF])
+        .unwrap_or(bytes)
+        .to_vec()
 }
 
 /// Quit — the standard per-OS shortcut (⌘Q on macOS, Ctrl+Q elsewhere).

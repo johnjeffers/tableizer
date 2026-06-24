@@ -3,7 +3,14 @@
 //! To be built on the `csv` / `csv-core` crates using *byte* records, so the canonical cell value
 //! is always the exact source bytes. Encoding handling (BOM-aware, via `encoding_rs`) is
 //! lossy-but-*visible*: undecodable bytes render as U+FFFD and are counted, never silently dropped,
-//! never panicked on. A max-field / max-record guard defends against single-field DoS.
+//! never panicked on.
+//!
+//! [`MAX_RECORD_BYTES`] caps how many bytes a single record may span on the **random-access** parse
+//! paths (schema derivation, type inference, viewport fetch): a pathological row — e.g. one
+//! unterminated quoted field spanning the whole file — is truncated at the cap rather than read
+//! whole into memory, so scrolling can't be made to OOM by one bad record. The streaming full-index
+//! build and the in-memory view scan do **not** yet enforce this bound (they use the high-level `csv`
+//! reader, which has no per-record cap); hardening those via a `csv-core` loop is future work.
 
 /// The dialect describing how to split a file into records and fields. Auto-detected as an
 /// *editable default*, never a silent authority (sampled from multiple regions, not just the head).
@@ -16,6 +23,11 @@ pub struct Dialect {
     /// Whether the first record is a header row.
     pub has_header: bool,
 }
+
+/// Maximum bytes a single record may span on the random-access parse paths before it is truncated
+/// (resource-exhaustion guard for untrusted input — see the module docs). Generous (64 MiB) so real
+/// rows are never affected; only a pathological unterminated field hits it.
+pub(crate) const MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
 
 impl Default for Dialect {
     fn default() -> Self {

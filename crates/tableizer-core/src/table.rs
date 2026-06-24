@@ -8,13 +8,14 @@
 //! Cells hold the exact field bytes the parser yields — type inference is presentational only and
 //! never mutates them (the byte-fidelity invariant — see `AGENTS.md`).
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::index::{OffsetIndex, record_reader};
-use crate::parse::Dialect;
+use crate::parse::{Dialect, MAX_RECORD_BYTES};
 use crate::search::Matcher;
 use crate::source::{Source, map_file};
 use crate::{
@@ -151,7 +152,7 @@ impl ViewportSource for CsvTable {
                 None => contiguous_rows(request.rows),
             }
         };
-        self.fetch_data_rows(&data_rows, &request.columns, request.rows.start, cancel)
+        self.fetch_data_rows(&data_rows, &request.columns, cancel)
     }
 
     fn fetch_source(
@@ -161,7 +162,7 @@ impl ViewportSource for CsvTable {
     ) -> Result<Viewport> {
         // Source order, ignoring any active filter/sort: data rows are exactly the display range.
         let data_rows = contiguous_rows(request.rows);
-        self.fetch_data_rows(&data_rows, &request.columns, request.rows.start, cancel)
+        self.fetch_data_rows(&data_rows, &request.columns, cancel)
     }
 
     fn data_quality(&self) -> DataQuality {
@@ -211,10 +212,15 @@ impl ViewportSource for CsvTable {
                 sort,
                 &cancel,
             );
-            if let Ok(rows) = built
-                && !cancel.is_cancelled()
-            {
-                *view.lock().expect("view lock") = Some(rows);
+            if let Ok(rows) = built {
+                // Re-check cancellation while holding the view lock. `clear_view` / an identity
+                // `set_view` cancel first and *then* take this lock to install `None`, so checking
+                // under the lock makes the store atomic with "is this result still wanted" — a
+                // cancelled build can't resurrect a view the user just cleared.
+                let mut guard = view.lock().expect("view lock");
+                if !cancel.is_cancelled() {
+                    *guard = Some(rows);
+                }
             }
             building.store(false, Ordering::Relaxed);
         });
@@ -241,42 +247,43 @@ impl CsvTable {
         &self,
         data_rows: &[u64],
         columns: &[ColumnId],
-        stream_start: u64,
         cancel: &CancellationToken,
     ) -> Result<Viewport> {
         let bytes = self.source.bytes();
         let guard = self.index.lock().expect("index lock");
         let Some(index) = guard.as_ref() else {
-            // Index not ready → stream the head (sort/filter/export are UI-gated on a full index).
+            // Index not ready → stream from the head, resolving each *data-row* index. Doing it by
+            // data-row (not the raw display range) keeps an active filter/sort correct in the brief
+            // gap before the index lands, instead of falling back to source order.
             drop(guard);
-            let len = u32::try_from(data_rows.len()).unwrap_or(u32::MAX);
             return fetch_streaming(
                 bytes,
                 &self.dialect,
-                RowRange {
-                    start: stream_start.saturating_add(self.header_rows),
-                    len,
-                },
+                self.header_rows,
+                data_rows,
                 columns,
                 cancel,
             );
         };
         let total_physical = index.row_count();
-        let mut rows = Vec::new();
+        let mut rows = Vec::with_capacity(data_rows.len());
         for &data_row in data_rows {
             if cancel.is_cancelled() {
                 return Err(Error::Cancelled);
             }
             let phys = data_row.saturating_add(self.header_rows);
-            if phys >= total_physical {
-                continue;
-            }
-            let offset = index
-                .offset_of_row(bytes, phys)
-                .expect("a row below the total has an indexed offset");
-            let record = parse_one_record(&bytes[offset as usize..], &self.dialect)
-                .expect("a record exists at an indexed offset");
-            rows.push(project_record(&record, columns));
+            // A stale-but-undetected index (file changed under an identical size+mtime) could hand
+            // back an out-of-range or unparseable offset. Degrade to an empty row rather than
+            // panicking — a wrong fetch must never crash a data viewer.
+            let cells = (phys < total_physical)
+                .then(|| index.offset_of_row(bytes, phys))
+                .flatten()
+                .and_then(|offset| parse_one_record(&bytes[offset as usize..], &self.dialect))
+                .map_or_else(
+                    || empty_row(columns),
+                    |record| project_record(&record, columns),
+                );
+            rows.push(cells);
         }
         Ok(Viewport { rows })
     }
@@ -357,40 +364,52 @@ fn spawn_index_build(
     });
 }
 
-/// Serve `rows` by parsing forward from the head — the path used before the index is ready. O(start),
-/// so it is cheap for the first screens and degrades for deep jumps until the index lands.
+/// Serve the requested `data_rows` by parsing forward from the head — the path used before the index
+/// is ready. Resolves by data-row index (not a contiguous range), so it is correct for an active
+/// filter/sort view as well as source order. O(max data-row), so it is cheap for the first screens
+/// and degrades for deep jumps until the index lands.
 fn fetch_streaming(
     bytes: &[u8],
     dialect: &Dialect,
-    rows: RowRange,
+    header_rows: u64,
+    data_rows: &[u64],
     columns: &[ColumnId],
     cancel: &CancellationToken,
 ) -> Result<Viewport> {
+    let Some(&max_data_row) = data_rows.iter().max() else {
+        return Ok(Viewport::default());
+    };
+    let wanted: HashSet<u64> = data_rows.iter().copied().collect();
+    let mut found: HashMap<u64, Vec<Cell>> = HashMap::with_capacity(data_rows.len());
     let mut reader = record_reader(bytes, dialect);
     let mut record = csv::ByteRecord::new();
-
-    let mut skipped = 0u64;
-    while skipped < rows.start {
-        if cancel.is_cancelled() {
-            return Err(Error::Cancelled);
-        }
-        if !reader.read_byte_record(&mut record).map_err(parse_io)? {
-            return Ok(Viewport::default());
-        }
-        skipped += 1;
-    }
-
-    let mut out = Vec::new();
-    for _ in 0..rows.len {
+    let mut phys = 0u64;
+    let max_phys = max_data_row.saturating_add(header_rows);
+    while phys <= max_phys {
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
         if !reader.read_byte_record(&mut record).map_err(parse_io)? {
             break;
         }
-        out.push(project_record(&record, columns));
+        if let Some(data_row) = phys.checked_sub(header_rows)
+            && wanted.contains(&data_row)
+        {
+            found.insert(data_row, project_record(&record, columns));
+        }
+        phys += 1;
     }
-    Ok(Viewport { rows: out })
+    let rows = data_rows
+        .iter()
+        .map(|dr| found.get(dr).cloned().unwrap_or_else(|| empty_row(columns)))
+        .collect();
+    Ok(Viewport { rows })
+}
+
+/// A row of empty cells, one per requested column — the placeholder for a row that can't be served
+/// (missing from a streamed window, or an offset that failed to parse against a stale index).
+fn empty_row(columns: &[ColumnId]) -> Vec<Cell> {
+    columns.iter().map(|_| Cell(Box::default())).collect()
 }
 
 /// Project a record onto the requested columns, in order, as byte-faithful cells.
@@ -437,7 +456,8 @@ const TYPE_SAMPLE_ROWS: usize = 200;
 /// column is `Integer`/`Float`/`Boolean` only if every non-empty sampled value fits (empties are
 /// treated as nulls and never disqualify a type); otherwise `Text`. Never mutates cell bytes.
 fn infer_column_types(bytes: &[u8], dialect: &Dialect, column_count: usize) -> Vec<InferredType> {
-    let mut reader = record_reader(bytes, dialect);
+    // Cap the sampled head so a pathological giant first field can't balloon inference into memory.
+    let mut reader = record_reader(bounded(bytes), dialect);
     let mut record = csv::ByteRecord::new();
     let mut all_int = vec![true; column_count];
     let mut all_float = vec![true; column_count];
@@ -488,15 +508,21 @@ fn infer_column_types(bytes: &[u8], dialect: &Dialect, column_count: usize) -> V
         .collect()
 }
 
-/// Parse exactly one record from the start of `bytes`.
+/// Parse exactly one record from the start of `bytes`. The input is capped at [`MAX_RECORD_BYTES`]
+/// so a single unterminated field can't be read whole into memory on the random-access path.
 fn parse_one_record(bytes: &[u8], dialect: &Dialect) -> Option<csv::ByteRecord> {
-    let mut reader = record_reader(bytes, dialect);
+    let mut reader = record_reader(bounded(bytes), dialect);
     let mut record = csv::ByteRecord::new();
     if reader.read_byte_record(&mut record).ok()? {
         Some(record)
     } else {
         None
     }
+}
+
+/// The leading slice of `bytes` capped at [`MAX_RECORD_BYTES`] (resource-exhaustion guard).
+fn bounded(bytes: &[u8]) -> &[u8] {
+    &bytes[..bytes.len().min(MAX_RECORD_BYTES)]
 }
 
 /// Map a `csv` read error into our I/O error (malformed-row *content* is not an error here).
@@ -653,7 +679,8 @@ mod tests {
         let streamed = fetch_streaming(
             &data,
             &dialect,
-            RowRange { start: 1, len: 2 },
+            0,
+            &[1, 2],
             &cols,
             &CancellationToken::new(),
         )
@@ -661,6 +688,25 @@ mod tests {
 
         assert_eq!(indexed.rows, streamed.rows);
         assert_eq!(streamed.rows[0][0].0.as_ref(), b"c\nc"); // quoted embedded newline preserved
+    }
+
+    #[test]
+    fn streaming_fallback_resolves_scattered_view_rows() {
+        // The pre-index fallback must honour an active view's row mapping, not just source order:
+        // requesting data-rows [2, 0] returns those rows in that order (with header skipped).
+        let data = b"h\nr0\nr1\nr2\n".to_vec();
+        let cols = [ColumnId(0)];
+        let streamed = fetch_streaming(
+            &data,
+            &Dialect::default(),
+            1, // one header row
+            &[2, 0],
+            &cols,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(streamed.rows[0][0].0.as_ref(), b"r2");
+        assert_eq!(streamed.rows[1][0].0.as_ref(), b"r0");
     }
 
     #[test]

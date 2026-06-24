@@ -163,10 +163,13 @@ impl ViewportSource for ParquetTable {
         let building = Arc::clone(&self.view_building);
         thread::spawn(move || {
             let built = build_view(&path, &meta, matcher, sort, &cancel);
-            if let Ok(rows) = built
-                && !cancel.is_cancelled()
-            {
-                *view.lock().expect("view lock") = Some(rows);
+            if let Ok(rows) = built {
+                // Re-check cancellation under the view lock so a cancelled build can't overwrite a
+                // view the user just cleared (clear/identity-set_view cancel then lock to set None).
+                let mut guard = view.lock().expect("view lock");
+                if !cancel.is_cancelled() {
+                    *guard = Some(rows);
+                }
             }
             building.store(false, Ordering::Relaxed);
         });
