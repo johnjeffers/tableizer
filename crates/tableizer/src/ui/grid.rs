@@ -39,8 +39,11 @@ pub(crate) fn grid(ui: &mut egui::Ui, loaded: &mut LoadedTable, palette: &theme:
         .collect();
     let table_columns: Vec<egui_table::Column> = (0..displayed.len())
         .map(|_| {
+            // `range.min` is the floor a manual resize is clamped to (egui_table grows a column to
+            // fit content otherwise) — keep it small so a column can be dragged narrow (content just
+            // truncates) and isn't sized back up; the grip stays grabbable. Max caps auto-fit width.
             egui_table::Column::new(180.0)
-                .range(64.0..=900.0)
+                .range(24.0..=900.0)
                 .resizable(true)
         })
         .collect();
@@ -140,6 +143,15 @@ pub(crate) fn grid(ui: &mut egui::Ui, loaded: &mut LoadedTable, palette: &theme:
         header_band.bottom() - 0.5,
         egui::Stroke::new(1.0, palette.border),
     );
+
+    // egui_table auto-fits every column to its content whenever it has no stored state ("is_new").
+    // Seed an (empty) default state so that pass never runs: columns keep their default width and
+    // only change when the user drags a separator (or double-clicks one to fit that column). This is
+    // a no-op once a state exists, so manually-set widths are preserved.
+    let table_state_id = egui_table::TableState::id(ui, egui::Id::new("tableizer-grid"));
+    if egui_table::TableState::load(ui.ctx(), table_state_id).is_none() {
+        egui_table::TableState::default().store(ui.ctx(), table_state_id);
+    }
 
     grid.show(ui, &mut delegate);
 
@@ -520,23 +532,35 @@ impl egui_table::TableDelegate for GridDelegate<'_> {
             )
         }
         .selectable(false);
-        // During the auto-size (sizing) pass, measure the full text rather than truncating, so a
-        // double-clicked separator fits the widest value.
-        let label = if ui.is_sizing_pass() {
-            label.wrap_mode(egui::TextWrapMode::Extend)
-        } else {
-            label.truncate()
-        };
-        // 10px of padding on both sides so text never touches the column edge (and so auto-size
-        // leaves the same margin); numeric columns align right.
+        // 10px of padding on both sides so text never touches the column edge; numeric columns align
+        // right.
         let layout = if numeric {
             egui::Layout::right_to_left(egui::Align::Center)
         } else {
             egui::Layout::left_to_right(egui::Align::Center)
         };
         ui.with_layout(layout, |ui| {
+            // Zero item-spacing so the explicit `add_space`s are the only horizontal padding.
+            ui.spacing_mut().item_spacing.x = 0.0;
             ui.add_space(10.0);
-            ui.add(label);
+            if ui.is_sizing_pass() {
+                // Auto-size (double-clicked separator) measures the full text.
+                ui.add(label.wrap_mode(egui::TextWrapMode::Extend));
+            } else {
+                // Constrain the truncated text to leave room for the trailing pad, so the cell's
+                // reported min width is exactly the column width — never wider. Otherwise the overshoot
+                // makes egui_table grow the column a little every frame until the text fits (the
+                // "auto-resizing to the text" bug). Keep the column's own layout so alignment is
+                // unchanged (text left-aligned, numeric right-aligned, vertically centered).
+                let text_w = (ui.available_width() - 10.0).max(0.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(text_w, ui.available_height()),
+                    layout,
+                    |ui| {
+                        ui.add(label.truncate());
+                    },
+                );
+            }
             ui.add_space(10.0);
         });
 
