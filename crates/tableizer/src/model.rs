@@ -9,8 +9,9 @@ use std::sync::{Arc, Mutex};
 use encoding_rs::Encoding;
 use tableizer_core::search::Matcher;
 use tableizer_core::{
-    CancellationToken, ColumnId, CsvTable, Direction, FilterSpec, JsonTable, ParquetTable,
-    RowRange, Schema, SortKey, ViewSpec, ViewportRequest, ViewportSource, parse::Dialect,
+    CancellationToken, ColumnId, CsvTable, Direction, FilterSpec, JsonMode, JsonTable,
+    ParquetTable, RowRange, Schema, SortKey, ViewSpec, ViewportRequest, ViewportSource,
+    parse::Dialect,
 };
 
 /// A table behind the [`ViewportSource`] seam, shared (`Arc`) so a background export thread can hold
@@ -24,8 +25,10 @@ pub(crate) type SharedTable = Arc<dyn ViewportSource + Send + Sync>;
 pub(crate) enum Format {
     /// CSV / TSV / arbitrary-separator text (the dialect-driven path).
     Delimited,
-    /// JSON — NDJSON / JSON Lines, or a single top-level JSON array.
-    Json,
+    /// JSON, carrying the detected shape: NDJSON / JSON Lines, or a single top-level array. The mode
+    /// comes from [`tableizer_core::json::sniff`], the same source [`JsonTable::mode`] uses, so the
+    /// status-bar label always matches what the reader parsed.
+    Json(JsonMode),
     /// Apache Parquet.
     Parquet,
 }
@@ -39,8 +42,8 @@ pub(crate) fn detect_format(path: &Path) -> Format {
     if head.starts_with(b"PAR1") {
         return Format::Parquet;
     }
-    if tableizer_core::json::sniff(&head).is_some() {
-        return Format::Json;
+    if let Some(mode) = tableizer_core::json::sniff(&head) {
+        return Format::Json(mode);
     }
     match path
         .extension()
@@ -49,7 +52,9 @@ pub(crate) fn detect_format(path: &Path) -> Format {
         .as_deref()
     {
         Some("parquet" | "pqt") => Format::Parquet,
-        Some("ndjson" | "jsonl") => Format::Json,
+        // The extension fallback fires only when the content didn't classify (e.g. an empty file);
+        // a `.ndjson`/`.jsonl` extension implies NDJSON, matching `JsonTable`'s `Lines` default.
+        Some("ndjson" | "jsonl") => Format::Json(JsonMode::Lines),
         _ => Format::Delimited,
     }
 }
@@ -188,7 +193,7 @@ pub(crate) fn open_table(
         Format::Delimited => CsvTable::open(path, dialect)
             .map(|t| Arc::new(t) as SharedTable)
             .map_err(|e| e.to_string()),
-        Format::Json => JsonTable::open(path)
+        Format::Json(_) => JsonTable::open(path)
             .map(|t| Arc::new(t) as SharedTable)
             .map_err(|e| e.to_string()),
         Format::Parquet => ParquetTable::open(path)
@@ -212,7 +217,8 @@ pub(crate) fn delimiter_display(delimiter: u8) -> String {
 pub(crate) fn format_label(format: Format, dialect: &Dialect) -> String {
     match format {
         Format::Parquet => "Parquet".to_string(),
-        Format::Json => "JSON".to_string(),
+        Format::Json(JsonMode::Lines) => "NDJSON".to_string(),
+        Format::Json(JsonMode::Array) => "JSON (array)".to_string(),
         Format::Delimited => match dialect.delimiter {
             b',' => "CSV".to_string(),
             b'\t' => "TSV".to_string(),
@@ -500,20 +506,29 @@ mod tests {
         // With no content to sniff, the extension decides (these files are empty on disk).
         assert_eq!(detect_with("parquet", b""), Format::Parquet);
         assert_eq!(detect_with("PQT", b""), Format::Parquet);
-        assert_eq!(detect_with("ndjson", b""), Format::Json);
-        assert_eq!(detect_with("JSONL", b""), Format::Json);
+        assert_eq!(detect_with("ndjson", b""), Format::Json(JsonMode::Lines));
+        assert_eq!(detect_with("JSONL", b""), Format::Json(JsonMode::Lines));
         assert_eq!(detect_with("csv", b""), Format::Delimited);
         assert_eq!(detect_with("unknown_ext_zz", b""), Format::Delimited);
     }
 
     #[test]
     fn detect_format_routes_json_by_content_regardless_of_extension() {
-        // The reported bug: NDJSON content in a `.json` file must be JSON, not CSV.
-        assert_eq!(detect_with("json", b"{\"a\":1}\n{\"a\":2}\n"), Format::Json);
-        // A top-level array in a `.json` file is JSON too.
-        assert_eq!(detect_with("json", b"[{\"a\":1},{\"a\":2}]"), Format::Json);
+        // The reported bug: NDJSON content in a `.json` file must be JSON (Lines), not CSV.
+        assert_eq!(
+            detect_with("json", b"{\"a\":1}\n{\"a\":2}\n"),
+            Format::Json(JsonMode::Lines)
+        );
+        // A top-level array in a `.json` file is JSON too, detected as the Array shape.
+        assert_eq!(
+            detect_with("json", b"[{\"a\":1},{\"a\":2}]"),
+            Format::Json(JsonMode::Array)
+        );
         // Content wins over a misleading extension (NDJSON named `.csv`).
-        assert_eq!(detect_with("csv", b"{\"a\":1}\n{\"a\":2}\n"), Format::Json);
+        assert_eq!(
+            detect_with("csv", b"{\"a\":1}\n{\"a\":2}\n"),
+            Format::Json(JsonMode::Lines)
+        );
         // Real delimited content stays delimited even with a `.json` extension.
         assert_eq!(
             detect_with("json", b"name,age\nbob,30\n"),
@@ -530,7 +545,15 @@ mod tests {
     fn format_label_names_each_format() {
         let comma = Dialect::default();
         assert_eq!(format_label(Format::Parquet, &comma), "Parquet");
-        assert_eq!(format_label(Format::Json, &comma), "JSON");
+        // JSON distinguishes its two shapes (the engine's detected `JsonMode`).
+        assert_eq!(
+            format_label(Format::Json(JsonMode::Lines), &comma),
+            "NDJSON"
+        );
+        assert_eq!(
+            format_label(Format::Json(JsonMode::Array), &comma),
+            "JSON (array)"
+        );
         // Delimited is named by its delimiter.
         assert_eq!(format_label(Format::Delimited, &comma), "CSV");
         let tab = Dialect {
