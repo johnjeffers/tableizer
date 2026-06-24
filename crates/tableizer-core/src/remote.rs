@@ -21,14 +21,92 @@
 //! SSO works: `object_store` has no SSO support, so we resolve the temporary credentials ourselves and
 //! hand them in as static options.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use futures::StreamExt;
 use object_store::{ObjectStore, ObjectStoreExt};
 use url::Url;
 
 use crate::{CancellationToken, Error, Result};
+
+/// Per-bucket S3 region cache. S3 buckets are region-specific, but one credential set (e.g. an SSO
+/// role) can read buckets in many regions — so we discover each bucket's region once and reuse it.
+fn region_cache() -> &'static Mutex<HashMap<String, String>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The bucket name of an S3 URL (`s3://bucket/key` → `bucket`), else `None`.
+fn s3_bucket(url: &Url) -> Option<String> {
+    matches!(url.scheme(), "s3" | "s3a")
+        .then(|| url.host_str().map(str::to_owned))
+        .flatten()
+}
+
+/// Discover `bucket`'s region via S3 `HeadBucket` (which the SDK resolves across regions, returning the
+/// bucket's real region) and cache it. Credentials come from the already-resolved `options`, so no
+/// extra chain/SSO resolution. `None` on any failure — the caller then falls back to the configured
+/// region, so a same-region bucket is unaffected. This is the in-app equivalent of passing `--region`.
+async fn resolve_bucket_region(bucket: &str, options: &[(String, String)]) -> Option<String> {
+    if let Some(region) = region_cache().lock().expect("region cache").get(bucket) {
+        return Some(region.clone());
+    }
+    let opt = |key: &str| {
+        options
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+    };
+    // Reuse aws-config only for the runtime plumbing (HTTP client, sleep); credentials are taken from
+    // `options` (static keys, or chain/SSO-resolved upstream) so SSO isn't resolved again here.
+    let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(aws_config::Region::new("us-east-1"));
+    if let (Some(key), Some(secret)) = (opt("aws_access_key_id"), opt("aws_secret_access_key")) {
+        loader = loader.credentials_provider(aws_credential_types::Credentials::new(
+            key,
+            secret,
+            opt("aws_session_token"),
+            None,
+            "tableizer-resolved",
+        ));
+    }
+    let sdk = loader.load().await;
+    let client = aws_sdk_s3::Client::from_conf(aws_sdk_s3::config::Builder::from(&sdk).build());
+    let region = client
+        .head_bucket()
+        .bucket(bucket)
+        .send()
+        .await
+        .ok()?
+        .bucket_region()?
+        .to_string();
+    region_cache()
+        .lock()
+        .expect("region cache")
+        .insert(bucket.to_string(), region.clone());
+    Some(region)
+}
+
+/// Build the `object_store` for `url`, first resolving an AWS bucket's actual region and overriding it
+/// in the options (a bucket in a non-default region then "just works", as `--region` would on the CLI).
+/// Skipped for non-S3 URLs and for S3-compatible custom endpoints (single-region).
+async fn build_store(
+    url: &Url,
+    options: &[(String, String)],
+) -> Result<(Box<dyn ObjectStore>, object_store::path::Path)> {
+    let mut merged = merge_options(std::env::vars(), options);
+    if let Some(bucket) = s3_bucket(url)
+        && !options.iter().any(|(k, _)| k == "aws_endpoint")
+        && let Some(region) = resolve_bucket_region(&bucket, options).await
+    {
+        merged.push(("aws_region".to_string(), region)); // applied last → wins over the configured one
+    }
+    object_store::parse_url_opts(url, merged)
+        .map_err(|e| Error::Remote(format!("unsupported location: {e}")))
+}
 
 /// One entry in a remote directory listing: a child "folder" (common prefix) or an object (file).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -216,9 +294,6 @@ pub fn list_dir(
     cancel: &CancellationToken,
 ) -> Result<DirListing> {
     let url = Url::parse(location).map_err(|e| Error::Remote(format!("invalid URL: {e}")))?;
-    let (store, prefix) =
-        object_store::parse_url_opts(&url, merge_options(std::env::vars(), options))
-            .map_err(|e| Error::Remote(format!("unsupported location: {e}")))?;
     // The bucket/host root to rebuild absolute URLs from the store-relative keys the listing returns.
     let base = format!("{}://{}", url.scheme(), url.host_str().unwrap_or(""));
 
@@ -229,6 +304,7 @@ pub fn list_dir(
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
+        let (store, prefix) = build_store(&url, options).await?;
         // `list_with_delimiter` returns the prefix's immediate children: common prefixes (folders) and
         // objects (files), rather than a full recursive listing.
         let prefix = (!prefix.as_ref().is_empty()).then_some(prefix);
@@ -342,18 +418,15 @@ pub fn fetch_to_cache(
     cancel: &CancellationToken,
 ) -> Result<PathBuf> {
     let url = Url::parse(target).map_err(|e| Error::Remote(format!("invalid URL: {e}")))?;
-    // `object_store` picks the backend from the scheme; one code path serves every provider. It builds
-    // a *blank* store, so credentials/region are passed as options — the environment first (so the
-    // standard cloud vars + EC2 role/IMDS work), then the in-app form on top.
-    let (store, path) =
-        object_store::parse_url_opts(&url, merge_options(std::env::vars(), options))
-            .map_err(|e| Error::Remote(format!("unsupported location: {e}")))?;
 
     // The engine is sync; drive the async object-store calls on a confined current-thread runtime.
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     runtime.block_on(async move {
+        // `object_store` builds a *blank* store, so credentials/region are passed as options; the
+        // bucket's real region is resolved and applied so a non-default-region bucket just works.
+        let (store, path) = build_store(&url, options).await?;
         let meta = store
             .head(&path)
             .await
@@ -459,6 +532,21 @@ mod tests {
             entries,
             vec![("alpha", "s3://alpha/", true), ("zeta", "s3://zeta/", true),]
         );
+    }
+
+    #[test]
+    fn s3_bucket_extracts_the_host_for_s3_urls_only() {
+        assert_eq!(
+            s3_bucket(&Url::parse("s3://my-bucket/a/b.csv").unwrap()).as_deref(),
+            Some("my-bucket")
+        );
+        assert_eq!(
+            s3_bucket(&Url::parse("s3a://other/x").unwrap()).as_deref(),
+            Some("other")
+        );
+        // Non-S3 schemes have no AWS bucket region to resolve.
+        assert_eq!(s3_bucket(&Url::parse("gs://bucket/x").unwrap()), None);
+        assert_eq!(s3_bucket(&Url::parse("https://h/x").unwrap()), None);
     }
 
     #[test]

@@ -27,19 +27,27 @@
     download-to-cache in the state dir (ETag-keyed, streamed with progress + cancel), then opened like
     a local file. `parse_url` builds a blank store, so credentials are wired explicitly.
   - DONE: cloud file **browser** (File ▸ Browse Cloud…, empty-view button, or the Open-URL dialog's
-    Browse…) — opens to a **bucket list discovered from the credentials** (`remote::list_s3_buckets`
-    via `aws-sdk-s3` ListBuckets, since object_store is bucket-scoped and can't enumerate); click a
-    bucket to enter, then `remote::list_dir` (object_store `list_with_delimiter`) lists folders + files,
-    Up ascends (back to the bucket list at a bucket root), click a file to open. Background-listed with
-    the same credential resolution as opening (SSO/profile/static). NOTE: `aws-sdk-s3` must keep
-    `default-features=false` + `default-https-client` (NOT the default `rustls` feature → legacy
-    rustls 0.21, RUSTSEC-2026-0098/0099/0104). Follow-ups: bucket discovery for GCS/Azure (S3 only
-    now), breadcrumb trail, recent buckets, type-ahead filter, paging very large prefixes.
+    Browse…) — a lazy **hierarchical tree**: opens to **buckets discovered from the credentials**
+    (`remote::list_s3_buckets` via `aws-sdk-s3` ListBuckets, since object_store is bucket-scoped and
+    can't enumerate); expand a bucket/folder to list it (`remote::list_dir`, object_store
+    `list_with_delimiter`), click a file to open. **Expanded subtrees are cached** (`ChildState` in the
+    `BrowseNode` tree) and persist across browser re-opens, so revisiting never re-lists; Refresh
+    re-discovers, and a "go to" field adds a non-discovered bucket / deep prefix as a top-level node.
+    Background-listed (multiple folders concurrently) with the same credential resolution as opening
+    (SSO/profile/static). NOTE: `aws-sdk-s3` must keep `default-features=false` + `default-https-client`
+    (NOT the default `rustls` feature → legacy rustls 0.21, RUSTSEC-2026-0098/0099/0104). Follow-ups:
+    bucket discovery for GCS/Azure (S3 only now), type-ahead filter, paging very large prefixes,
+    persisting the tree across app restarts.
   - DONE: S3 credentials (Settings ▸ Cloud storage), two modes — (1) **AWS chain** (default):
     `remote::aws_credentials` via `aws-config` covers env, `~/.aws` profiles, **SSO** (`aws sso login`
     token cache → temp creds), assume-role, EC2/ECS roles; optional profile + region fields. (2)
     **Static keys** for pasted creds / S3-compatible (MinIO/R2: endpoint + allow-HTTP). Secrets saved
     plaintext-0600 in `cloud.json`.
+  - DONE: **per-bucket region auto-resolution** — S3 buckets are region-specific but one cred set can
+    span regions; before each bucket op the engine resolves the bucket's region via S3 `HeadBucket`
+    (`remote::resolve_bucket_region`, cached per bucket) and passes it to object_store, overriding the
+    configured region. The in-app equivalent of the CLI's `--region`. Skipped for custom endpoints
+    (single-region). On failure it falls back to the configured region (same-region buckets unaffected).
   - Streaming `ReadAt` source — first screen from a head fetch, random access by ranged GET, no full
     download — so multi-TB cloud objects don't require downloading the whole thing. Generalises the
     planned `pread`/SIGBUS seam; download-to-cache is the eager subset of it.

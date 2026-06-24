@@ -120,11 +120,16 @@ options come from one of two sources, chosen in Settings ▸ Cloud storage: (1) 
 **SSO** (the `aws sso login` token cache → temporary credentials), assume-role, and EC2/ECS roles;
 `object_store` has no SSO of its own, so we resolve and pass static temp credentials in. Or (2) a
 **static-keys** form for pasted credentials / S3-compatible stores (MinIO, R2: endpoint + allow-HTTP).
-A **cloud file browser** lets the user pick a file instead of typing a URL: it opens to a bucket list
-discovered from the credentials (`remote::list_s3_buckets`, via `aws-sdk-s3`'s `ListBuckets` — needed
-because `object_store` is bucket-scoped and can't enumerate buckets), then navigates folders/files with
-`remote::list_dir` (`object_store`'s `list_with_delimiter`). All on a background thread with the same
-credential resolution as opening.
+S3 buckets are region-specific, but one credential set (e.g. an SSO role) can span regions, so before
+each bucket operation the engine **resolves the bucket's region** (S3 `HeadBucket`, cached per bucket)
+and passes it to `object_store` — the in-app equivalent of the CLI's `--region`, so a bucket in a
+non-default region just works.
+A **cloud file browser** lets the user pick a file instead of typing a URL, as a lazy **tree**: it
+opens to buckets discovered from the credentials (`remote::list_s3_buckets`, via `aws-sdk-s3`'s
+`ListBuckets` — needed because `object_store` is bucket-scoped and can't enumerate buckets), and each
+folder is listed on expand with `remote::list_dir` (`object_store`'s `list_with_delimiter`). Expanded
+subtrees are **cached** in the in-memory `BrowseNode` tree and kept across re-opens, so revisiting a
+branch never re-lists. All on background threads with the same credential resolution as opening.
 
 The documented next step is a **streaming `ReadAt` source** — first screen from a head fetch,
 random access by ranged GET, no full download — which generalises the same `pread`/SIGBUS seam above

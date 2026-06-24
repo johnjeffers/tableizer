@@ -79,16 +79,12 @@ pub(crate) struct TableizerApp {
     cloud: CloudConfig,
     /// Whether the cloud file-browser dialog is showing.
     pub(crate) browse_open: bool,
-    /// The browser's editable location field (a bucket root or prefix URL).
-    browse_input: String,
-    /// The prefix URL currently listed (drives "Up" and stale-result filtering).
-    browse_current: String,
-    /// The in-flight directory listing, if any.
-    browse_job: Option<BrowseJob>,
-    /// The most recent successful listing, rendered in the browser.
-    browse_listing: Option<tableizer_core::remote::DirListing>,
-    /// The most recent listing error, if any.
-    browse_error: Option<String>,
+    /// The browse tree's root level (the buckets). Cached across opens so revisiting never re-lists.
+    browse_root: ChildState,
+    /// In-flight listings (one per expanding folder, plus the root), keyed by their location.
+    browse_jobs: Vec<BrowseJob>,
+    /// The "go to" field: a bucket/prefix URL to add to the tree and expand.
+    browse_goto: String,
 }
 
 /// A running (or just-finished) remote download to the local cache, on a background thread so a
@@ -147,23 +143,55 @@ impl CloudAuth {
     }
 }
 
-/// A running (or just-finished) remote directory listing for the file browser, on a background thread
-/// (the listing call does network I/O). The UI polls `outcome` each frame.
+/// A node in the cloud browse **tree**: a bucket/prefix (folder, lazily expandable) or a file.
+struct BrowseNode {
+    /// Full URL — a folder's ends in `/` (navigable), a file's is the object URL (openable).
+    url: String,
+    name: String,
+    is_dir: bool,
+    /// File size (files only).
+    size: Option<u64>,
+    /// Whether this folder is expanded.
+    expanded: bool,
+    /// The folder's children once listed — **cached**, so collapse/re-expand never re-fetches.
+    children: ChildState,
+}
+
+/// Load state of one tree level (the bucket root, or a folder's children). Kept across re-opens of the
+/// browser, so a previously listed subtree is never re-fetched.
+#[derive(Default)]
+enum ChildState {
+    /// Not listed yet.
+    #[default]
+    Unloaded,
+    /// A listing is in flight.
+    Loading,
+    /// Listed — the children (folders first, then files).
+    Loaded(Vec<BrowseNode>),
+    /// Listing failed; the message shows in the tree, and expanding again retries.
+    Failed(String),
+}
+
+/// A running directory/bucket listing. Several may run at once (expanding multiple folders); each is
+/// keyed by `location` (`""` = the bucket root) so its result lands on the right node.
 struct BrowseJob {
-    /// The prefix URL being listed (so a stale poll for a superseded navigation can be ignored).
     location: String,
     cancel: CancellationToken,
     outcome: Arc<Mutex<Option<Result<tableizer_core::remote::DirListing, String>>>>,
 }
 
-/// What [`TableizerApp::show_browse`] asks the update loop to do after rendering the browser.
+/// What [`TableizerApp::show_browse`] asks the update loop to do after rendering the tree.
 enum BrowseAction {
     None,
-    /// Navigate to (list) a prefix URL.
-    Navigate(String),
+    /// List a folder's children (its URL; `""` = root) on a background thread.
+    Load(String),
     /// Open the chosen file URL (and close the browser).
     Open(String),
-    /// Close the browser.
+    /// Re-discover buckets, resetting the tree.
+    Refresh,
+    /// Add a typed bucket/prefix URL as a top-level node and expand it.
+    Goto(String),
+    /// Close the browser (keeping the tree cached).
     Close,
 }
 
@@ -225,11 +253,9 @@ impl TableizerApp {
             pending_target: target,
             cloud: cloud::load(),
             browse_open: false,
-            browse_input: String::new(),
-            browse_current: String::new(),
-            browse_job: None,
-            browse_listing: None,
-            browse_error: None,
+            browse_root: ChildState::Unloaded,
+            browse_jobs: Vec::new(),
+            browse_goto: String::new(),
         }
     }
 
@@ -823,7 +849,7 @@ impl TableizerApp {
         if browse {
             self.url_dialog_open = false;
             self.browse_open = true;
-            self.browse_input = self.url_input.trim().to_string();
+            self.browse_goto = self.url_input.trim().to_string();
             self.url_input.clear();
             return None;
         }
@@ -850,27 +876,21 @@ impl TableizerApp {
         }
     }
 
-    /// List `location` in the browser on a background thread, superseding any in-flight listing. An
-    /// **empty** location is the root: discover S3 buckets from the credentials. The result is picked
-    /// up by [`poll_browse`](Self::poll_browse).
-    fn navigate_browse(&mut self, location: String, ctx: &egui::Context) {
-        self.browse_current = location.clone();
-        self.browse_input = location.clone();
-        self.browse_error = None;
-        if let Some(prev) = self.browse_job.take() {
-            prev.cancel.cancel();
-        }
+    /// Spawn a background listing for `location` (`""` = discover buckets, else list a prefix). The
+    /// result is installed on the matching tree node by [`poll_browse`](Self::poll_browse). Multiple
+    /// may run at once (expanding several folders); the tree node was already marked `Loading`.
+    fn load_children(&mut self, location: String, ctx: &egui::Context) {
         let cancel = CancellationToken::new();
         let outcome: Arc<Mutex<Option<Result<tableizer_core::remote::DirListing, String>>>> =
             Arc::new(Mutex::new(None));
-        self.browse_job = Some(BrowseJob {
+        self.browse_jobs.push(BrowseJob {
             location: location.clone(),
             cancel: cancel.clone(),
             outcome: Arc::clone(&outcome),
         });
         let ctx = ctx.clone();
         if location.is_empty() {
-            // Root view: enumerate buckets reachable with the configured credentials.
+            // Root: enumerate buckets reachable with the configured credentials.
             let auth = self.s3_auth();
             std::thread::spawn(move || {
                 let result =
@@ -892,168 +912,292 @@ impl TableizerApp {
         });
     }
 
-    /// Poll the running listing into `browse_listing`/`browse_error`, ignoring a result for a prefix
-    /// the user has already navigated away from.
+    /// Install any finished listings onto their tree node (root for `""`, else the folder by URL). A
+    /// result for a node no longer in the tree (e.g. after Refresh) is dropped.
     fn poll_browse(&mut self, ctx: &egui::Context) {
-        let done = self.browse_job.as_ref().and_then(|job| {
-            job.outcome
-                .lock()
-                .expect("browse outcome lock")
-                .take()
-                .map(|result| (job.location.clone(), result))
+        let mut finished = Vec::new();
+        let mut running = false;
+        self.browse_jobs.retain(|job| {
+            match job.outcome.lock().expect("browse outcome lock").take() {
+                Some(result) => {
+                    finished.push((job.location.clone(), result));
+                    false
+                }
+                None => {
+                    running = true;
+                    true
+                }
+            }
         });
-        let Some((location, result)) = done else {
-            if self.browse_job.is_some() {
-                ctx.request_repaint();
+        for (location, result) in finished {
+            let state = match result {
+                Ok(listing) => ChildState::Loaded(nodes_from(listing)),
+                Err(error) => ChildState::Failed(error),
+            };
+            if location.is_empty() {
+                self.browse_root = state;
+            } else if let Some(node) = find_node_mut(&mut self.browse_root, &location) {
+                node.children = state;
             }
-            return;
-        };
-        self.browse_job = None;
-        if location != self.browse_current {
-            return; // a newer navigation superseded this listing
         }
-        match result {
-            Ok(listing) => {
-                self.browse_listing = Some(listing);
-                self.browse_error = None;
-            }
-            Err(error) => self.browse_error = Some(error),
+        if running {
+            ctx.request_repaint();
         }
     }
 
-    /// Close the browser and reset its state, so the next open rediscovers buckets with current creds.
+    /// Add a typed bucket/prefix URL as a top-level tree node and expand it (a non-discovered bucket,
+    /// or a jump to a deep prefix). Already-present nodes are just expanded — using the cached subtree.
+    fn goto_browse(&mut self, url: String, ctx: &egui::Context) {
+        if url.is_empty() {
+            return;
+        }
+        if !matches!(self.browse_root, ChildState::Loaded(_)) {
+            self.browse_root = ChildState::Loaded(Vec::new());
+        }
+        let mut load = false;
+        if let ChildState::Loaded(nodes) = &mut self.browse_root {
+            let node = match nodes.iter_mut().position(|n| n.url == url) {
+                Some(i) => &mut nodes[i],
+                None => {
+                    nodes.push(BrowseNode {
+                        name: browse_label(&url),
+                        url: url.clone(),
+                        is_dir: true,
+                        size: None,
+                        expanded: false,
+                        children: ChildState::Unloaded,
+                    });
+                    nodes.last_mut().expect("just pushed")
+                }
+            };
+            node.expanded = true;
+            if matches!(node.children, ChildState::Unloaded | ChildState::Failed(_)) {
+                node.children = ChildState::Loading;
+                load = true;
+            }
+        }
+        if load {
+            self.load_children(url, ctx);
+        }
+    }
+
+    /// Close the browser, keeping the discovered tree cached so reopening doesn't re-list.
     fn close_browser(&mut self) {
         self.browse_open = false;
-        self.browse_current.clear();
-        self.browse_input.clear();
-        self.browse_listing = None;
-        self.browse_error = None;
-        if let Some(job) = self.browse_job.take() {
-            job.cancel.cancel();
-        }
     }
 
-    /// Render the cloud file browser: a location field + Go, an Up button, and a list of folders
-    /// (navigate) and files (open). Returns the action for the update loop to apply.
+    /// Render the cloud file browser as a lazy **tree**: a "go to" field + Refresh, then the expandable
+    /// bucket/folder hierarchy (expanded subtrees stay cached). Returns the action to apply.
     fn show_browse(&mut self, ctx: &egui::Context) -> BrowseAction {
         if !self.browse_open {
             return BrowseAction::None;
         }
         let mut action = BrowseAction::None;
-        // Split-borrow the fields the closure touches so the location field stays editable while the
-        // listing/error are read.
+        // Split-borrow so the tree is mutable (expand toggles) while the "go to" field stays editable.
         let TableizerApp {
-            browse_input,
-            browse_current,
-            browse_listing,
-            browse_error,
-            browse_job,
+            browse_root,
+            browse_goto,
             ..
         } = self;
-        let running = browse_job.is_some();
         egui::Window::new("Browse cloud storage")
             .collapsible(false)
             .resizable(true)
-            .default_size([520.0, 420.0])
+            .default_size([560.0, 460.0])
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     let submit = ui
                         .add(
-                            egui::TextEdit::singleline(browse_input)
-                                .hint_text("s3://bucket/prefix/")
-                                .desired_width(ui.available_width() - 56.0),
+                            egui::TextEdit::singleline(browse_goto)
+                                .hint_text("s3://bucket/prefix/ — jump to")
+                                .desired_width(ui.available_width() - 132.0),
                         )
                         .lost_focus()
                         && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if ui.button("Go").clicked() || submit {
-                        action = BrowseAction::Navigate(browse_input.trim().to_string());
-                    }
-                });
-                ui.horizontal(|ui| {
-                    // "Up" goes to the parent prefix, or — at a bucket root — back to the bucket list
-                    // (the empty root). Disabled only at the bucket list itself.
-                    let up = if browse_current.is_empty() {
-                        None
-                    } else {
-                        tableizer_core::remote::parent_url(browse_current).or_else(|| {
-                            tableizer_core::remote::is_s3(browse_current).then(String::new)
-                        })
-                    };
-                    if ui
-                        .add_enabled(up.is_some(), egui::Button::new("Up"))
-                        .clicked()
-                        && let Some(up) = up
+                    let ready = !browse_goto.trim().is_empty();
+                    if ui.add_enabled(ready, egui::Button::new("Go")).clicked() || (submit && ready)
                     {
-                        action = BrowseAction::Navigate(up);
+                        action = BrowseAction::Goto(browse_goto.trim().to_string());
                     }
-                    let here = if browse_current.is_empty() {
-                        "Buckets"
-                    } else {
-                        browse_current.as_str()
-                    };
-                    ui.label(egui::RichText::new(here).weak());
-                    if running {
-                        ui.spinner();
+                    if ui.button("Refresh").clicked() {
+                        action = BrowseAction::Refresh;
                     }
                 });
                 ui.separator();
-                if let Some(error) = browse_error.as_ref() {
-                    ui.colored_label(ui.visuals().error_fg_color, error);
-                    ui.add_space(4.0);
-                }
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
-                    .show(ui, |ui| match browse_listing.as_ref() {
-                        Some(listing) if !listing.entries.is_empty() => {
-                            for entry in &listing.entries {
-                                if entry.is_dir {
-                                    if ui
-                                        .selectable_label(false, format!("{}/", entry.name))
-                                        .clicked()
-                                    {
-                                        action = BrowseAction::Navigate(entry.url.clone());
-                                    }
-                                } else {
-                                    ui.horizontal(|ui| {
-                                        if ui.selectable_label(false, entry.name.as_str()).clicked()
-                                        {
-                                            action = BrowseAction::Open(entry.url.clone());
-                                        }
-                                        if let Some(size) = entry.size {
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    ui.label(
-                                                        egui::RichText::new(fmt_bytes(size)).weak(),
-                                                    );
-                                                },
-                                            );
-                                        }
-                                    });
-                                }
-                            }
-                        }
-                        Some(_) if !running => {
-                            ui.label(egui::RichText::new("(empty)").weak());
-                        }
-                        _ if running => {
-                            ui.label("Listing…");
-                        }
-                        _ => {
-                            ui.label(
-                                egui::RichText::new("Enter a bucket or prefix URL and press Go.")
-                                    .weak(),
-                            );
-                        }
+                    .show(ui, |ui| {
+                        show_browse_children(ui, browse_root, 0, &mut action);
                     });
                 ui.separator();
-                if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                if ui.button("Close").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                     action = BrowseAction::Close;
                 }
             });
         action
     }
+}
+
+/// Build tree nodes (each initially unexpanded/unloaded) from a directory listing.
+fn nodes_from(listing: tableizer_core::remote::DirListing) -> Vec<BrowseNode> {
+    listing
+        .entries
+        .into_iter()
+        .map(|e| BrowseNode {
+            url: e.url,
+            name: e.name,
+            is_dir: e.is_dir,
+            size: e.size,
+            expanded: false,
+            children: ChildState::Unloaded,
+        })
+        .collect()
+}
+
+/// Find the folder node with URL `url` anywhere in the tree, to install a finished listing onto it.
+fn find_node_mut<'a>(state: &'a mut ChildState, url: &str) -> Option<&'a mut BrowseNode> {
+    let ChildState::Loaded(nodes) = state else {
+        return None;
+    };
+    for node in nodes.iter_mut() {
+        if node.url == url {
+            return Some(node);
+        }
+        if let Some(found) = find_node_mut(&mut node.children, url) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// A short display name for a typed URL (`s3://bucket/a/b/` → `b`, `s3://bucket/` → `bucket`).
+fn browse_label(url: &str) -> String {
+    url.trim_end_matches('/')
+        .rsplit('/')
+        .find(|s| !s.is_empty())
+        .unwrap_or(url)
+        .to_string()
+}
+
+/// Render one tree level (a folder's children, or the bucket root) at `depth`, collecting any action.
+fn show_browse_children(
+    ui: &mut egui::Ui,
+    state: &mut ChildState,
+    depth: usize,
+    action: &mut BrowseAction,
+) {
+    let indent = depth as f32 * 16.0 + 18.0;
+    match state {
+        ChildState::Unloaded => {}
+        ChildState::Loading => {
+            ui.horizontal(|ui| {
+                ui.add_space(indent);
+                ui.weak("Listing…");
+            });
+        }
+        ChildState::Failed(error) => {
+            ui.horizontal(|ui| {
+                ui.add_space(indent);
+                ui.colored_label(ui.visuals().error_fg_color, error.as_str());
+            });
+        }
+        ChildState::Loaded(nodes) if nodes.is_empty() => {
+            ui.horizontal(|ui| {
+                ui.add_space(indent);
+                ui.weak("(empty)");
+            });
+        }
+        ChildState::Loaded(nodes) => {
+            for node in nodes.iter_mut() {
+                show_browse_node(ui, node, depth, action);
+            }
+        }
+    }
+}
+
+/// Render one tree node (folder = expandable disclosure; file = clickable row with size) and recurse.
+fn show_browse_node(
+    ui: &mut egui::Ui,
+    node: &mut BrowseNode,
+    depth: usize,
+    action: &mut BrowseAction,
+) {
+    let indent = depth as f32 * 16.0;
+    if node.is_dir {
+        let mut toggle = false;
+        ui.horizontal(|ui| {
+            ui.add_space(indent);
+            ui.spacing_mut().item_spacing.x = 2.0;
+            if disclosure(ui, node.expanded).clicked() {
+                toggle = true;
+            }
+            if ui
+                .selectable_label(false, format!("{}/", node.name))
+                .clicked()
+            {
+                toggle = true;
+            }
+        });
+        if toggle {
+            node.expanded = !node.expanded;
+            // Expanding an unlisted (or previously failed) folder kicks off a one-time listing.
+            if node.expanded
+                && matches!(node.children, ChildState::Unloaded | ChildState::Failed(_))
+            {
+                node.children = ChildState::Loading;
+                *action = BrowseAction::Load(node.url.clone());
+            }
+        }
+        if node.expanded {
+            show_browse_children(ui, &mut node.children, depth + 1, action);
+        }
+    } else {
+        ui.horizontal(|ui| {
+            ui.add_space(indent + 18.0); // align past the disclosure column
+            if ui.selectable_label(false, node.name.as_str()).clicked() {
+                *action = BrowseAction::Open(node.url.clone());
+            }
+            if let Some(size) = node.size {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.weak(fmt_bytes(size));
+                });
+            }
+        });
+    }
+}
+
+/// A small disclosure triangle (▶ collapsed / ▼ expanded) drawn as a shape (font-independent, like the
+/// grid's painted arrows). Returns its click response.
+fn disclosure(ui: &mut egui::Ui, open: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let color = if response.hovered() {
+        ui.visuals().text_color()
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    let c = rect.center();
+    let points = if open {
+        vec![
+            egui::pos2(c.x - 4.0, c.y - 2.0),
+            egui::pos2(c.x + 4.0, c.y - 2.0),
+            egui::pos2(c.x, c.y + 3.0),
+        ]
+    } else {
+        vec![
+            egui::pos2(c.x - 2.0, c.y - 4.0),
+            egui::pos2(c.x - 2.0, c.y + 4.0),
+            egui::pos2(c.x + 3.0, c.y),
+        ]
+    };
+    ui.painter().add(egui::Shape::convex_polygon(
+        points,
+        color,
+        egui::Stroke::NONE,
+    ));
+    response
 }
 
 impl eframe::App for TableizerApp {
@@ -1084,23 +1228,27 @@ impl eframe::App for TableizerApp {
         if let Some(url) = self.show_url_dialog(&ctx) {
             self.open_target(url, &ctx);
         }
-        // The cloud file browser: on first open (nothing loaded yet) auto-list the bucket root, then
-        // poll any in-flight listing, render it, and apply the chosen action.
-        if self.browse_open
-            && self.browse_job.is_none()
-            && self.browse_listing.is_none()
-            && self.browse_error.is_none()
-        {
-            let start = self.browse_input.trim().to_string();
-            self.navigate_browse(start, &ctx);
+        // The cloud file browser: discover buckets on first open (the tree is cached across opens),
+        // install finished listings, render the tree, and apply the chosen action.
+        if self.browse_open && matches!(self.browse_root, ChildState::Unloaded) {
+            self.browse_root = ChildState::Loading;
+            self.load_children(String::new(), &ctx);
         }
         self.poll_browse(&ctx);
         match self.show_browse(&ctx) {
-            BrowseAction::Navigate(location) => self.navigate_browse(location, &ctx),
+            BrowseAction::Load(location) => self.load_children(location, &ctx),
             BrowseAction::Open(url) => {
                 self.close_browser();
                 self.open_target(url, &ctx);
             }
+            BrowseAction::Refresh => {
+                for job in self.browse_jobs.drain(..) {
+                    job.cancel.cancel(); // abandon in-flight listings of the old tree
+                }
+                self.browse_root = ChildState::Loading;
+                self.load_children(String::new(), &ctx);
+            }
+            BrowseAction::Goto(url) => self.goto_browse(url, &ctx),
             BrowseAction::Close => self.close_browser(),
             BrowseAction::None => {}
         }
