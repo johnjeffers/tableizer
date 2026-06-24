@@ -4,10 +4,11 @@
 use eframe::egui;
 use tableizer_core::{CancellationToken, ColumnId, ExportScope};
 
-use crate::app::{CLOSE_SHORTCUT, OPEN_SHORTCUT, QUIT_SHORTCUT, SETTINGS_SHORTCUT, TableizerApp};
+use crate::app::{
+    CLOSE_SHORTCUT, OPEN_SHORTCUT, PanelTab, QUIT_SHORTCUT, SETTINGS_SHORTCUT, TableizerApp,
+};
 use crate::model::{
-    Format, GridLayout, LoadedTable, View, column_name, delimiter_display, delimiter_label,
-    parse_delimiter,
+    GridLayout, LoadedTable, View, column_name, delimiter_display, delimiter_label, parse_delimiter,
 };
 use crate::theme;
 use std::path::PathBuf;
@@ -66,7 +67,8 @@ pub(crate) fn menu_bar(ui: &mut egui::Ui, app: &mut TableizerApp, to_open: &mut 
             .add(egui::Button::new("Settings…").shortcut_text(settings_sc))
             .clicked()
         {
-            app.settings_open = true;
+            app.panel_open = true;
+            app.panel_tab = PanelTab::Settings;
             ui.close();
         }
         ui.separator();
@@ -91,20 +93,18 @@ pub(crate) fn menu_bar(ui: &mut egui::Ui, app: &mut TableizerApp, to_open: &mut 
         }
     });
 
-    if let View::Loaded(loaded) = &mut app.view {
-        // The Parsing menu (delimiter / header / encoding) is delimited-text only — NDJSON and
-        // Parquet carry their own schema, so there is nothing to re-parse.
-        if loaded.format == Format::Delimited {
-            ui.menu_button("Parsing", |ui| parsing_menu(ui, loaded));
-        }
-    }
-
-    // Columns live in a right-side slide-out panel now; its toggle sits at the right end of the bar.
+    // The right-side panel holds Columns / Parsing / Settings tabs now; the bar's right-end icon
+    // toggles it on the Columns tab (Parsing moved into the panel; it's a tab there when delimited).
     if matches!(app.view, View::Loaded(_)) {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let open = app.columns_open;
-            if columns_toggle(ui, open).clicked() {
-                app.columns_open = !open;
+            let on_columns = app.panel_open && app.panel_tab == PanelTab::Columns;
+            if columns_toggle(ui, on_columns).clicked() {
+                if on_columns {
+                    app.panel_open = false;
+                } else {
+                    app.panel_open = true;
+                    app.panel_tab = PanelTab::Columns;
+                }
             }
         });
     }
@@ -151,8 +151,20 @@ fn columns_toggle(ui: &mut egui::Ui, open: bool) -> egui::Response {
     response.on_hover_text(if open { "Hide columns" } else { "Show columns" })
 }
 
-/// The right-side Columns panel contents: a scrollable visibility list with a pinned reset action.
-pub(crate) fn columns_panel(ui: &mut egui::Ui, loaded: &mut LoadedTable) {
+/// A small uppercase, muted section heading inside the right panel.
+fn panel_heading(ui: &mut egui::Ui, title: &str) {
+    ui.label(
+        egui::RichText::new(title)
+            .text_style(theme::text_style(theme::MENU_SECTION))
+            .strong()
+            .color(ui.visuals().weak_text_color()),
+    );
+    ui.add_space(4.0);
+}
+
+/// The Columns panel tab: Select All/None, a scrollable per-column visibility list, and a pinned
+/// "Reset columns & view" action.
+pub(crate) fn columns_tab(ui: &mut egui::Ui, loaded: &mut LoadedTable) {
     egui::Panel::bottom("tz_columns_reset").show_inside(ui, |ui| {
         ui.add_space(6.0);
         if ui
@@ -167,14 +179,7 @@ pub(crate) fn columns_panel(ui: &mut egui::Ui, loaded: &mut LoadedTable) {
         ui.add_space(6.0);
     });
     egui::CentralPanel::default().show_inside(ui, |ui| {
-        ui.add_space(8.0);
-        ui.label(
-            egui::RichText::new("COLUMNS")
-                .text_style(theme::text_style(theme::MENU_SECTION))
-                .strong()
-                .color(ui.visuals().weak_text_color()),
-        );
-        ui.add_space(4.0);
+        ui.add_space(6.0);
         ui.horizontal(|ui| {
             let w = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
             if ui
@@ -275,25 +280,18 @@ fn export_menu(ui: &mut egui::Ui, loaded: &LoadedTable) {
     }
 }
 
-/// The Parsing menu: delimiter (presets + custom), header row, and display encoding. Changing the
-/// delimiter or header re-opens the file (column structure may change); encoding is display-only.
-fn parsing_menu(ui: &mut egui::Ui, loaded: &mut LoadedTable) {
-    ui.set_min_width(180.0);
+/// The Parsing panel tab (delimited text only): header toggle, delimiter (auto / presets / custom),
+/// and display encoding. Changing the delimiter or header re-opens the file (column structure may
+/// change); encoding is display-only.
+pub(crate) fn parsing_tab(ui: &mut egui::Ui, loaded: &mut LoadedTable) {
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.add_space(6.0);
+            ui.checkbox(&mut loaded.dialect.has_header, "Header row");
 
-    ui.checkbox(&mut loaded.dialect.has_header, "Header row");
-
-    // Use `CloseOnClickOutside` rather than the menu default (`CloseOnClick`): otherwise the click
-    // that focuses the Custom text field counts as a menu click and dismisses the menu before you
-    // can type. With this, clicks inside the submenu (presets, the text field) keep it open; a click
-    // outside or Esc closes it.
-    egui::containers::menu::SubMenuButton::new("Delimiter")
-        .config(
-            egui::containers::menu::MenuConfig::new()
-                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                .style(super::wide_menu),
-        )
-        .ui(ui, |ui| {
-            ui.set_min_width(196.0);
+            ui.add_space(12.0);
+            panel_heading(ui, "DELIMITER");
             // Auto is the default; presets/custom are explicit overrides for when sniffing guessed wrong.
             let detected = loaded.detected_delimiter;
             if ui
@@ -320,6 +318,7 @@ fn parsing_menu(ui: &mut egui::Ui, loaded: &mut LoadedTable) {
                     loaded.delimiter_input = delimiter_display(byte);
                 }
             }
+            ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.label("Custom:");
                 ui.add(
@@ -334,19 +333,18 @@ fn parsing_menu(ui: &mut egui::Ui, loaded: &mut LoadedTable) {
                     loaded.delimiter_auto = false;
                 }
             });
-        });
 
-    ui.menu_button("Encoding", |ui| {
-        ui.set_min_width(160.0);
-        for choice in [encoding_rs::UTF_8, encoding_rs::WINDOWS_1252] {
-            if ui
-                .selectable_label(std::ptr::eq(loaded.encoding, choice), choice.name())
-                .clicked()
-            {
-                loaded.encoding = choice;
+            ui.add_space(12.0);
+            panel_heading(ui, "ENCODING");
+            for choice in [encoding_rs::UTF_8, encoding_rs::WINDOWS_1252] {
+                if ui
+                    .selectable_label(std::ptr::eq(loaded.encoding, choice), choice.name())
+                    .clicked()
+                {
+                    loaded.encoding = choice;
+                }
             }
-        }
-    });
+        });
 }
 
 /// Export the table to a user-chosen file (native save dialog). Errors are reported to stderr.

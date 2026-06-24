@@ -12,7 +12,9 @@ use crate::model::{
     detect_format, open_table, sniff_file,
 };
 use crate::persist::{prefs, recent, views};
-use crate::ui::{columns_panel, empty_view, grid, menu_bar, settings_window, status_bar, toolbar};
+use crate::ui::{
+    columns_tab, empty_view, grid, menu_bar, parsing_tab, settings_tab, status_bar, toolbar,
+};
 use crate::{fonts, theme};
 
 pub(crate) struct TableizerApp {
@@ -29,14 +31,34 @@ pub(crate) struct TableizerApp {
     font_rx: Option<std::sync::mpsc::Receiver<Vec<(String, bool)>>>,
     /// Table font last pushed to egui — rebuild the font atlas only when this changes.
     applied_table_font: Option<String>,
-    /// Filter text in the table-font picker (inside the Settings window).
+    /// Filter text in the table-font picker (inside the Settings tab).
     font_search: String,
     /// Whether the picker is filtered to monospaced fonts.
     font_mono_only: bool,
-    /// Whether the Settings window is open.
-    pub(crate) settings_open: bool,
-    /// Whether the right-side Columns panel is expanded (toggled from the menu bar).
-    pub(crate) columns_open: bool,
+    /// Whether the right-side panel (Columns / Parsing / Settings tabs) is expanded.
+    pub(crate) panel_open: bool,
+    /// Which tab the right-side panel shows.
+    pub(crate) panel_tab: PanelTab,
+}
+
+/// Which tab the right-side panel shows. Columns and Parsing need a loaded file (Parsing only for
+/// delimited text); Settings is always available.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum PanelTab {
+    #[default]
+    Columns,
+    Parsing,
+    Settings,
+}
+
+impl PanelTab {
+    fn label(self) -> &'static str {
+        match self {
+            PanelTab::Columns => "Columns",
+            PanelTab::Parsing => "Parsing",
+            PanelTab::Settings => "Settings",
+        }
+    }
 }
 
 impl TableizerApp {
@@ -65,8 +87,8 @@ impl TableizerApp {
             applied_table_font: None,
             font_search: String::new(),
             font_mono_only: false,
-            settings_open: false,
-            columns_open: false,
+            panel_open: false,
+            panel_tab: PanelTab::default(),
         };
         if let Some(path) = path {
             app.open_path(path);
@@ -106,7 +128,7 @@ impl TableizerApp {
             Format::Json | Format::Parquet => (Dialect::default(), b',', true),
         };
         // UTF-16 is transcoded to UTF-8 by the engine; single-byte encodings default to UTF-8 here and
-        // can be switched to Windows-1252 via the Parsing menu.
+        // can be switched to Windows-1252 via the Parsing tab.
         let encoding: &'static Encoding = encoding_rs::UTF_8;
         self.view = match open_table(&path, format, dialect) {
             Ok(table) => {
@@ -130,6 +152,72 @@ impl TableizerApp {
             }
             Err(error) => View::Failed { path, error },
         };
+    }
+
+    /// The panel tabs available right now. Columns + (delimited-only) Parsing need a loaded file;
+    /// Settings is always present.
+    fn available_tabs(&self) -> Vec<PanelTab> {
+        let mut tabs = Vec::with_capacity(3);
+        if let View::Loaded(loaded) = &self.view {
+            tabs.push(PanelTab::Columns);
+            if loaded.format == Format::Delimited {
+                tabs.push(PanelTab::Parsing);
+            }
+        }
+        tabs.push(PanelTab::Settings);
+        tabs
+    }
+
+    /// Keep `panel_tab` on a currently-available tab (the file may have closed or changed format).
+    fn fix_panel_tab(&mut self) {
+        if !self.available_tabs().contains(&self.panel_tab) {
+            self.panel_tab = if matches!(self.view, View::Loaded(_)) {
+                PanelTab::Columns
+            } else {
+                PanelTab::Settings
+            };
+        }
+    }
+
+    /// Render the right panel's tab strip (with a close button) and the active tab's contents.
+    fn side_panel_contents(&mut self, ui: &mut egui::Ui) {
+        let tabs = self.available_tabs();
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            for tab in &tabs {
+                if ui
+                    .selectable_label(self.panel_tab == *tab, tab.label())
+                    .clicked()
+                {
+                    self.panel_tab = *tab;
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if close_button(ui).clicked() {
+                    self.panel_open = false;
+                }
+            });
+        });
+        ui.separator();
+        match self.panel_tab {
+            PanelTab::Columns => {
+                if let View::Loaded(loaded) = &mut self.view {
+                    columns_tab(ui, loaded);
+                }
+            }
+            PanelTab::Parsing => {
+                if let View::Loaded(loaded) = &mut self.view {
+                    parsing_tab(ui, loaded);
+                }
+            }
+            PanelTab::Settings => settings_tab(
+                ui,
+                &mut self.theme,
+                &self.font_families,
+                &mut self.font_search,
+                &mut self.font_mono_only,
+            ),
+        }
     }
 }
 
@@ -193,6 +281,22 @@ impl eframe::App for TableizerApp {
         {
             self.view = View::Empty;
         }
+        // ⌘, / Ctrl+, opens the right panel on the Settings tab (toggles it closed if already there).
+        if ctx.input_mut(|i| i.consume_shortcut(&SETTINGS_SHORTCUT)) {
+            if self.panel_open && self.panel_tab == PanelTab::Settings {
+                self.panel_open = false;
+            } else {
+                self.panel_open = true;
+                self.panel_tab = PanelTab::Settings;
+            }
+        }
+        // Esc closes the panel when nothing else holds keyboard focus (e.g. not mid-edit in a field).
+        if self.panel_open
+            && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+            && ctx.memory(|m| m.focused().is_none())
+        {
+            self.panel_open = false;
+        }
 
         egui::Panel::top("menu_bar").show_inside(ui, |ui| {
             // `wide_menu` gives the bar buttons *and* every dropdown popup roomier horizontal item
@@ -212,8 +316,30 @@ impl eframe::App for TableizerApp {
             });
         }
 
-        // React to the toolbar's edits: a dialect change re-opens the file; otherwise apply the
-        // filter/sort view and persist the per-file saved view.
+        if matches!(self.view, View::Loaded(_)) {
+            egui::Panel::bottom("status_bar").show_inside(ui, |ui| {
+                if let View::Loaded(loaded) = &self.view {
+                    status_bar(ui, loaded, &palette);
+                }
+            });
+        }
+
+        // Right-side tabbed panel (Columns / Parsing / Settings): resizable, slides in/out when
+        // toggled. Shown before the central panel so the grid takes the remaining width; the default
+        // width suits the Settings tab (its font picker is the widest content).
+        self.fix_panel_tab();
+        let panel_open = self.panel_open;
+        egui::Panel::right("side_panel")
+            .resizable(true)
+            .default_size(340.0)
+            .min_size(240.0)
+            .max_size(560.0)
+            .show_animated_inside(ui, panel_open, |ui| self.side_panel_contents(ui));
+
+        // React to edits from the toolbar (filter/sort) and the side panel (Parsing → dialect,
+        // Columns → layout): a dialect change re-opens the file; otherwise apply the view and persist
+        // the per-file saved view. This must run *after* the panel renders — the Parsing tab lives
+        // there, so an earlier check would miss the change (and next frame's snapshot would hide it).
         if let View::Loaded(loaded) = &mut self.view {
             if Some(loaded.dialect) != dialect_before {
                 if let Ok(reopened) = open_table(&loaded.path, loaded.format, loaded.dialect) {
@@ -238,26 +364,6 @@ impl eframe::App for TableizerApp {
             }
         }
 
-        if matches!(self.view, View::Loaded(_)) {
-            egui::Panel::bottom("status_bar").show_inside(ui, |ui| {
-                if let View::Loaded(loaded) = &self.view {
-                    status_bar(ui, loaded, &palette);
-                }
-            });
-        }
-
-        // Right-side Columns panel: slides in/out (animated) when toggled from the menu bar. Shown
-        // before the central panel so the grid takes the remaining width.
-        let columns_open = self.columns_open && matches!(self.view, View::Loaded(_));
-        egui::Panel::right("columns_panel")
-            .resizable(false)
-            .default_size(220.0)
-            .show_animated_inside(ui, columns_open, |ui| {
-                if let View::Loaded(loaded) = &mut self.view {
-                    columns_panel(ui, loaded);
-                }
-            });
-
         // No inner margin: the table fills the central area edge-to-edge (the empty/failed views
         // center their own content, so they're unaffected).
         let central_frame = egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::ZERO);
@@ -274,27 +380,6 @@ impl eframe::App for TableizerApp {
                 }
                 View::Loaded(loaded) => grid(ui, loaded, &palette),
             });
-
-        // Settings window: toggled by the File ▸ Settings item and ⌘/Ctrl+, ; closed by its ✕ or Esc.
-        if ctx.input_mut(|i| i.consume_shortcut(&SETTINGS_SHORTCUT)) {
-            self.settings_open = !self.settings_open;
-        }
-        if self.settings_open
-            && ctx.input(|i| i.key_pressed(egui::Key::Escape))
-            && ctx.memory(|m| m.focused().is_none())
-        {
-            self.settings_open = false;
-        }
-        if self.settings_open {
-            settings_window(
-                &ctx,
-                &mut self.settings_open,
-                &mut self.theme,
-                &self.font_families,
-                &mut self.font_search,
-                &mut self.font_mono_only,
-            );
-        }
 
         if self.theme != theme_before {
             prefs::save(&self.theme);
@@ -320,10 +405,32 @@ impl eframe::App for TableizerApp {
     }
 }
 
+/// A small ✕ close button drawn as two strokes (shapes, not a glyph — font-independent, per the `ui`
+/// module's hand-painted-text invariant). Returns its click response.
+fn close_button(ui: &mut egui::Ui) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let color = if response.hovered() {
+        ui.visuals().text_color()
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    let c = rect.center();
+    let r = 4.0;
+    let stroke = egui::Stroke::new(1.5, color);
+    ui.painter()
+        .line_segment([c + egui::vec2(-r, -r), c + egui::vec2(r, r)], stroke);
+    ui.painter()
+        .line_segment([c + egui::vec2(-r, r), c + egui::vec2(r, -r)], stroke);
+    response.on_hover_text("Close panel")
+}
+
 /// Quit — the standard per-OS shortcut (⌘Q on macOS, Ctrl+Q elsewhere).
 pub(crate) const QUIT_SHORTCUT: egui::KeyboardShortcut =
     egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Q);
-/// Open the Settings window (⌘, / Ctrl+,).
+/// Open the right panel on the Settings tab (⌘, / Ctrl+,).
 pub(crate) const SETTINGS_SHORTCUT: egui::KeyboardShortcut =
     egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Comma);
 /// Open a file (⌘O / Ctrl+O).

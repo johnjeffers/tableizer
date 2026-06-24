@@ -36,7 +36,7 @@ crate's `ByteRecord` (never hand-rolled RFC 4180): quoting, doubled-quote escapi
 newlines/delimiters, ragged rows tolerated and counted (a "⚠ N ragged rows" badge). Encodings:
 BOM-aware UTF-8 / UTF-16 LE+BE (transcoded to UTF-8 at open), with user override to Latin-1 /
 Windows-1252 for display. Random access is served by the persisted sparse offset index
-(`crates/tableizer-core/src/index.rs`). This is the only format with the Parsing menu (delimiter /
+(`crates/tableizer-core/src/index.rs`). This is the only format with the Parsing tab (delimiter /
 header / encoding) and the only one whose index is cached to the state dir.
 
 ## JSON — NDJSON and top-level arrays (`JsonTable`)

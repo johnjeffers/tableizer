@@ -12,7 +12,7 @@ use tableizer_core::{
 };
 
 /// The file format behind a [`ViewportSource`]. Detected on open; selects which engine reader to
-/// build and which UI affordances apply (only the delimited format exposes the Parsing menu).
+/// build and which UI affordances apply (only the delimited format exposes the Parsing tab).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Format {
     /// CSV / TSV / arbitrary-separator text (the dialect-driven path).
@@ -358,13 +358,13 @@ pub(crate) struct LoadedTable {
     pub(crate) path: PathBuf,
     pub(crate) table: Box<dyn ViewportSource>,
     pub(crate) layout: GridLayout,
-    /// The detected file format. Gates the delimited-only UI (the Parsing menu).
+    /// The detected file format. Gates the delimited-only UI (the Parsing tab).
     pub(crate) format: Format,
     pub(crate) dialect: Dialect,
     pub(crate) encoding: &'static Encoding,
     pub(crate) view: ViewControls,
     pub(crate) saved: SavedView,
-    /// Text in the Parsing menu's custom-delimiter field (a char like `:` or a hex byte like `0x01`).
+    /// Text in the Parsing tab's custom-delimiter field (a char like `:` or a hex byte like `0x01`).
     pub(crate) delimiter_input: String,
     /// The delimiter `Dialect::sniff` detected on open — what "Auto" resolves to.
     pub(crate) detected_delimiter: u8,

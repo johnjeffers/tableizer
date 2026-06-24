@@ -1,4 +1,4 @@
-//! The Settings window: appearance (theme / accent / density), the table-font picker with live
+//! The Settings panel tab: appearance (theme / accent / density), the table-font picker with live
 //! preview, and the index-cache size/clear control. Everything applies live and persists on change.
 
 use eframe::egui;
@@ -21,7 +21,7 @@ fn human_bytes(n: u64) -> String {
     format!("{size:.1} {}", UNITS[unit])
 }
 
-/// A section heading inside the Settings window.
+/// A section heading inside the Settings tab.
 fn settings_section(ui: &mut egui::Ui, title: &str) {
     ui.add_space(2.0);
     ui.label(
@@ -68,24 +68,19 @@ fn accent_swatches(ui: &mut egui::Ui, current: &mut theme::Accent) {
     });
 }
 
-/// The Settings window (non-modal, singleton): appearance (theme/accent/density) and the table font
-/// (size + live preview + searchable family list). Everything applies live and persists on change.
-/// Toggled from the menu bar and ⌘/Ctrl+, ; closed by its ✕ or Esc.
-pub(crate) fn settings_window(
-    ctx: &egui::Context,
-    open: &mut bool,
+/// The Settings panel tab: appearance (theme/accent/density), the table font (size + live preview +
+/// searchable family list), and the index cache. Everything applies live and persists on change.
+/// Rendered into the right panel; scrolls when the panel is shorter than its content.
+pub(crate) fn settings_tab(
+    ui: &mut egui::Ui,
     settings: &mut theme::Settings,
     families: &[(String, bool)],
     font_search: &mut String,
     mono_only: &mut bool,
 ) {
-    let mut window_open = *open;
-    egui::Window::new("Settings")
-        .open(&mut window_open)
-        .resizable(false)
-        .collapsible(false)
-        .default_width(360.0)
-        .show(ctx, |ui| {
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
             settings_section(ui, "Appearance");
             egui::Grid::new("settings_appearance")
                 .num_columns(2)
@@ -218,5 +213,4 @@ pub(crate) fn settings_window(
                 tableizer_core::cache::clear();
             }
         });
-    *open = window_open;
 }

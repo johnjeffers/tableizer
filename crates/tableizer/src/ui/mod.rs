@@ -1,5 +1,6 @@
 //! The egui rendering layer: top-level window panels (toolbar, status bar, empty state) and — via
-//! submodules — the menu bar, Settings window, and data grid.
+//! submodules — the menu bar, the right-side tabbed panel (Columns / Parsing / Settings), and the
+//! data grid.
 //!
 //! Invariant: menu and list item text is rendered with native egui widgets (`Button`,
 //! `SelectableLabel`, `Label`, …), never hand-painted with `Painter::text`. Text painted directly
@@ -12,8 +13,8 @@ mod menu;
 mod settings;
 
 pub(crate) use grid::grid;
-pub(crate) use menu::{columns_panel, menu_bar};
-pub(crate) use settings::settings_window;
+pub(crate) use menu::{columns_tab, menu_bar, parsing_tab};
+pub(crate) use settings::settings_tab;
 
 use std::path::PathBuf;
 
