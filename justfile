@@ -46,3 +46,22 @@ bench file:
 # License + advisory audit (needs cargo-deny)
 deny:
     cargo deny check
+
+# Build Tableizer.app into dist/ (macOS only)
+build:
+    bash scripts/package-macos.sh
+
+# Build the macOS .app bundle + .dmg into dist/ (macOS only)
+package-mac:
+    bash scripts/package-macos.sh dmg
+
+# Build and install Tableizer.app into /Applications (macOS only)
+install: build
+    rm -rf /Applications/Tableizer.app
+    ditto dist/Tableizer.app /Applications/Tableizer.app
+    @echo "installed → /Applications/Tableizer.app"
+
+# Remove Tableizer.app from /Applications (macOS only)
+uninstall:
+    rm -rf /Applications/Tableizer.app
+    @echo "removed /Applications/Tableizer.app"

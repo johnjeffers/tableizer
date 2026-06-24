@@ -26,13 +26,21 @@ use eframe::egui;
 
 use crate::app::TableizerApp;
 
+/// The window / taskbar icon, decoded once from the committed master PNG (`assets/icon.png`). The
+/// macOS `.app` bundle uses `icon.icns` instead; this covers Linux/Windows and bare-binary runs.
+fn app_icon() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(include_bytes!("../../../assets/icon.png"))
+        .expect("bundled assets/icon.png is a valid PNG")
+}
+
 fn main() -> eframe::Result<()> {
     let path = std::env::args_os().nth(1).map(PathBuf::from);
     let native_options = eframe::NativeOptions {
         // Initial size on first launch; the `persistence` feature restores the last geometry after.
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([640.0, 400.0]),
+            .with_min_inner_size([640.0, 400.0])
+            .with_icon(app_icon()),
         ..Default::default()
     };
     eframe::run_native(
