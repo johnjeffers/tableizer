@@ -4,13 +4,13 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use encoding_rs::Encoding;
 use tableizer_core::search::Matcher;
 use tableizer_core::{
-    ColumnId, CsvTable, Direction, FilterSpec, JsonTable, ParquetTable, Schema, SortKey, ViewSpec,
-    ViewportSource, parse::Dialect,
+    CancellationToken, ColumnId, CsvTable, Direction, FilterSpec, JsonTable, ParquetTable,
+    RowRange, Schema, SortKey, ViewSpec, ViewportRequest, ViewportSource, parse::Dialect,
 };
 
 /// A table behind the [`ViewportSource`] seam, shared (`Arc`) so a background export thread can hold
@@ -96,6 +96,85 @@ pub(crate) fn highlight_matcher(view: &ViewControls) -> Option<Matcher> {
         case_sensitive: view.case_sensitive,
     })
     .ok()
+}
+
+/// Scan the active view for the next/previous display-row whose displayed cells match `matcher`,
+/// starting at display-row `first` and moving toward the boundary (`forward` ⇒ increasing rows, else
+/// decreasing). Fetches in batches through the [`ViewportSource`] seam, so it honours any active
+/// filter/sort and only ever reads small windows; `cancel` abandons a long scan. Returns the matching
+/// display-row, or `None` when the boundary is reached with no match. Drives the toolbar Prev/Next
+/// find buttons; tested below against an in-memory table.
+pub(crate) fn next_match(
+    table: &dyn ViewportSource,
+    columns: &[ColumnId],
+    matcher: &Matcher,
+    first: u64,
+    forward: bool,
+    total: u64,
+    cancel: &CancellationToken,
+) -> Option<u64> {
+    /// Rows per `fetch` — large enough that a dense match is found in one round-trip, small enough
+    /// that a no-match scan stays cancellable on a coarse cadence.
+    const BATCH: u64 = 8192;
+    if total == 0 || first >= total {
+        return None;
+    }
+    // Fetch the window `[start, start+len)` and return the first matching display-row, scanning it
+    // forward (Next) or backward (Prev) so matches are visited in travel order.
+    let scan = |start: u64, len: u64, rev: bool| -> Option<u64> {
+        let request = ViewportRequest {
+            rows: RowRange {
+                start,
+                len: u32::try_from(len).unwrap_or(u32::MAX),
+            },
+            columns: columns.to_vec(),
+        };
+        let viewport = table.fetch(&request, cancel).ok()?;
+        let hit = |i: usize| {
+            matcher
+                .matches_any(viewport.rows[i].iter().map(|cell| cell.0.as_ref()))
+                .then(|| start + i as u64)
+        };
+        let n = viewport.rows.len();
+        if rev {
+            (0..n).rev().find_map(hit)
+        } else {
+            (0..n).find_map(hit)
+        }
+    };
+
+    if forward {
+        let mut pos = first;
+        while pos < total {
+            if cancel.is_cancelled() {
+                return None;
+            }
+            let len = (total - pos).min(BATCH);
+            if let Some(row) = scan(pos, len, false) {
+                return Some(row);
+            }
+            pos += len;
+        }
+        None
+    } else {
+        // Windows end at `first` and march down to row 0; each is scanned top-down in reverse so the
+        // nearest match above the cursor wins, and no window ever reaches past `first`.
+        let mut top = first;
+        loop {
+            if cancel.is_cancelled() {
+                return None;
+            }
+            let len = BATCH.min(top + 1);
+            let start = top + 1 - len;
+            if let Some(row) = scan(start, len, true) {
+                return Some(row);
+            }
+            if start == 0 {
+                return None;
+            }
+            top = start - 1;
+        }
+    }
 }
 
 /// Open `path` behind the `ViewportSource` seam (the rest of the app is format-agnostic). The
@@ -277,6 +356,11 @@ pub(crate) struct ViewControls {
     pub(crate) selecting: bool,
     /// Display row under the mouse (transient; drives the hover highlight).
     pub(crate) hovered_row: Option<u64>,
+    /// Pending Prev/Next find request from the toolbar: `Some(true)` = next, `Some(false)` = prev.
+    /// Taken by the app, which spawns the background scan ([`next_match`]).
+    pub(crate) find_request: Option<bool>,
+    /// Display row the grid should scroll into view next frame (set by find-nav), consumed once.
+    pub(crate) pending_scroll: Option<u64>,
 }
 
 impl ViewControls {
@@ -363,6 +447,14 @@ impl SavedView {
     }
 }
 
+/// A running find-navigation scan (background thread). The app polls `result` each frame: `None`
+/// while scanning, `Some(found)` once done — `found` is the matched display-row, or `None` for "no
+/// match". The scan is cancelled when a newer one supersedes it or the file closes.
+pub(crate) struct FindJob {
+    pub(crate) cancel: CancellationToken,
+    pub(crate) result: Arc<Mutex<Option<Option<u64>>>>,
+}
+
 /// A loaded table and all its per-file UI state.
 pub(crate) struct LoadedTable {
     pub(crate) path: PathBuf,
@@ -380,6 +472,8 @@ pub(crate) struct LoadedTable {
     pub(crate) detected_delimiter: u8,
     /// Whether the delimiter is auto-detected (the default) vs an explicit user override.
     pub(crate) delimiter_auto: bool,
+    /// The in-flight find-navigation scan (Prev/Next), if any. Polled by the app each frame.
+    pub(crate) find_nav: Option<FindJob>,
 }
 
 /// What the window is currently showing.
@@ -568,6 +662,45 @@ mod tests {
         assert!(!highlights(&view, "12"));
         // An invalid regex (mid-typing) compiles to nothing rather than erroring.
         assert!(highlight_matcher(&find("(", true, false)).is_none());
+    }
+
+    #[test]
+    fn next_match_navigates_between_matching_rows() {
+        // Header excluded → data rows 0..5 are alpha, beta, alpha, gamma, alpha.
+        let csv = "name,val\nalpha,1\nbeta,2\nalpha,3\ngamma,4\nalpha,5\n";
+        let table = CsvTable::from_bytes(csv.as_bytes().to_vec(), Dialect::default()).unwrap();
+        let columns = [ColumnId(0), ColumnId(1)];
+        let matcher = |query: &str| {
+            Matcher::compile(&FilterSpec {
+                query: query.into(),
+                regex: false,
+                invert: false,
+                case_sensitive: false,
+            })
+            .unwrap()
+        };
+        let m = matcher("alpha");
+        let cancel = CancellationToken::new();
+        let next = |first, forward| next_match(&table, &columns, &m, first, forward, 5, &cancel);
+        // Forward visits each match in turn, then stops past the last row.
+        assert_eq!(next(0, true), Some(0));
+        assert_eq!(next(1, true), Some(2));
+        assert_eq!(next(3, true), Some(4));
+        assert_eq!(next(5, true), None);
+        // Backward walks them in reverse — never returning a row at or below the cursor's far side.
+        assert_eq!(next(4, false), Some(4));
+        assert_eq!(next(3, false), Some(2));
+        assert_eq!(next(1, false), Some(0));
+        // A non-matching query yields None in both directions.
+        let none = matcher("zzz");
+        assert_eq!(
+            next_match(&table, &columns, &none, 0, true, 5, &cancel),
+            None
+        );
+        assert_eq!(
+            next_match(&table, &columns, &none, 4, false, 5, &cancel),
+            None
+        );
     }
 
     #[test]

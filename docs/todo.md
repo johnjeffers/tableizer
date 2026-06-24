@@ -1,3 +1,4 @@
+- Per column filters/functions (min, max, unique)
 - CI/CD
   - Package as a standard app
   - Create release artifacts for each OS

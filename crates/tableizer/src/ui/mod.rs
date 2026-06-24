@@ -46,6 +46,24 @@ pub(crate) fn toolbar(ui: &mut egui::Ui, loaded: &mut LoadedTable, focus_find: b
         if focus_find {
             find.request_focus();
         }
+        // Prev/Next jump the selection between matches across the whole file (a background scan, so a
+        // far-off match never freezes the UI). Enabled whenever there's a query; degenerate but
+        // harmless under "Show matches only" (every visible row matches there).
+        let has_query = !view.search.is_empty();
+        if ui
+            .add_enabled(has_query, egui::Button::new("<"))
+            .on_hover_text("Previous match (above the selection)")
+            .clicked()
+        {
+            view.find_request = Some(false);
+        }
+        if ui
+            .add_enabled(has_query, egui::Button::new(">"))
+            .on_hover_text("Next match (below the selection)")
+            .clicked()
+        {
+            view.find_request = Some(true);
+        }
         ui.checkbox(&mut view.filter_mode, "Show matches only");
         ui.checkbox(&mut view.regex, "Use regex");
         ui.checkbox(&mut view.case_sensitive, "Match case");

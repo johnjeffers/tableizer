@@ -100,6 +100,11 @@ pub(crate) fn grid(ui: &mut egui::Ui, loaded: &mut LoadedTable, palette: &theme:
         });
     }
 
+    // A find-nav jump (toolbar Prev/Next) requests a scroll to the matched row, applied this frame.
+    if let Some(row) = view.pending_scroll.take() {
+        scroll_to = Some(row);
+    }
+
     let mut delegate = GridDelegate {
         table: table.as_ref(),
         columns: displayed,

@@ -13,8 +13,8 @@ use tableizer_core::{
 };
 
 use crate::model::{
-    Format, GridLayout, LoadedTable, SavedView, SharedTable, View, ViewControls, delimiter_display,
-    detect_format, open_table, sniff_file,
+    FindJob, Format, GridLayout, LoadedTable, RowSpan, SavedView, SharedTable, View, ViewControls,
+    delimiter_display, detect_format, highlight_matcher, next_match, open_table, sniff_file,
 };
 use crate::persist::{prefs, recent, views};
 use crate::ui::{
@@ -173,6 +173,7 @@ impl TableizerApp {
                     encoding,
                     view,
                     saved,
+                    find_nav: None,
                 }))
             }
             Err(error) => View::Failed { path, error },
@@ -529,6 +530,29 @@ impl eframe::App for TableizerApp {
                     loaded.saved = current;
                 }
             }
+
+            // Find navigation (toolbar Prev/Next): start a requested scan, then poll the running one.
+            if let Some(forward) = loaded.view.find_request.take() {
+                start_find_nav(loaded, forward, &ctx);
+            }
+            if loaded.find_nav.is_some() {
+                // Read (and clear) the result under the lock, then release it before mutating state.
+                let done = loaded
+                    .find_nav
+                    .as_ref()
+                    .and_then(|job| job.result.lock().expect("find result lock").take());
+                match done {
+                    Some(found) => {
+                        loaded.find_nav = None;
+                        // Select + scroll to the hit; a `None` (no match / cancelled) leaves the view.
+                        if let Some(row) = found {
+                            loaded.view.selected = Some(RowSpan::single(row));
+                            loaded.view.pending_scroll = Some(row);
+                        }
+                    }
+                    None => ctx.request_repaint(), // keep polling while the scan runs
+                }
+            }
         }
 
         // No inner margin: the table fills the central area edge-to-edge (the empty/failed views
@@ -650,6 +674,60 @@ fn run_export(
         let _ = std::fs::remove_file(path);
     }
     result
+}
+
+/// Spawn a background find-navigation scan from the current selection toward `forward`'s boundary,
+/// superseding any in-flight scan. The matching display-row (or `None`) is published to
+/// `loaded.find_nav`, which the update loop polls and then scrolls + selects. Off the UI thread so a
+/// match far from the cursor — or a query that matches nothing — never freezes the grid (Tier C).
+fn start_find_nav(loaded: &mut LoadedTable, forward: bool, ctx: &egui::Context) {
+    // The non-inverting highlight matcher backs the on-screen highlights, so Prev/Next jump between
+    // exactly the cells shown marked. An empty or mid-typed (invalid) query yields nothing to do.
+    let Some(matcher) = highlight_matcher(&loaded.view) else {
+        return;
+    };
+    let total = match loaded.table.row_count() {
+        RowCount::Exact(n) | RowCount::AtLeast(n) => n,
+    };
+    let columns = loaded.layout.displayed();
+    if total == 0 || columns.is_empty() {
+        return;
+    }
+    // Continue from the current selection; with none, start at the near edge for the direction.
+    let first = match (loaded.view.selected.map(|s| s.lead), forward) {
+        (Some(r), true) => r.saturating_add(1),
+        (Some(0), false) => return, // already at the top — no earlier match to seek
+        (Some(r), false) => r - 1,
+        (None, true) => 0,
+        (None, false) => total - 1,
+    };
+
+    // Supersede any running scan, then publish the new job for the poll loop.
+    if let Some(prev) = loaded.find_nav.take() {
+        prev.cancel.cancel();
+    }
+    let cancel = CancellationToken::new();
+    let result: Arc<Mutex<Option<Option<u64>>>> = Arc::new(Mutex::new(None));
+    loaded.find_nav = Some(FindJob {
+        cancel: cancel.clone(),
+        result: Arc::clone(&result),
+    });
+
+    let table: SharedTable = Arc::clone(&loaded.table);
+    let ctx = ctx.clone();
+    std::thread::spawn(move || {
+        let found = next_match(
+            table.as_ref(),
+            &columns,
+            &matcher,
+            first,
+            forward,
+            total,
+            &cancel,
+        );
+        *result.lock().expect("find result lock") = Some(found);
+        ctx.request_repaint(); // wake the idle UI to apply the result
+    });
 }
 
 /// The raw source bytes of column `id`'s name, with a leading UTF-8 BOM stripped (the BOM is a file
