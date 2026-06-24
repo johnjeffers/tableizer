@@ -5,7 +5,7 @@ use eframe::egui;
 use encoding_rs::Encoding;
 use tableizer_core::{CancellationToken, ColumnId, ExportScope, ViewportSource, parse::Dialect};
 
-use crate::app::{QUIT_SHORTCUT, SETTINGS_SHORTCUT, TableizerApp};
+use crate::app::{CLOSE_SHORTCUT, OPEN_SHORTCUT, QUIT_SHORTCUT, SETTINGS_SHORTCUT, TableizerApp};
 use crate::model::{
     Format, GridLayout, LoadedTable, View, column_name, delimiter_display, delimiter_label,
     parse_delimiter,
@@ -17,7 +17,11 @@ use std::path::PathBuf;
 pub(crate) fn menu_bar(ui: &mut egui::Ui, app: &mut TableizerApp, to_open: &mut Option<PathBuf>) {
     ui.menu_button("File", |ui| {
         ui.set_min_width(150.0);
-        if ui.button("Open…").clicked() {
+        let open_sc = ui.ctx().format_shortcut(&OPEN_SHORTCUT);
+        if ui
+            .add(egui::Button::new("Open…").shortcut_text(open_sc))
+            .clicked()
+        {
             if let Some(path) = rfd::FileDialog::new().pick_file() {
                 *to_open = Some(path);
             }
@@ -67,8 +71,12 @@ pub(crate) fn menu_bar(ui: &mut egui::Ui, app: &mut TableizerApp, to_open: &mut 
             ui.close();
         }
         ui.separator();
+        let close_sc = ui.ctx().format_shortcut(&CLOSE_SHORTCUT);
         if ui
-            .add_enabled(loaded, egui::Button::new("Close File"))
+            .add_enabled(
+                loaded,
+                egui::Button::new("Close File").shortcut_text(close_sc),
+            )
             .clicked()
         {
             app.view = View::Empty;

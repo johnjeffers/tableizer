@@ -181,6 +181,18 @@ impl eframe::App for TableizerApp {
         if ctx.input_mut(|i| i.consume_shortcut(&QUIT_SHORTCUT)) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
+        // ⌘O / Ctrl+O opens a file (same as File ▸ Open…).
+        if ctx.input_mut(|i| i.consume_shortcut(&OPEN_SHORTCUT))
+            && let Some(path) = rfd::FileDialog::new().pick_file()
+        {
+            to_open = Some(path);
+        }
+        // ⌘W / Ctrl+W closes the current file (no-op when none is open).
+        if ctx.input_mut(|i| i.consume_shortcut(&CLOSE_SHORTCUT))
+            && matches!(self.view, View::Loaded(_))
+        {
+            self.view = View::Empty;
+        }
 
         egui::Panel::top("menu_bar").show_inside(ui, |ui| {
             // `wide_menu` gives the bar buttons *and* every dropdown popup roomier horizontal item
@@ -314,3 +326,9 @@ pub(crate) const QUIT_SHORTCUT: egui::KeyboardShortcut =
 /// Open the Settings window (⌘, / Ctrl+,).
 pub(crate) const SETTINGS_SHORTCUT: egui::KeyboardShortcut =
     egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Comma);
+/// Open a file (⌘O / Ctrl+O).
+pub(crate) const OPEN_SHORTCUT: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::O);
+/// Close the current file (⌘W / Ctrl+W).
+pub(crate) const CLOSE_SHORTCUT: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::W);
