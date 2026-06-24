@@ -28,4 +28,16 @@ tableizer-core = { path = "../tableizer-core" }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+# macOS file-open (kAEOpenDocuments) receiver — see src/macos_open.rs.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSAppleEventManager",
+    "NSAppleEventDescriptor",
+    "NSString",
+    "NSURL",
+    "objc2-core-services",
+] }
+objc2-core-foundation = { version = "0.3", features = ["CFRunLoop"] }
 # eframe added via `cargo add` (the winit + wgpu + egui desktop runtime).

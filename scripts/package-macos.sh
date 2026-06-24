@@ -46,6 +46,64 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>LSMinimumSystemVersion</key><string>10.15</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
   <key>NSHighResolutionCapable</key><true/>
+
+  <!-- Offer Tableizer as a handler (Open With / settable default) for the formats it reads. -->
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key><string>Delimited text</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.comma-separated-values-text</string>
+        <string>public.tab-separated-values-text</string>
+        <string>public.plain-text</string>
+      </array>
+    </dict>
+    <dict>
+      <key>CFBundleTypeName</key><string>JSON</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.json</string>
+        <string>public.ndjson</string>
+      </array>
+    </dict>
+    <dict>
+      <key>CFBundleTypeName</key><string>Apache Parquet</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array><string>org.apache.parquet</string></array>
+    </dict>
+  </array>
+
+  <!-- Declare UTIs for the formats with no system UTI (we support but don't own them → Imported). -->
+  <key>UTImportedTypeDeclarations</key>
+  <array>
+    <dict>
+      <key>UTTypeIdentifier</key><string>public.ndjson</string>
+      <key>UTTypeDescription</key><string>JSON Lines</string>
+      <key>UTTypeConformsTo</key><array><string>public.text</string></array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key>
+        <array><string>ndjson</string><string>jsonl</string></array>
+      </dict>
+    </dict>
+    <dict>
+      <key>UTTypeIdentifier</key><string>org.apache.parquet</string>
+      <key>UTTypeDescription</key><string>Apache Parquet</string>
+      <key>UTTypeConformsTo</key><array><string>public.data</string></array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key>
+        <array><string>parquet</string><string>pqt</string></array>
+      </dict>
+    </dict>
+  </array>
 </dict>
 </plist>
 PLIST

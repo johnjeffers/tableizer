@@ -1,6 +1,14 @@
 - Package as a standard app
 - Create release artifacts for each OS
 - App should be allowed to be set as the default handler for CSV, TSV, etc.
+  - macOS: DONE — verified warm + cold (Open With / double-click / set-as-default) on macOS 26.
+    Declaration via `CFBundleDocumentTypes` + imported UTIs in `scripts/package-macos.sh`; the
+    open-documents receiver is `src/macos_open.rs` (cold launch leans on a run-loop-entry re-assert —
+    re-verify if winit/eframe/macOS are upgraded).
+  - Windows: per-extension association via a ProgID + `shell\open\command` (installer-written); files
+    arrive as argv, so no receiver code needed.
+  - Linux: a `.desktop` file with `MimeType=` + `update-desktop-database`, plus a `shared-mime-info`
+    XML for Parquet/NDJSON (no standard MIME types); files arrive as argv.
 - Export
   - Delimited (default to CSV, but allow user to pick)
   - Parquet

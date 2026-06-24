@@ -15,6 +15,8 @@
 
 mod app;
 mod fonts;
+#[cfg(target_os = "macos")]
+mod macos_open;
 mod model;
 mod persist;
 mod theme;
@@ -35,6 +37,10 @@ fn app_icon() -> egui::IconData {
 
 fn main() -> eframe::Result<()> {
     let path = std::env::args_os().nth(1).map(PathBuf::from);
+    // Register the macOS open-documents handler as early as possible, to give a cold-launch file the
+    // best chance of being caught before AppKit dispatches it (see macos_open.rs).
+    #[cfg(target_os = "macos")]
+    macos_open::install();
     let native_options = eframe::NativeOptions {
         // Initial size on first launch; the `persistence` feature restores the last geometry after.
         viewport: egui::ViewportBuilder::default()
@@ -49,6 +55,10 @@ fn main() -> eframe::Result<()> {
         Box::new(move |cc| {
             let mut app = TableizerApp::new(path);
             app.install_fonts(&cc.egui_ctx); // chrome + table fonts; re-installed on change in `ui`
+            // Let the open-documents handler wake an idle UI to drain a received file. (Re-asserting
+            // the handler after launch is handled by the run-loop observer in `install`.)
+            #[cfg(target_os = "macos")]
+            macos_open::set_repaint_ctx(cc.egui_ctx.clone());
             // The theme (`theme` module) is resolved and applied each frame in `App::ui`.
             Ok(Box::new(app))
         }),

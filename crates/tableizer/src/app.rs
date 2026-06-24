@@ -272,6 +272,12 @@ impl eframe::App for TableizerApp {
         if self.theme != theme_before {
             prefs::save(&self.theme);
         }
+        // Files handed to us by macOS "Open With" / double-click arrive via an Apple Event, not argv
+        // (see macos_open.rs); open whatever has been queued since the last frame.
+        #[cfg(target_os = "macos")]
+        for path in crate::macos_open::take_pending() {
+            self.open_path(path);
+        }
         if let Some(path) = to_open {
             self.open_path(path);
         }
