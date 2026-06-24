@@ -331,12 +331,24 @@ impl egui_table::TableDelegate for GridDelegate<'_> {
                 .text_style(theme::text_style(theme::COLUMN_HEADER)),
         )
         .selectable(false);
-        // Auto-size (double-click separator) must also fit the header name → measure it in full.
-        ui.add(if ui.is_sizing_pass() {
-            name_label.wrap_mode(egui::TextWrapMode::Extend)
+        // Reserve room on the right for the sort arrow — always, even on unsorted columns — so the
+        // name never sits under it and auto-size (double-click separator) leaves space for it.
+        const SORT_ARROW_W: f32 = 18.0;
+        if ui.is_sizing_pass() {
+            // Auto-size measures the natural content: grip + full name + the sort-arrow reservation.
+            ui.add(name_label.wrap_mode(egui::TextWrapMode::Extend));
+            ui.add_space(SORT_ARROW_W);
         } else {
-            name_label.truncate()
-        });
+            // Display: truncate the name to the width left of the sort-arrow column.
+            let name_w = (ui.available_width() - SORT_ARROW_W).max(0.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(name_w, cell_h),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.add(name_label.truncate());
+                },
+            );
+        }
 
         // Sort indicator: a small accent triangle on the sorted column (painted, not a glyph).
         if let Some(sort) = self.sort
