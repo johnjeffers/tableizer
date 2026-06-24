@@ -12,17 +12,33 @@ workspace = true
 
 [dependencies]
 arrow = "59.0.0"
+aws-config = { version = "1.8.18", features = ["sso"] }
+aws-credential-types = "1.2.14"
+# Drop the default `rustls` feature: it pulls the SDK's *legacy* rustls 0.21 client (vulnerable
+# rustls-webpki 0.101 — RUSTSEC-2026-0098/0099/0104). `default-https-client` is the modern stack,
+# the same one `aws-config` defaults to.
+aws-sdk-s3 = { version = "1.137.0", default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+    "sigv4a",
+    "http-1x",
+] }
 csv = "1.4.0"
 directories = "6.0.0"
 encoding_rs = "0.8.35"
+flate2 = "1.1.9"
+futures = "0.3.32"
 memchr = "2.8.2"
 memmap2 = "0.9.11"
+object_store = { version = "0.14.0", features = ["aws", "gcp", "azure", "http"] }
 parquet = "59.0.0"
 regex = "1.12.4"
 # preserve_order: NDJSON columns follow first-seen object-key order, not serde_json's default
 # alphabetical sort (which would shuffle the table's columns relative to the source).
 serde_json = { version = "1.0.150", features = ["preserve_order"] }
 thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "net", "time"] }
+url = "2.5.8"
 # thiserror added via `cargo add`.
 
 # Engine dependency spine (add each as the corresponding module is implemented, so there are no

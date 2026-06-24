@@ -96,6 +96,41 @@ files in practice — huge UTF-16 is not streamed). The known caveat: an `mmap`e
 another process can `SIGBUS`; a positioned-`pread` fallback + SIGBUS guard is the planned hardening
 for adversarial / network / removable media.
 
+**Gzip** (`crates/tableizer-core/src/gzip.rs`) is *streaming* — no random access — so it is handled
+the same way as a remote object: a gzipped file (detected by magic bytes, not extension) is
+**decompressed once to a cache file** in the OS *state* dir under `tableizer/decompressed` (streamed,
+progress + cancel, keyed by source `{path, size, mtime}`), and the seekable decompressed file is what
+the engine opens. Byte fidelity holds on the decompressed content (decode is lossless/deterministic;
+the wrapper is transport). It composes with remote: an `s3://…/data.csv.gz` is downloaded, then
+decompressed, then opened. The three caches (index, downloaded objects, decompressed files) share the
+state dir and are surfaced together with one **Clear cache** control (Settings ▸ Cache).
+
+**Remote / cloud sources** (`crates/tableizer-core/src/remote.rs`) are reached through the
+`object_store` crate (multi-cloud: S3 / GCS / Azure / HTTP behind one ranged-read API). It is *pure
+I/O* — a byte source, not a query or sort engine — so reusing it leaves the "the external sort is
+ours" invariant untouched. The current strategy is **download-to-cache**: a remote object is fetched
+once (streamed, with progress + cancel) into the OS *state* dir under `tableizer/remote-cache`, keyed
+by the object's ETag (else size + last-modified), then opened exactly like a local file — so the whole
+engine (index, view, sort, search, export, index persistence) works unchanged. The object store is
+async; that is confined to `remote.rs` behind a per-call current-thread runtime so the engine stays
+synchronous. **Credentials:** `object_store::parse_url` builds a *blank* backend (it does not read the
+environment), so auth is passed explicitly as options merged over the process environment. For S3 the
+options come from one of two sources, chosen in Settings ▸ Cloud storage: (1) the **AWS provider chain**
+(default) — `remote::aws_credentials` runs `aws-config` to resolve environment, `~/.aws` profiles,
+**SSO** (the `aws sso login` token cache → temporary credentials), assume-role, and EC2/ECS roles;
+`object_store` has no SSO of its own, so we resolve and pass static temp credentials in. Or (2) a
+**static-keys** form for pasted credentials / S3-compatible stores (MinIO, R2: endpoint + allow-HTTP).
+A **cloud file browser** lets the user pick a file instead of typing a URL: it opens to a bucket list
+discovered from the credentials (`remote::list_s3_buckets`, via `aws-sdk-s3`'s `ListBuckets` — needed
+because `object_store` is bucket-scoped and can't enumerate buckets), then navigates folders/files with
+`remote::list_dir` (`object_store`'s `list_with_delimiter`). All on a background thread with the same
+credential resolution as opening.
+
+The documented next step is a **streaming `ReadAt` source** — first screen from a head fetch,
+random access by ranged GET, no full download — which generalises the same `pread`/SIGBUS seam above
+and reuses this `object_store` backend and cache directory; download-to-cache is a strict subset of
+it (eager instead of lazy).
+
 ## Concurrency
 
 Index builds and view builds run on background threads; each long job carries a `CancellationToken`

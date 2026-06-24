@@ -13,13 +13,14 @@ use tableizer_core::{
 };
 
 use crate::model::{
-    FindJob, Format, GridLayout, LoadedTable, RowSpan, SavedView, SharedTable, View, ViewControls,
-    delimiter_display, detect_format, highlight_matcher, next_match, open_table, sniff_file,
+    CloudConfig, FindJob, Format, GridLayout, LoadedTable, RowSpan, SavedView, SharedTable, View,
+    ViewControls, delimiter_display, detect_format, highlight_matcher, next_match, open_table,
+    sniff_file,
 };
-use crate::persist::{prefs, recent, views};
+use crate::persist::{cloud, prefs, recent, views};
 use crate::ui::{
-    ExportKind, ExportRequest, columns_tab, empty_view, fmt_count, grid, menu_bar, parsing_tab,
-    settings_tab, status_bar, toolbar,
+    ExportKind, ExportRequest, columns_tab, empty_view, fmt_bytes, fmt_count, grid, menu_bar,
+    parsing_tab, settings_tab, status_bar, toolbar,
 };
 use crate::{fonts, theme};
 
@@ -63,6 +64,107 @@ pub(crate) struct TableizerApp {
     pub(crate) panel_tab: PanelTab,
     /// The in-flight (or just-finished) export, if any — driven on a background thread.
     export_job: Option<ExportJob>,
+    /// The in-flight (or just-finished) remote download, if any — driven on a background thread.
+    download_job: Option<DownloadJob>,
+    /// The in-flight (or just-finished) gzip decompression, if any — driven on a background thread.
+    decompress_job: Option<DecompressJob>,
+    /// Whether the "Open URL…" entry dialog is showing (set from the File menu too).
+    pub(crate) url_dialog_open: bool,
+    /// Text in the "Open URL…" entry field.
+    url_input: String,
+    /// A target (path or URL) queued at startup (CLI arg) to open on the first frame, once a `Context`
+    /// exists to drive a remote download's progress UI.
+    pending_target: Option<String>,
+    /// S3 credentials/config (from Settings) applied when opening `s3://` URLs.
+    cloud: CloudConfig,
+    /// Whether the cloud file-browser dialog is showing.
+    pub(crate) browse_open: bool,
+    /// The browser's editable location field (a bucket root or prefix URL).
+    browse_input: String,
+    /// The prefix URL currently listed (drives "Up" and stale-result filtering).
+    browse_current: String,
+    /// The in-flight directory listing, if any.
+    browse_job: Option<BrowseJob>,
+    /// The most recent successful listing, rendered in the browser.
+    browse_listing: Option<tableizer_core::remote::DirListing>,
+    /// The most recent listing error, if any.
+    browse_error: Option<String>,
+}
+
+/// A running (or just-finished) remote download to the local cache, on a background thread so a
+/// multi-GB object fetch never blocks the UI (Tier-C: async, progress, cancellable). The UI polls
+/// `progress`/`total`/`outcome` each frame; on success the cached file is opened like a local one.
+struct DownloadJob {
+    /// The source URL — shown in the progress dialog and used as the opened table's `origin`.
+    target: String,
+    /// Bytes downloaded so far (published by the engine's fetch loop).
+    progress: Arc<AtomicU64>,
+    /// Total bytes to download (from the object's `head`; 0 until known).
+    total: Arc<AtomicU64>,
+    /// Cancels the download thread when the user hits Cancel.
+    cancel: CancellationToken,
+    /// `None` while running; `Some(Ok(local_path))` on success, `Some(Err)` with a message on failure.
+    outcome: Arc<Mutex<Option<Result<PathBuf, String>>>>,
+}
+
+/// A running (or just-finished) gzip decompression to the local cache, on a background thread so a
+/// multi-GB decompress never blocks the UI. On success the decompressed file is opened.
+struct DecompressJob {
+    /// The source label (path or URL) — shown in the dialog and used as the opened table's `origin`.
+    origin: String,
+    /// Compressed bytes consumed so far.
+    progress: Arc<AtomicU64>,
+    /// Total compressed bytes (the source size).
+    total: Arc<AtomicU64>,
+    cancel: CancellationToken,
+    /// `None` while running; `Some(Ok(local_path))` on success, `Some(Err)` with a message on failure.
+    outcome: Arc<Mutex<Option<Result<PathBuf, String>>>>,
+}
+
+/// The user's cloud-auth choice, captured so a worker thread (download or browse) can resolve the
+/// final `object_store` options off the UI thread (the AWS chain does a network round-trip).
+struct CloudAuth {
+    /// Static form options (region/endpoint/allow-http, plus keys in static mode).
+    form_options: Vec<(String, String)>,
+    /// Whether to resolve the AWS chain (env / profiles / SSO / role) — S3 + chosen, on this target.
+    use_chain: bool,
+    profile: Option<String>,
+    region: Option<String>,
+}
+
+impl CloudAuth {
+    /// Resolve to final `object_store` options on a worker thread: AWS-chain credentials first (when
+    /// applicable), then the form options layered on top so an explicit value wins.
+    fn resolve(self) -> Result<Vec<(String, String)>, String> {
+        let mut options = if self.use_chain {
+            tableizer_core::remote::aws_credentials(self.profile.as_deref(), self.region.as_deref())
+                .map_err(|e| e.to_string())?
+        } else {
+            Vec::new()
+        };
+        options.extend(self.form_options);
+        Ok(options)
+    }
+}
+
+/// A running (or just-finished) remote directory listing for the file browser, on a background thread
+/// (the listing call does network I/O). The UI polls `outcome` each frame.
+struct BrowseJob {
+    /// The prefix URL being listed (so a stale poll for a superseded navigation can be ignored).
+    location: String,
+    cancel: CancellationToken,
+    outcome: Arc<Mutex<Option<Result<tableizer_core::remote::DirListing, String>>>>,
+}
+
+/// What [`TableizerApp::show_browse`] asks the update loop to do after rendering the browser.
+enum BrowseAction {
+    None,
+    /// Navigate to (list) a prefix URL.
+    Navigate(String),
+    /// Open the chosen file URL (and close the browser).
+    Open(String),
+    /// Close the browser.
+    Close,
 }
 
 /// Which tab the right-side panel shows. Columns and Parsing need a loaded file (Parsing only for
@@ -86,7 +188,7 @@ impl PanelTab {
 }
 
 impl TableizerApp {
-    pub(crate) fn new(path: Option<PathBuf>) -> Self {
+    pub(crate) fn new(target: Option<String>) -> Self {
         let mut db = fontdb::Database::new();
         db.load_system_fonts();
         // Fast family list now (metadata only); refine monospace flags off-thread (parsing fonts to
@@ -100,7 +202,9 @@ impl TableizerApp {
                 let _ = font_tx.send(fonts::installed_families(&fonts_db, true));
             });
         }
-        let mut app = Self {
+        // Defer opening the CLI target to the first frame (a remote URL needs a `Context` for its
+        // download-progress UI); a local path opens effectively instantly there too.
+        Self {
             view: View::Empty,
             recent: recent::load(),
             theme: prefs::load(),
@@ -114,11 +218,19 @@ impl TableizerApp {
             panel_open: false,
             panel_tab: PanelTab::default(),
             export_job: None,
-        };
-        if let Some(path) = path {
-            app.open_path(path);
+            download_job: None,
+            decompress_job: None,
+            url_dialog_open: false,
+            url_input: String::new(),
+            pending_target: target,
+            cloud: cloud::load(),
+            browse_open: false,
+            browse_input: String::new(),
+            browse_current: String::new(),
+            browse_job: None,
+            browse_listing: None,
+            browse_error: None,
         }
-        app
     }
 
     /// Rebuild and install the font atlas (chrome + table fonts) for the current settings.
@@ -128,11 +240,39 @@ impl TableizerApp {
         self.applied_table_font = self.theme.table_font.clone();
     }
 
-    fn open_path(&mut self, path: PathBuf) {
+    /// Open a target chosen anywhere (CLI arg, Open dialog, recent, macOS Open-With): a remote URL is
+    /// downloaded to the local cache on a background thread (progress UI), then opened; a local path
+    /// opens directly. Always resets the grid's stored column widths so the new file auto-fits.
+    fn open_target(&mut self, target: String, ctx: &egui::Context) {
+        if tableizer_core::remote::is_remote(&target) {
+            self.start_download(target, ctx);
+        } else {
+            self.open_prepared(PathBuf::from(&target), target, ctx);
+        }
+    }
+
+    /// A local file is in hand (opened directly, or just downloaded): decompress it first if it's
+    /// gzipped (on a background thread), otherwise open it. `origin` is the user-facing label (URL or
+    /// path) for the status bar / recent / saved views.
+    fn open_prepared(&mut self, local: PathBuf, origin: String, ctx: &egui::Context) {
+        if tableizer_core::gzip::is_gzip(&local) {
+            self.start_decompress(local, origin, ctx);
+        } else {
+            self.open_resolved(local, origin, ctx);
+        }
+    }
+
+    /// Open a resolved **local, uncompressed** file (`engine_path` — the file itself, a downloaded
+    /// copy, or a decompressed copy) under the given `origin` label. `origin` keys recent files and
+    /// saved views so they survive a re-download/re-decompress to a different cache filename. Resets
+    /// the grid's stored column widths so the new file auto-fits.
+    fn open_resolved(&mut self, engine_path: PathBuf, origin: String, ctx: &egui::Context) {
+        ctx.data_mut(|d| d.remove_by_type::<egui_table::TableState>());
+        let path = engine_path;
         let format = detect_format(&path);
         // The saved view (column layout/sort/filter) applies to every format; only the delimiter
-        // override within it is delimited-specific.
-        let saved = views::load(&path).unwrap_or_default();
+        // override within it is delimited-specific. Keyed by `origin`, not the local cache path.
+        let saved = views::load(Path::new(&origin)).unwrap_or_default();
         // Delimiter sniffing + override only make sense for delimited text; the other formats carry
         // their own schema, so they use a default dialect (header on → exports include column names).
         let (dialect, detected_delimiter, delimiter_auto) = match format {
@@ -160,13 +300,14 @@ impl TableizerApp {
                 let mut layout = GridLayout::new(table.schema().columns.len());
                 let mut view = ViewControls::default();
                 saved.apply(&mut layout, &mut view);
-                recent::add(&mut self.recent, &path);
+                recent::add(&mut self.recent, Path::new(&origin));
                 View::Loaded(Box::new(LoadedTable {
                     delimiter_input: delimiter_display(dialect.delimiter),
                     detected_delimiter,
                     delimiter_auto,
                     format,
                     path,
+                    origin,
                     table,
                     layout,
                     dialect,
@@ -242,6 +383,7 @@ impl TableizerApp {
                 &self.font_families,
                 &mut self.font_search,
                 &mut self.font_mono_only,
+                &mut self.cloud,
             ),
         }
     }
@@ -377,6 +519,541 @@ impl TableizerApp {
             self.export_job = None;
         }
     }
+
+    /// Capture the user's cloud-auth choice for a worker thread acting on `target` (download/list).
+    fn cloud_auth(&self, target: &str) -> CloudAuth {
+        CloudAuth {
+            form_options: self.cloud.s3_options(),
+            use_chain: self.cloud.uses_aws_chain() && tableizer_core::remote::is_s3(target),
+            profile: self.cloud.profile().map(str::to_owned),
+            region: self.cloud.region().map(str::to_owned),
+        }
+    }
+
+    /// Begin downloading a remote URL to the local cache on a background thread (Tier-C: async,
+    /// progress within ~100 ms, cancellable) via the engine's `object_store` seam. On completion
+    /// [`poll_download`](Self::poll_download) opens the cached file. One download at a time.
+    fn start_download(&mut self, target: String, ctx: &egui::Context) {
+        if self.download_job.is_some() {
+            return; // one download at a time
+        }
+        let Some(cache_root) = tableizer_core::remote::cache_dir() else {
+            self.view = View::Failed {
+                path: PathBuf::from(&target),
+                error: "no cache directory is available for downloads".to_string(),
+            };
+            return;
+        };
+        self.url_dialog_open = false;
+        let cancel = CancellationToken::new();
+        let progress = Arc::new(AtomicU64::new(0));
+        let total = Arc::new(AtomicU64::new(0));
+        let outcome: Arc<Mutex<Option<Result<PathBuf, String>>>> = Arc::new(Mutex::new(None));
+        self.download_job = Some(DownloadJob {
+            target: target.clone(),
+            progress: Arc::clone(&progress),
+            total: Arc::clone(&total),
+            cancel: cancel.clone(),
+            outcome: Arc::clone(&outcome),
+        });
+
+        let auth = self.cloud_auth(&target);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = (|| -> Result<PathBuf, String> {
+                let options = auth.resolve()?; // env / SSO / profile / static, resolved off the UI thread
+                tableizer_core::remote::fetch_to_cache(
+                    &target,
+                    &cache_root,
+                    &options,
+                    &progress,
+                    &total,
+                    &cancel,
+                )
+                .map_err(|e| e.to_string())
+            })();
+            *outcome.lock().expect("download outcome lock") = Some(result);
+            ctx.request_repaint(); // wake the idle UI to apply the result
+        });
+    }
+
+    /// Poll a running download: on success open the cached file (decompressing first if it's gzipped);
+    /// a failure is left in `download_job` for [`show_download`] to surface.
+    fn poll_download(&mut self, ctx: &egui::Context) {
+        let outcome = self
+            .download_job
+            .as_ref()
+            .and_then(|j| j.outcome.lock().expect("download outcome lock").clone());
+        match outcome {
+            Some(Ok(local)) => {
+                let origin = self
+                    .download_job
+                    .take()
+                    .map(|j| j.target)
+                    .unwrap_or_default();
+                self.open_prepared(local, origin, ctx);
+            }
+            Some(Err(_)) => {} // leave the job; show_download renders the error + Close
+            None => {
+                if self.download_job.is_some() {
+                    ctx.request_repaint(); // keep the progress bar moving
+                }
+            }
+        }
+    }
+
+    /// Begin decompressing a gzipped local file to the cache on a background thread (progress +
+    /// cancel). On completion [`poll_decompress`](Self::poll_decompress) opens the result.
+    fn start_decompress(&mut self, gz_path: PathBuf, origin: String, ctx: &egui::Context) {
+        if self.decompress_job.is_some() {
+            return; // one at a time
+        }
+        let Some(cache_root) = tableizer_core::gzip::cache_dir() else {
+            self.view = View::Failed {
+                path: gz_path,
+                error: "no cache directory is available for decompression".to_string(),
+            };
+            return;
+        };
+        let cancel = CancellationToken::new();
+        let progress = Arc::new(AtomicU64::new(0));
+        let total = Arc::new(AtomicU64::new(0));
+        let outcome: Arc<Mutex<Option<Result<PathBuf, String>>>> = Arc::new(Mutex::new(None));
+        self.decompress_job = Some(DecompressJob {
+            origin,
+            progress: Arc::clone(&progress),
+            total: Arc::clone(&total),
+            cancel: cancel.clone(),
+            outcome: Arc::clone(&outcome),
+        });
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = tableizer_core::gzip::decompress_to_cache(
+                &gz_path,
+                &cache_root,
+                &progress,
+                &total,
+                &cancel,
+            )
+            .map_err(|e| e.to_string());
+            *outcome.lock().expect("decompress outcome lock") = Some(result);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Poll a running decompression: on success open the decompressed file; a failure is left in
+    /// `decompress_job` for [`show_decompress`] to surface.
+    fn poll_decompress(&mut self, ctx: &egui::Context) {
+        let outcome = self
+            .decompress_job
+            .as_ref()
+            .and_then(|j| j.outcome.lock().expect("decompress outcome lock").clone());
+        match outcome {
+            Some(Ok(decompressed)) => {
+                let origin = self
+                    .decompress_job
+                    .take()
+                    .map(|j| j.origin)
+                    .unwrap_or_default();
+                self.open_resolved(decompressed, origin, ctx);
+            }
+            Some(Err(_)) => {} // leave the job; show_decompress renders the error + Close
+            None => {
+                if self.decompress_job.is_some() {
+                    ctx.request_repaint();
+                }
+            }
+        }
+    }
+
+    /// Render the decompression dialog: progress + Cancel while running, an error + Close on failure
+    /// (a success is opened by [`poll_decompress`], so the dialog just closes next frame).
+    fn show_decompress(&mut self, ctx: &egui::Context) {
+        let Some(job) = &self.decompress_job else {
+            return;
+        };
+        let outcome = job.outcome.lock().expect("decompress outcome lock").clone();
+        let mut dismiss = false;
+        egui::Window::new("Decompressing")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_width(320.0);
+                match &outcome {
+                    None => {
+                        let done = job.progress.load(Ordering::Relaxed);
+                        let total = job.total.load(Ordering::Relaxed);
+                        ui.label(format!("Decompressing {}…", job.origin));
+                        ui.add_space(4.0);
+                        let frac = if total > 0 {
+                            done as f32 / total as f32
+                        } else {
+                            0.0
+                        };
+                        ui.add(egui::ProgressBar::new(frac).show_percentage());
+                        ui.add_space(6.0);
+                        if ui.button("Cancel").clicked() {
+                            job.cancel.cancel();
+                        }
+                        ctx.request_repaint();
+                    }
+                    Some(Ok(_)) => {} // opened by poll_decompress; closes next frame
+                    Some(Err(error)) => {
+                        if job.cancel.is_cancelled() {
+                            ui.label("Decompression cancelled.");
+                        } else {
+                            ui.colored_label(
+                                ui.visuals().error_fg_color,
+                                format!("Decompression failed: {error}"),
+                            );
+                        }
+                        ui.add_space(6.0);
+                        dismiss = ui.button("Close").clicked();
+                    }
+                }
+            });
+        if dismiss {
+            self.decompress_job = None;
+        }
+    }
+
+    /// Render the download dialog: progress + Cancel while running, an error + Close on failure (a
+    /// success is opened by [`poll_download`], so the dialog just closes next frame).
+    fn show_download(&mut self, ctx: &egui::Context) {
+        let Some(job) = &self.download_job else {
+            return;
+        };
+        let outcome = job.outcome.lock().expect("download outcome lock").clone();
+        let mut dismiss = false;
+        egui::Window::new("Downloading")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_width(320.0);
+                match &outcome {
+                    None => {
+                        let done = job.progress.load(Ordering::Relaxed);
+                        let total = job.total.load(Ordering::Relaxed);
+                        ui.label(format!("Downloading {}…", job.target));
+                        ui.add_space(4.0);
+                        let frac = if total > 0 {
+                            done as f32 / total as f32
+                        } else {
+                            0.0
+                        };
+                        ui.add(egui::ProgressBar::new(frac).show_percentage());
+                        ui.add_space(2.0);
+                        ui.label(if total > 0 {
+                            format!("{} / {}", fmt_bytes(done), fmt_bytes(total))
+                        } else {
+                            format!("{} downloaded", fmt_bytes(done))
+                        });
+                        ui.add_space(6.0);
+                        if ui.button("Cancel").clicked() {
+                            job.cancel.cancel();
+                        }
+                        ctx.request_repaint();
+                    }
+                    Some(Ok(_)) => {} // opened by poll_download; this dialog closes next frame
+                    Some(Err(error)) => {
+                        if job.cancel.is_cancelled() {
+                            ui.label("Download cancelled.");
+                        } else {
+                            ui.colored_label(
+                                ui.visuals().error_fg_color,
+                                format!("Download failed: {error}"),
+                            );
+                        }
+                        ui.add_space(6.0);
+                        dismiss = ui.button("Close").clicked();
+                    }
+                }
+            });
+        if dismiss {
+            self.download_job = None;
+        }
+    }
+
+    /// The "Open URL…" entry dialog. Returns the entered URL when the user submits (Open / Enter);
+    /// `None` otherwise. Esc or Cancel dismisses it.
+    fn show_url_dialog(&mut self, ctx: &egui::Context) -> Option<String> {
+        if !self.url_dialog_open {
+            return None;
+        }
+        let mut submitted = None;
+        let mut close = false;
+        let mut browse = false;
+        egui::Window::new("Open URL")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_width(420.0);
+                ui.label("Open a file from cloud storage (S3, GCS, Azure, or HTTP):");
+                ui.add_space(6.0);
+                let edit = ui.add(
+                    egui::TextEdit::singleline(&mut self.url_input)
+                        .hint_text("s3://bucket/path/data.csv")
+                        .desired_width(f32::INFINITY),
+                );
+                edit.request_focus();
+                let entered = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let ready = !self.url_input.trim().is_empty();
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(ready, egui::Button::new("Open")).clicked()
+                        || (entered && ready)
+                    {
+                        submitted = Some(self.url_input.trim().to_string());
+                    }
+                    // Browse from the typed location (or the bucket) instead of opening it directly.
+                    if ui.button("Browse…").clicked() {
+                        browse = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                });
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    close = true;
+                }
+            });
+        if browse {
+            self.url_dialog_open = false;
+            self.browse_open = true;
+            self.browse_input = self.url_input.trim().to_string();
+            self.url_input.clear();
+            return None;
+        }
+        if submitted.is_some() || close {
+            self.url_dialog_open = false;
+            self.url_input.clear();
+        }
+        submitted
+    }
+
+    /// The S3 connection parameters for bucket discovery, from the Settings cloud config.
+    fn s3_auth(&self) -> tableizer_core::remote::S3Auth {
+        let c = &self.cloud;
+        // Static keys only apply in the static-keys mode; otherwise the AWS chain (incl. SSO) is used.
+        let field =
+            |value: &str| (!c.uses_aws_chain() && !value.is_empty()).then(|| value.to_owned());
+        tableizer_core::remote::S3Auth {
+            profile: c.profile().map(str::to_owned),
+            region: c.region().map(str::to_owned),
+            access_key_id: field(&c.access_key_id),
+            secret_access_key: field(&c.secret_access_key),
+            session_token: field(&c.session_token),
+            endpoint: field(&c.endpoint),
+        }
+    }
+
+    /// List `location` in the browser on a background thread, superseding any in-flight listing. An
+    /// **empty** location is the root: discover S3 buckets from the credentials. The result is picked
+    /// up by [`poll_browse`](Self::poll_browse).
+    fn navigate_browse(&mut self, location: String, ctx: &egui::Context) {
+        self.browse_current = location.clone();
+        self.browse_input = location.clone();
+        self.browse_error = None;
+        if let Some(prev) = self.browse_job.take() {
+            prev.cancel.cancel();
+        }
+        let cancel = CancellationToken::new();
+        let outcome: Arc<Mutex<Option<Result<tableizer_core::remote::DirListing, String>>>> =
+            Arc::new(Mutex::new(None));
+        self.browse_job = Some(BrowseJob {
+            location: location.clone(),
+            cancel: cancel.clone(),
+            outcome: Arc::clone(&outcome),
+        });
+        let ctx = ctx.clone();
+        if location.is_empty() {
+            // Root view: enumerate buckets reachable with the configured credentials.
+            let auth = self.s3_auth();
+            std::thread::spawn(move || {
+                let result =
+                    tableizer_core::remote::list_s3_buckets(&auth).map_err(|e| e.to_string());
+                *outcome.lock().expect("browse outcome lock") = Some(result);
+                ctx.request_repaint();
+            });
+            return;
+        }
+        let auth = self.cloud_auth(&location);
+        std::thread::spawn(move || {
+            let result = (|| -> Result<tableizer_core::remote::DirListing, String> {
+                let options = auth.resolve()?;
+                tableizer_core::remote::list_dir(&location, &options, &cancel)
+                    .map_err(|e| e.to_string())
+            })();
+            *outcome.lock().expect("browse outcome lock") = Some(result);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Poll the running listing into `browse_listing`/`browse_error`, ignoring a result for a prefix
+    /// the user has already navigated away from.
+    fn poll_browse(&mut self, ctx: &egui::Context) {
+        let done = self.browse_job.as_ref().and_then(|job| {
+            job.outcome
+                .lock()
+                .expect("browse outcome lock")
+                .take()
+                .map(|result| (job.location.clone(), result))
+        });
+        let Some((location, result)) = done else {
+            if self.browse_job.is_some() {
+                ctx.request_repaint();
+            }
+            return;
+        };
+        self.browse_job = None;
+        if location != self.browse_current {
+            return; // a newer navigation superseded this listing
+        }
+        match result {
+            Ok(listing) => {
+                self.browse_listing = Some(listing);
+                self.browse_error = None;
+            }
+            Err(error) => self.browse_error = Some(error),
+        }
+    }
+
+    /// Close the browser and reset its state, so the next open rediscovers buckets with current creds.
+    fn close_browser(&mut self) {
+        self.browse_open = false;
+        self.browse_current.clear();
+        self.browse_input.clear();
+        self.browse_listing = None;
+        self.browse_error = None;
+        if let Some(job) = self.browse_job.take() {
+            job.cancel.cancel();
+        }
+    }
+
+    /// Render the cloud file browser: a location field + Go, an Up button, and a list of folders
+    /// (navigate) and files (open). Returns the action for the update loop to apply.
+    fn show_browse(&mut self, ctx: &egui::Context) -> BrowseAction {
+        if !self.browse_open {
+            return BrowseAction::None;
+        }
+        let mut action = BrowseAction::None;
+        // Split-borrow the fields the closure touches so the location field stays editable while the
+        // listing/error are read.
+        let TableizerApp {
+            browse_input,
+            browse_current,
+            browse_listing,
+            browse_error,
+            browse_job,
+            ..
+        } = self;
+        let running = browse_job.is_some();
+        egui::Window::new("Browse cloud storage")
+            .collapsible(false)
+            .resizable(true)
+            .default_size([520.0, 420.0])
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let submit = ui
+                        .add(
+                            egui::TextEdit::singleline(browse_input)
+                                .hint_text("s3://bucket/prefix/")
+                                .desired_width(ui.available_width() - 56.0),
+                        )
+                        .lost_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if ui.button("Go").clicked() || submit {
+                        action = BrowseAction::Navigate(browse_input.trim().to_string());
+                    }
+                });
+                ui.horizontal(|ui| {
+                    // "Up" goes to the parent prefix, or — at a bucket root — back to the bucket list
+                    // (the empty root). Disabled only at the bucket list itself.
+                    let up = if browse_current.is_empty() {
+                        None
+                    } else {
+                        tableizer_core::remote::parent_url(browse_current).or_else(|| {
+                            tableizer_core::remote::is_s3(browse_current).then(String::new)
+                        })
+                    };
+                    if ui
+                        .add_enabled(up.is_some(), egui::Button::new("Up"))
+                        .clicked()
+                        && let Some(up) = up
+                    {
+                        action = BrowseAction::Navigate(up);
+                    }
+                    let here = if browse_current.is_empty() {
+                        "Buckets"
+                    } else {
+                        browse_current.as_str()
+                    };
+                    ui.label(egui::RichText::new(here).weak());
+                    if running {
+                        ui.spinner();
+                    }
+                });
+                ui.separator();
+                if let Some(error) = browse_error.as_ref() {
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                    ui.add_space(4.0);
+                }
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| match browse_listing.as_ref() {
+                        Some(listing) if !listing.entries.is_empty() => {
+                            for entry in &listing.entries {
+                                if entry.is_dir {
+                                    if ui
+                                        .selectable_label(false, format!("{}/", entry.name))
+                                        .clicked()
+                                    {
+                                        action = BrowseAction::Navigate(entry.url.clone());
+                                    }
+                                } else {
+                                    ui.horizontal(|ui| {
+                                        if ui.selectable_label(false, entry.name.as_str()).clicked()
+                                        {
+                                            action = BrowseAction::Open(entry.url.clone());
+                                        }
+                                        if let Some(size) = entry.size {
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(fmt_bytes(size)).weak(),
+                                                    );
+                                                },
+                                            );
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                        Some(_) if !running => {
+                            ui.label(egui::RichText::new("(empty)").weak());
+                        }
+                        _ if running => {
+                            ui.label("Listing…");
+                        }
+                        _ => {
+                            ui.label(
+                                egui::RichText::new("Enter a bucket or prefix URL and press Go.")
+                                    .weak(),
+                            );
+                        }
+                    });
+                ui.separator();
+                if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    action = BrowseAction::Close;
+                }
+            });
+        action
+    }
 }
 
 impl eframe::App for TableizerApp {
@@ -392,6 +1069,41 @@ impl eframe::App for TableizerApp {
 
         // A running/finished export shows its own progress dialog (cancellable, off the UI thread).
         self.show_export(&ctx);
+
+        // Open a CLI target queued at startup, now that a `Context` exists to drive a download's UI.
+        if let Some(target) = self.pending_target.take() {
+            self.open_target(target, &ctx);
+        }
+        // A running/finished remote download: poll it (opening the cached file on success) and show
+        // its progress dialog. The "Open URL…" entry dialog starts a download when submitted.
+        self.poll_download(&ctx);
+        self.show_download(&ctx);
+        // A gzipped file (local or just-downloaded) is decompressed to the cache before opening.
+        self.poll_decompress(&ctx);
+        self.show_decompress(&ctx);
+        if let Some(url) = self.show_url_dialog(&ctx) {
+            self.open_target(url, &ctx);
+        }
+        // The cloud file browser: on first open (nothing loaded yet) auto-list the bucket root, then
+        // poll any in-flight listing, render it, and apply the chosen action.
+        if self.browse_open
+            && self.browse_job.is_none()
+            && self.browse_listing.is_none()
+            && self.browse_error.is_none()
+        {
+            let start = self.browse_input.trim().to_string();
+            self.navigate_browse(start, &ctx);
+        }
+        self.poll_browse(&ctx);
+        match self.show_browse(&ctx) {
+            BrowseAction::Navigate(location) => self.navigate_browse(location, &ctx),
+            BrowseAction::Open(url) => {
+                self.close_browser();
+                self.open_target(url, &ctx);
+            }
+            BrowseAction::Close => self.close_browser(),
+            BrowseAction::None => {}
+        }
 
         // Resolve the theme (following the OS for `Auto`) and restyle only when it changes.
         let system_dark = ctx.system_theme().is_none_or(|t| t == egui::Theme::Dark);
@@ -420,7 +1132,10 @@ impl eframe::App for TableizerApp {
 
         let mut to_open: Option<PathBuf> = None;
         let mut to_export: Option<ExportRequest> = None;
+        let mut open_url = false;
+        let mut open_browse = false;
         let theme_before = self.theme.clone();
+        let cloud_before = self.cloud.clone();
         let dialect_before = match &self.view {
             View::Loaded(loaded) => Some(loaded.dialect),
             _ => None,
@@ -526,7 +1241,7 @@ impl eframe::App for TableizerApp {
                 let delimiter = (!loaded.delimiter_auto).then_some(loaded.dialect.delimiter);
                 let current = SavedView::snapshot(&loaded.layout, &loaded.view, delimiter);
                 if current != loaded.saved {
-                    views::save(&loaded.path, &current);
+                    views::save(Path::new(&loaded.origin), &current);
                     loaded.saved = current;
                 }
             }
@@ -561,7 +1276,13 @@ impl eframe::App for TableizerApp {
         egui::CentralPanel::default()
             .frame(central_frame)
             .show_inside(ui, |ui| match &mut self.view {
-                View::Empty => empty_view(ui, &self.recent, &mut to_open),
+                View::Empty => empty_view(
+                    ui,
+                    &self.recent,
+                    &mut to_open,
+                    &mut open_url,
+                    &mut open_browse,
+                ),
                 View::Failed { path, error } => {
                     ui.add_space(40.0);
                     ui.vertical_centered(|ui| {
@@ -575,18 +1296,26 @@ impl eframe::App for TableizerApp {
         if self.theme != theme_before {
             prefs::save(&self.theme);
         }
+        if self.cloud != cloud_before {
+            cloud::save(&self.cloud);
+        }
         // Files handed to us by macOS "Open With" / double-click arrive via an Apple Event, not argv
         // (see macos_open.rs); open whatever has been queued since the last frame.
         #[cfg(target_os = "macos")]
         for path in crate::macos_open::take_pending() {
-            self.open_path(path);
+            self.open_target(path.to_string_lossy().into_owned(), &ctx);
         }
+        // `open_target` resolves local vs remote and (for local) drops egui_table's stored column
+        // widths so the new file's columns auto-fit — column order/visibility live in our own
+        // `GridLayout`, so they're unaffected. A recent entry may be a URL, handled the same way.
         if let Some(path) = to_open {
-            self.open_path(path);
-            // Drop egui_table's stored column widths so the new file's columns auto-fit to their
-            // content on open (egui_table re-fits when it has no state for the table). Column
-            // order/visibility live in our own `GridLayout`, so they're unaffected.
-            ctx.data_mut(|d| d.remove_by_type::<egui_table::TableState>());
+            self.open_target(path.to_string_lossy().into_owned(), &ctx);
+        }
+        if open_url {
+            self.url_dialog_open = true;
+        }
+        if open_browse {
+            self.browse_open = true;
         }
         if let Some((scope, kind)) = to_export {
             self.start_export(scope, kind, &ctx);

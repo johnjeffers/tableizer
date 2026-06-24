@@ -9,10 +9,12 @@
 pub mod cache;
 pub mod error;
 pub mod export;
+pub mod gzip;
 pub mod index;
 pub mod json;
 pub mod parquet;
 pub mod parse;
+pub mod remote;
 pub mod search;
 pub mod sort;
 pub mod table;

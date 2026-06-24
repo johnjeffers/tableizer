@@ -24,6 +24,10 @@ allow = [
     # font crate.
     "OFL-1.1",
     "Ubuntu-font-1.0",
+    # Community Data License Agreement – Permissive 2.0: a permissive *data* license covering the
+    # bundled CA-root certificate set (`webpki-root-certs`, pulled by the `object_store` HTTPS/TLS
+    # stack for remote/cloud file opening). Permissive and compatible with a permissive app.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
 

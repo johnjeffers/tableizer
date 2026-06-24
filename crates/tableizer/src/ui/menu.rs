@@ -35,6 +35,14 @@ pub(crate) fn menu_bar(
             }
             ui.close();
         }
+        if ui.button("Open URL…").clicked() {
+            app.url_dialog_open = true;
+            ui.close();
+        }
+        if ui.button("Browse Cloud…").clicked() {
+            app.browse_open = true;
+            ui.close();
+        }
         ui.menu_button("Open Recent", |ui| {
             if app.recent.is_empty() {
                 ui.label("(none)");

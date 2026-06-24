@@ -80,7 +80,7 @@ pub(crate) fn status_bar(ui: &mut egui::Ui, loaded: &LoadedTable, palette: &them
     };
     let cols = loaded.table.schema().columns.len() as u64;
     ui.horizontal(|ui| {
-        ui.label(loaded.path.display().to_string());
+        ui.label(&loaded.origin);
         ui.separator();
         ui.label(format_label(loaded.format, &loaded.dialect));
         ui.separator();
@@ -136,18 +136,33 @@ pub(crate) fn status_bar(ui: &mut egui::Ui, loaded: &LoadedTable, palette: &them
     });
 }
 
-/// The empty (no file) view: an Open button (and recent files, if any). Mirrors File ▸ Open…, so a
-/// file can always be chosen from within the app — no CLI argument required.
-pub(crate) fn empty_view(ui: &mut egui::Ui, recent: &[PathBuf], to_open: &mut Option<PathBuf>) {
+/// The empty (no file) view: Open buttons (and recent files, if any). Mirrors File ▸ Open…, so a
+/// file can always be chosen from within the app — no CLI argument required. `open_url` is set when
+/// the user clicks "Open URL…", which the app turns into the URL-entry dialog.
+pub(crate) fn empty_view(
+    ui: &mut egui::Ui,
+    recent: &[PathBuf],
+    to_open: &mut Option<PathBuf>,
+    open_url: &mut bool,
+    open_browse: &mut bool,
+) {
     ui.add_space(40.0);
     ui.vertical_centered(|ui| {
         ui.label("Open a CSV, TSV, NDJSON, or Parquet file to get started.");
         ui.add_space(12.0);
-        if ui.button("Open File…").clicked()
-            && let Some(path) = rfd::FileDialog::new().pick_file()
-        {
-            *to_open = Some(path);
-        }
+        ui.horizontal(|ui| {
+            if ui.button("Open File…").clicked()
+                && let Some(path) = rfd::FileDialog::new().pick_file()
+            {
+                *to_open = Some(path);
+            }
+            if ui.button("Open URL…").clicked() {
+                *open_url = true;
+            }
+            if ui.button("Browse Cloud…").clicked() {
+                *open_browse = true;
+            }
+        });
         if !recent.is_empty() {
             ui.add_space(16.0);
             ui.label(egui::RichText::new("RECENT").weak());
@@ -167,6 +182,22 @@ pub(crate) fn empty_view(ui: &mut egui::Ui, recent: &[PathBuf], to_open: &mut Op
             }
         }
     });
+}
+
+/// Format a byte count in binary units (KiB/MiB/GiB), for the download progress dialog.
+pub(crate) fn fmt_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = n as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{n} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 /// Format a row count with thousands separators.

@@ -453,6 +453,85 @@ impl SavedView {
     }
 }
 
+/// How S3 credentials are obtained.
+#[derive(Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum CredentialSource {
+    /// The full AWS provider chain via `aws-config`: environment, `~/.aws` profiles, **SSO**, and IAM
+    /// roles. The default — it covers most real AWS use without pasting keys.
+    #[default]
+    AwsChain,
+    /// Explicit static keys entered in the form — for pasted credentials or S3-compatible stores
+    /// (MinIO, Cloudflare R2) that aren't AWS.
+    Static,
+}
+
+/// S3 / S3-compatible credentials & config entered in Settings, persisted in the config dir (secrets
+/// unencrypted, 0600 on Unix) and applied when opening an `s3://` URL.
+#[derive(Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CloudConfig {
+    /// Where credentials come from (AWS chain incl. SSO, or static keys).
+    pub(crate) source: CredentialSource,
+    pub(crate) region: String,
+    /// AWS profile name for [`CredentialSource::AwsChain`] (selects an SSO/profile); empty =
+    /// `AWS_PROFILE` / the `default` profile.
+    pub(crate) profile: String,
+    pub(crate) access_key_id: String,
+    pub(crate) secret_access_key: String,
+    pub(crate) session_token: String,
+    /// Custom endpoint for S3-compatible stores (MinIO, Cloudflare R2, …); empty = AWS default.
+    pub(crate) endpoint: String,
+    /// Allow a plain-HTTP endpoint (e.g. a local MinIO) — off by default (HTTPS only).
+    pub(crate) allow_http: bool,
+}
+
+impl CloudConfig {
+    /// The synchronous `object_store` S3 options from the form: region / endpoint / allow-http always,
+    /// plus the static keys only in [`CredentialSource::Static`] mode. AWS-chain credentials (incl.
+    /// SSO) are resolved separately via [`tableizer_core::remote::aws_credentials`] and layered
+    /// *under* these, so an explicit form value still wins.
+    pub(crate) fn s3_options(&self) -> Vec<(String, String)> {
+        let mut options = Vec::new();
+        for (key, value) in [
+            ("aws_region", &self.region),
+            ("aws_endpoint", &self.endpoint),
+        ] {
+            if !value.is_empty() {
+                options.push((key.to_string(), value.clone()));
+            }
+        }
+        if self.allow_http {
+            options.push(("aws_allow_http".to_string(), "true".to_string()));
+        }
+        if self.source == CredentialSource::Static {
+            for (key, value) in [
+                ("aws_access_key_id", &self.access_key_id),
+                ("aws_secret_access_key", &self.secret_access_key),
+                ("aws_session_token", &self.session_token),
+            ] {
+                if !value.is_empty() {
+                    options.push((key.to_string(), value.clone()));
+                }
+            }
+        }
+        options
+    }
+
+    /// Whether to resolve credentials through the AWS chain (env / profiles / SSO / roles).
+    pub(crate) fn uses_aws_chain(&self) -> bool {
+        self.source == CredentialSource::AwsChain
+    }
+
+    /// The configured AWS profile name, if any (else the ambient `AWS_PROFILE` / `default` is used).
+    pub(crate) fn profile(&self) -> Option<&str> {
+        (!self.profile.is_empty()).then_some(self.profile.as_str())
+    }
+
+    /// The configured region, if any.
+    pub(crate) fn region(&self) -> Option<&str> {
+        (!self.region.is_empty()).then_some(self.region.as_str())
+    }
+}
+
 /// A running find-navigation scan (background thread). The app polls `result` each frame: `None`
 /// while scanning, `Some(found)` once done — `found` is the matched display-row, or `None` for "no
 /// match". The scan is cancelled when a newer one supersedes it or the file closes.
@@ -463,7 +542,13 @@ pub(crate) struct FindJob {
 
 /// A loaded table and all its per-file UI state.
 pub(crate) struct LoadedTable {
+    /// The **local** path the engine actually reads — the file itself, or the downloaded cache copy
+    /// for a remote source. Used for parsing, the index cache, and dialect re-opens.
     pub(crate) path: PathBuf,
+    /// Human-facing origin shown in the status bar and keyed in recent files / saved views: the
+    /// original URL for a remote source, else the local path. Stable across re-downloads (unlike
+    /// `path`, whose cache filename changes when the object's ETag changes).
+    pub(crate) origin: String,
     pub(crate) table: SharedTable,
     pub(crate) layout: GridLayout,
     /// The detected file format. Gates the delimited-only UI (the Parsing tab).
@@ -685,6 +770,47 @@ mod tests {
         assert!(!highlights(&view, "12"));
         // An invalid regex (mid-typing) compiles to nothing rather than erroring.
         assert!(highlight_matcher(&find("(", true, false)).is_none());
+    }
+
+    #[test]
+    fn cloud_config_static_mode_emits_keys_and_endpoint() {
+        let cfg = CloudConfig {
+            source: CredentialSource::Static,
+            region: "us-east-1".into(),
+            access_key_id: "AKIA".into(),
+            secret_access_key: "secret".into(),
+            endpoint: "https://minio.local".into(),
+            allow_http: true,
+            ..CloudConfig::default()
+        };
+        let opts = cfg.s3_options();
+        assert!(opts.contains(&("aws_region".to_string(), "us-east-1".to_string())));
+        assert!(opts.contains(&("aws_access_key_id".to_string(), "AKIA".to_string())));
+        assert!(opts.contains(&(
+            "aws_endpoint".to_string(),
+            "https://minio.local".to_string()
+        )));
+        assert!(opts.contains(&("aws_allow_http".to_string(), "true".to_string())));
+        // Empty fields are omitted (no session token set here).
+        assert!(!opts.iter().any(|(k, _)| k == "aws_session_token"));
+    }
+
+    #[test]
+    fn cloud_config_aws_chain_mode_ignores_static_keys() {
+        // The default (AWS chain incl. SSO) mode: static-key fields are not emitted — credentials come
+        // from the chain. Region still applies; the chain only fills it in when left blank.
+        let cfg = CloudConfig {
+            region: "eu-west-1".into(),
+            access_key_id: "ignored".into(),
+            secret_access_key: "ignored".into(),
+            ..CloudConfig::default()
+        };
+        assert!(cfg.uses_aws_chain());
+        let opts = cfg.s3_options();
+        assert!(opts.contains(&("aws_region".to_string(), "eu-west-1".to_string())));
+        assert!(!opts.iter().any(|(k, _)| k == "aws_access_key_id"));
+        // A blank config emits nothing.
+        assert!(CloudConfig::default().s3_options().is_empty());
     }
 
     #[test]

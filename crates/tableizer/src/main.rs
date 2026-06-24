@@ -22,8 +22,6 @@ mod persist;
 mod theme;
 mod ui;
 
-use std::path::PathBuf;
-
 use eframe::egui;
 
 use crate::app::TableizerApp;
@@ -36,7 +34,10 @@ fn app_icon() -> egui::IconData {
 }
 
 fn main() -> eframe::Result<()> {
-    let path = std::env::args_os().nth(1).map(PathBuf::from);
+    // The first CLI arg is a local path or a remote URL (e.g. `s3://bucket/data.csv`).
+    let target = std::env::args_os()
+        .nth(1)
+        .map(|a| a.to_string_lossy().into_owned());
     // Register the macOS open-documents handler as early as possible, to give a cold-launch file the
     // best chance of being caught before AppKit dispatches it (see macos_open.rs).
     #[cfg(target_os = "macos")]
@@ -53,7 +54,7 @@ fn main() -> eframe::Result<()> {
         "Tableizer",
         native_options,
         Box::new(move |cc| {
-            let mut app = TableizerApp::new(path);
+            let mut app = TableizerApp::new(target);
             app.install_fonts(&cc.egui_ctx); // chrome + table fonts; re-installed on change in `ui`
             // Let the open-documents handler wake an idle UI to drain a received file. (Re-asserting
             // the handler after launch is handled by the run-loop observer in `install`.)
