@@ -28,7 +28,9 @@ pub(crate) fn grid(ui: &mut egui::Ui, loaded: &mut LoadedTable, palette: &theme:
     let displayed = layout.displayed();
     if displayed.is_empty() {
         ui.add_space(20.0);
-        ui.vertical_centered(|ui| ui.label("All columns hidden — enable some in the View menu."));
+        ui.vertical_centered(|ui| {
+            ui.label("All columns hidden — enable some in the Columns panel.")
+        });
         return;
     }
     let headers: Vec<String> = displayed

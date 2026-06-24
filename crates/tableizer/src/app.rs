@@ -12,7 +12,7 @@ use crate::model::{
     detect_format, open_table, sniff_file,
 };
 use crate::persist::{prefs, recent, views};
-use crate::ui::{empty_view, grid, menu_bar, settings_window, status_bar, toolbar};
+use crate::ui::{columns_panel, empty_view, grid, menu_bar, settings_window, status_bar, toolbar};
 use crate::{fonts, theme};
 
 pub(crate) struct TableizerApp {
@@ -35,6 +35,8 @@ pub(crate) struct TableizerApp {
     font_mono_only: bool,
     /// Whether the Settings window is open.
     pub(crate) settings_open: bool,
+    /// Whether the right-side Columns panel is expanded (toggled from the menu bar).
+    pub(crate) columns_open: bool,
 }
 
 impl TableizerApp {
@@ -64,6 +66,7 @@ impl TableizerApp {
             font_search: String::new(),
             font_mono_only: false,
             settings_open: false,
+            columns_open: false,
         };
         if let Some(path) = path {
             app.open_path(path);
@@ -230,6 +233,18 @@ impl eframe::App for TableizerApp {
                 }
             });
         }
+
+        // Right-side Columns panel: slides in/out (animated) when toggled from the menu bar. Shown
+        // before the central panel so the grid takes the remaining width.
+        let columns_open = self.columns_open && matches!(self.view, View::Loaded(_));
+        egui::Panel::right("columns_panel")
+            .resizable(false)
+            .default_size(220.0)
+            .show_animated_inside(ui, columns_open, |ui| {
+                if let View::Loaded(loaded) = &mut self.view {
+                    columns_panel(ui, loaded);
+                }
+            });
 
         // No inner margin: the table fills the central area edge-to-edge (the empty/failed views
         // center their own content, so they're unaffected).

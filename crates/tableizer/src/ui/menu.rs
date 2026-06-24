@@ -1,4 +1,5 @@
-//! The menu bar (File / Parsing / Columns), the Export submenu, and writing exports to disk.
+//! The menu bar (File / Parsing + the Columns-panel toggle), the right-side Columns panel, the
+//! Export submenu, and writing exports to disk.
 
 use eframe::egui;
 use encoding_rs::Encoding;
@@ -12,7 +13,7 @@ use crate::model::{
 use crate::theme;
 use std::path::PathBuf;
 
-/// The menu bar (File / Parsing / Columns).
+/// The menu bar: File / Parsing on the left, the Columns-panel toggle pinned to the right.
 pub(crate) fn menu_bar(ui: &mut egui::Ui, app: &mut TableizerApp, to_open: &mut Option<PathBuf>) {
     ui.menu_button("File", |ui| {
         ui.set_min_width(150.0);
@@ -89,32 +90,126 @@ pub(crate) fn menu_bar(ui: &mut egui::Ui, app: &mut TableizerApp, to_open: &mut 
         if loaded.format == Format::Delimited {
             ui.menu_button("Parsing", |ui| parsing_menu(ui, loaded));
         }
-        ui.menu_button("Columns", |ui| {
-            ui.set_min_width(190.0);
-            menu_section(ui, "VISIBLE");
-            for (i, shown) in loaded.layout.visible.iter_mut().enumerate() {
-                ui.checkbox(
-                    shown,
-                    column_name(loaded.table.schema(), ColumnId(i as u32), loaded.encoding),
-                );
-            }
-            menu_section(ui, "RESET");
-            if ui.button("Reset columns & view").clicked() {
-                // Column width/order/visibility/freeze, sort, and find/filter back to defaults.
-                loaded.layout = GridLayout::new(loaded.table.schema().columns.len());
-                loaded.view.sort = None;
-                loaded.view.search.clear();
-                loaded.view.regex = false;
-                loaded.view.invert = false;
-                loaded.view.filter_mode = false;
-                loaded.view.selected = None;
-                // Drop egui_table's persisted column widths so they return to their initial size.
-                ui.ctx()
-                    .data_mut(|d| d.remove_by_type::<egui_table::TableState>());
-                ui.close();
+    }
+
+    // Columns live in a right-side slide-out panel now; its toggle sits at the right end of the bar.
+    if matches!(app.view, View::Loaded(_)) {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let open = app.columns_open;
+            if columns_toggle(ui, open).clicked() {
+                app.columns_open = !open;
             }
         });
     }
+}
+
+/// The menu-bar toggle for the Columns panel: a painted "table columns" icon — two columns of rule
+/// lines, mapped from a 24×24 viewBox (shapes, not a font-dependent glyph — see the `ui` module
+/// invariant). Accent-coloured + backed when the panel is open.
+fn columns_toggle(ui: &mut egui::Ui, open: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(30.0, ui.available_height()),
+        egui::Sense::click(),
+    );
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    let color = if open {
+        ui.visuals().selection.bg_fill
+    } else if response.hovered() {
+        ui.visuals().text_color()
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    let icon = egui::Rect::from_center_size(rect.center(), egui::vec2(18.0, 18.0));
+    let painter = ui.painter();
+    if open || response.hovered() {
+        // Subtle button background so it reads as interactive / active.
+        painter.rect_filled(
+            rect.shrink2(egui::vec2(3.0, 4.0)),
+            egui::CornerRadius::same(4),
+            ui.visuals().widgets.hovered.bg_fill,
+        );
+    }
+    // A left and right column of four rule lines each (viewBox 0..24 → `icon`).
+    let stroke = egui::Stroke::new(1.5, color);
+    let at =
+        |x: f32, y: f32| icon.min + egui::vec2(x / 24.0 * icon.width(), y / 24.0 * icon.height());
+    for y in [6.0, 10.0, 14.0, 18.0] {
+        painter.line_segment([at(4.0, y), at(9.5, y)], stroke);
+        painter.line_segment([at(14.5, y), at(20.0, y)], stroke);
+    }
+
+    response.on_hover_text(if open { "Hide columns" } else { "Show columns" })
+}
+
+/// The right-side Columns panel contents: a scrollable visibility list with a pinned reset action.
+pub(crate) fn columns_panel(ui: &mut egui::Ui, loaded: &mut LoadedTable) {
+    egui::Panel::bottom("tz_columns_reset").show_inside(ui, |ui| {
+        ui.add_space(6.0);
+        if ui
+            .add_sized(
+                [ui.available_width(), 24.0],
+                egui::Button::new("Reset columns & view"),
+            )
+            .clicked()
+        {
+            reset_view(loaded, ui.ctx());
+        }
+        ui.add_space(6.0);
+    });
+    egui::CentralPanel::default().show_inside(ui, |ui| {
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new("COLUMNS")
+                .text_style(theme::text_style(theme::MENU_SECTION))
+                .strong()
+                .color(ui.visuals().weak_text_color()),
+        );
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let w = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+            if ui
+                .add_sized([w, 22.0], egui::Button::new("Select All"))
+                .clicked()
+            {
+                loaded.layout.visible.iter_mut().for_each(|v| *v = true);
+            }
+            if ui
+                .add_sized([w, 22.0], egui::Button::new("Select None"))
+                .clicked()
+            {
+                loaded.layout.visible.iter_mut().for_each(|v| *v = false);
+            }
+        });
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(2.0);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (i, shown) in loaded.layout.visible.iter_mut().enumerate() {
+                    ui.checkbox(
+                        shown,
+                        column_name(loaded.table.schema(), ColumnId(i as u32), loaded.encoding),
+                    );
+                }
+            });
+    });
+}
+
+/// Reset column width/order/visibility/freeze, sort, and find/filter back to defaults.
+fn reset_view(loaded: &mut LoadedTable, ctx: &egui::Context) {
+    loaded.layout = GridLayout::new(loaded.table.schema().columns.len());
+    loaded.view.sort = None;
+    loaded.view.search.clear();
+    loaded.view.regex = false;
+    loaded.view.invert = false;
+    loaded.view.filter_mode = false;
+    loaded.view.selected = None;
+    // Drop egui_table's persisted column widths so they return to their initial size.
+    ctx.data_mut(|d| d.remove_by_type::<egui_table::TableState>());
 }
 
 /// The Export submenu: current view or source, as CSV or TSV, to a chosen file.

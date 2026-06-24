@@ -12,7 +12,7 @@ mod menu;
 mod settings;
 
 pub(crate) use grid::grid;
-pub(crate) use menu::menu_bar;
+pub(crate) use menu::{columns_panel, menu_bar};
 pub(crate) use settings::settings_window;
 
 use std::path::PathBuf;
