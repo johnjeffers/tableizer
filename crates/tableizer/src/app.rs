@@ -295,6 +295,10 @@ impl eframe::App for TableizerApp {
         }
         if let Some(path) = to_open {
             self.open_path(path);
+            // Drop egui_table's stored column widths so the new file's columns auto-fit to their
+            // content on open (egui_table re-fits when it has no state for the table). Column
+            // order/visibility live in our own `GridLayout`, so they're unaffected.
+            ctx.data_mut(|d| d.remove_by_type::<egui_table::TableState>());
         }
     }
 

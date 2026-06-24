@@ -144,15 +144,6 @@ pub(crate) fn grid(ui: &mut egui::Ui, loaded: &mut LoadedTable, palette: &theme:
         egui::Stroke::new(1.0, palette.border),
     );
 
-    // egui_table auto-fits every column to its content whenever it has no stored state ("is_new").
-    // Seed an (empty) default state so that pass never runs: columns keep their default width and
-    // only change when the user drags a separator (or double-clicks one to fit that column). This is
-    // a no-op once a state exists, so manually-set widths are preserved.
-    let table_state_id = egui_table::TableState::id(ui, egui::Id::new("tableizer-grid"));
-    if egui_table::TableState::load(ui.ctx(), table_state_id).is_none() {
-        egui_table::TableState::default().store(ui.ctx(), table_state_id);
-    }
-
     grid.show(ui, &mut delegate);
 
     if let Some((dragged, target, after)) = delegate.pending_reorder {
