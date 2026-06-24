@@ -75,14 +75,17 @@ async fn resolve_bucket_region(bucket: &str, options: &[(String, String)]) -> Op
     }
     let sdk = loader.load().await;
     let client = aws_sdk_s3::Client::from_conf(aws_sdk_s3::config::Builder::from(&sdk).build());
-    let region = client
-        .head_bucket()
-        .bucket(bucket)
-        .send()
-        .await
-        .ok()?
-        .bucket_region()?
-        .to_string();
+    // A bucket outside the request region answers HeadBucket with a 301 carrying the real region in
+    // the `x-amz-bucket-region` header (NOT a `Location` header) — which the SDK surfaces as an error.
+    // Read the region from either the success output (same region) or that redirect error's headers,
+    // so cross-region buckets resolve without the SDK having to follow the redirect.
+    let region = match client.head_bucket().bucket(bucket).send().await {
+        Ok(output) => output.bucket_region().map(str::to_owned),
+        Err(error) => error
+            .raw_response()
+            .and_then(|response| response.headers().get("x-amz-bucket-region"))
+            .map(str::to_owned),
+    }?;
     region_cache()
         .lock()
         .expect("region cache")
