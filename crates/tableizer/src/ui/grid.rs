@@ -37,14 +37,19 @@ pub(crate) fn grid(ui: &mut egui::Ui, loaded: &mut LoadedTable, palette: &theme:
         .iter()
         .map(|&c| column_name(table.schema(), c, encoding))
         .collect();
-    let table_columns: Vec<egui_table::Column> = (0..displayed.len())
-        .map(|_| {
+    let table_columns: Vec<egui_table::Column> = displayed
+        .iter()
+        .map(|&col_id| {
             // `range.min` is the floor a manual resize is clamped to (egui_table grows a column to
             // fit content otherwise) — keep it small so a column can be dragged narrow (content just
             // truncates) and isn't sized back up; the grip stays grabbable. Max caps auto-fit width.
             egui_table::Column::new(180.0)
                 .range(24.0..=900.0)
                 .resizable(true)
+                // Key the stored width by the source column's identity, not its display position
+                // (egui_table's default). Otherwise reordering shuffles widths: a dragged column
+                // would inherit the width of whichever column previously sat in its new slot.
+                .id(egui::Id::new(("tz-col-width", col_id.0)))
         })
         .collect();
 
