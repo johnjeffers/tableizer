@@ -4,9 +4,7 @@
 use eframe::egui;
 use tableizer_core::{ColumnId, ExportScope, RowCount};
 
-use crate::app::{
-    CLOSE_SHORTCUT, OPEN_SHORTCUT, PanelTab, QUIT_SHORTCUT, SETTINGS_SHORTCUT, TableizerApp,
-};
+use crate::app::{CLOSE_SHORTCUT, PanelTab, QUIT_SHORTCUT, SETTINGS_SHORTCUT, TableizerApp};
 use crate::model::{
     GridLayout, LoadedTable, View, column_name, delimiter_display, delimiter_label, parse_delimiter,
 };
@@ -25,22 +23,10 @@ pub(crate) fn menu_bar(
 ) {
     ui.menu_button("File", |ui| {
         ui.set_min_width(150.0);
-        let open_sc = ui.ctx().format_shortcut(&OPEN_SHORTCUT);
-        if ui
-            .add(egui::Button::new("Open…").shortcut_text(open_sc))
-            .clicked()
-        {
-            if let Some(path) = rfd::FileDialog::new().pick_file() {
-                *to_open = Some(path);
-            }
-            ui.close();
-        }
-        if ui.button("Open URL…").clicked() {
-            app.url_dialog_open = true;
-            ui.close();
-        }
-        if ui.button("Browse Cloud…").clicked() {
-            app.browse_open = true;
+        // The built-in browser (start screen) replaces the OS file picker, so there's no "Open…".
+        // "Browse Files…" returns to that start screen (closing the current file — safe, read-only).
+        if ui.button("Browse Files…").clicked() {
+            app.view = View::Empty;
             ui.close();
         }
         ui.menu_button("Open Recent", |ui| {

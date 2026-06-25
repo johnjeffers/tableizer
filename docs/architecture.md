@@ -124,12 +124,22 @@ S3 buckets are region-specific, but one credential set (e.g. an SSO role) can sp
 each bucket operation the engine **resolves the bucket's region** (S3 `HeadBucket`, cached per bucket)
 and passes it to `object_store` — the in-app equivalent of the CLI's `--region`, so a bucket in a
 non-default region just works.
-A **cloud file browser** lets the user pick a file instead of typing a URL, as a lazy **tree**: it
-opens to buckets discovered from the credentials (`remote::list_s3_buckets`, via `aws-sdk-s3`'s
-`ListBuckets` — needed because `object_store` is bucket-scoped and can't enumerate buckets), and each
-folder is listed on expand with `remote::list_dir` (`object_store`'s `list_with_delimiter`). Expanded
-subtrees are **cached** in the in-memory `BrowseNode` tree and kept across re-opens, so revisiting a
-branch never re-lists. All on background threads with the same credential resolution as opening.
+The **start screen** (shown when no file is open) is a two-column landing: a left column with the
+recent-files list and, on the right, an inline **file browser** — the only way to open a file (no OS
+file picker, no URL dialog; a URL can still arrive via the CLI arg or a recent entry). A
+**Browse Local / Browse Remote** toggle switches the
+browser between the local filesystem (the default — no credentials, instant) and cloud storage; each
+mode keeps its own cached tree. The browser is a lazy **tree** (`BrowseNode` / `ChildState`):
+
+- **Remote:** opens to buckets discovered from the credentials (`remote::list_s3_buckets`, via
+  `aws-sdk-s3`'s `ListBuckets` — needed because `object_store` is bucket-scoped and can't enumerate
+  buckets); each folder is listed on expand with `remote::list_dir` (`object_store`'s
+  `list_with_delimiter`) on a background thread, with the same credential resolution as opening.
+- **Local:** roots at Home + the filesystem root; each folder is listed inline with `std::fs::read_dir`
+  (fast, synchronous — no background job, which also sidesteps node identity issues when a directory is
+  reachable two ways).
+
+Expanded subtrees are cached and kept across visits, so revisiting a branch never re-lists.
 
 The documented next step is a **streaming `ReadAt` source** — first screen from a head fetch,
 random access by ranged GET, no full download — which generalises the same `pread`/SIGBUS seam above

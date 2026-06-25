@@ -26,13 +26,19 @@
   - DONE (first cut): open by URL (File ▸ Open URL…, empty-view button, or CLI arg) via `object_store`;
     download-to-cache in the state dir (ETag-keyed, streamed with progress + cancel), then opened like
     a local file. `parse_url` builds a blank store, so credentials are wired explicitly.
-  - DONE: cloud file **browser** (File ▸ Browse Cloud…, empty-view button, or the Open-URL dialog's
-    Browse…) — a lazy **hierarchical tree**: opens to **buckets discovered from the credentials**
-    (`remote::list_s3_buckets` via `aws-sdk-s3` ListBuckets, since object_store is bucket-scoped and
-    can't enumerate); expand a bucket/folder to list it (`remote::list_dir`, object_store
-    `list_with_delimiter`), click a file to open. **Expanded subtrees are cached** (`ChildState` in the
-    `BrowseNode` tree) and persist across browser re-opens, so revisiting never re-lists; Refresh
-    re-discovers, and a "go to" field adds a non-discovered bucket / deep prefix as a top-level node.
+  - DONE: file **browser** lives inline on the **start screen** (2-column: recent files on the left,
+    the browser on the right) and is the only way to open files — **no OS file picker and no Open-URL
+    dialog** (a URL can still come via the CLI arg or a recent entry; the OS *save* dialog is still
+    used for export). A lazy **hierarchical tree** with a
+    **Browse Local / Browse Remote** toggle (default Local; each mode keeps its own cached tree).
+    **Remote:** opens to **buckets discovered
+    from the credentials** (`remote::list_s3_buckets` via `aws-sdk-s3` ListBuckets, since object_store
+    is bucket-scoped and can't enumerate); expand a bucket/folder to list it (`remote::list_dir`,
+    object_store `list_with_delimiter`) on a background thread. **Local:** roots at Home + filesystem
+    root, listed inline via `std::fs::read_dir` (hidden dot-files skipped). Click a file to open.
+    **Expanded subtrees are cached** (`ChildState` in the `BrowseNode` tree) and persist across visits,
+    so revisiting never re-lists; Refresh re-lists the root, and a "go to" field adds a bucket/prefix
+    (remote) or path (local) as a top-level node.
     Background-listed (multiple folders concurrently) with the same credential resolution as opening
     (SSO/profile/static). NOTE: `aws-sdk-s3` must keep `default-features=false` + `default-https-client`
     (NOT the default `rustls` feature → legacy rustls 0.21, RUSTSEC-2026-0098/0099/0104). Follow-ups:

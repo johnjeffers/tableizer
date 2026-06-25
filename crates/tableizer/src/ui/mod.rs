@@ -16,7 +16,7 @@ pub(crate) use grid::grid;
 pub(crate) use menu::{ExportKind, ExportRequest, columns_tab, menu_bar, parsing_tab};
 pub(crate) use settings::settings_tab;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use eframe::egui;
 use tableizer_core::RowCount;
@@ -136,52 +136,57 @@ pub(crate) fn status_bar(ui: &mut egui::Ui, loaded: &LoadedTable, palette: &them
     });
 }
 
-/// The empty (no file) view: Open buttons (and recent files, if any). Mirrors File ▸ Open…, so a
-/// file can always be chosen from within the app — no CLI argument required. `open_url` is set when
-/// the user clicks "Open URL…", which the app turns into the URL-entry dialog.
-pub(crate) fn empty_view(
-    ui: &mut egui::Ui,
-    recent: &[PathBuf],
-    to_open: &mut Option<PathBuf>,
-    open_url: &mut bool,
-    open_browse: &mut bool,
-) {
-    ui.add_space(40.0);
-    ui.vertical_centered(|ui| {
-        ui.label("Open a CSV, TSV, NDJSON, or Parquet file to get started.");
-        ui.add_space(12.0);
-        ui.horizontal(|ui| {
-            if ui.button("Open File…").clicked()
-                && let Some(path) = rfd::FileDialog::new().pick_file()
-            {
-                *to_open = Some(path);
-            }
-            if ui.button("Open URL…").clicked() {
-                *open_url = true;
-            }
-            if ui.button("Browse Cloud…").clicked() {
-                *open_browse = true;
-            }
-        });
-        if !recent.is_empty() {
-            ui.add_space(16.0);
-            ui.label(egui::RichText::new("RECENT").weak());
-            ui.add_space(4.0);
-            for path in recent {
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.display().to_string());
-                if ui
-                    .button(name)
-                    .on_hover_text(path.display().to_string())
-                    .clicked()
-                {
-                    *to_open = Some(path.clone());
-                }
-            }
-        }
-    });
+/// The start-screen **controls column** (left side of the landing): the recent-files list. Files are
+/// opened from the browser column to its right (see `show_landing`) — there is no OS file picker or
+/// URL dialog. Sets `to_open` when a recent entry is clicked.
+pub(crate) fn empty_view(ui: &mut egui::Ui, recent: &[PathBuf], to_open: &mut Option<PathBuf>) {
+    ui.add_space(10.0);
+    ui.label("Browse for a file on the right, or pick a recent.");
+    if !recent.is_empty() {
+        ui.add_space(20.0);
+        ui.label(egui::RichText::new("RECENT").weak());
+        ui.add_space(6.0);
+        // Full-width rows, left-aligned, name middle-elided so a long key keeps its start + extension;
+        // the full path/URL shows on hover. Scrolls within the column.
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+                    for path in recent {
+                        if ui
+                            .selectable_label(false, elide_middle(&recent_name(path), 36))
+                            .on_hover_text(path.display().to_string())
+                            .clicked()
+                        {
+                            *to_open = Some(path.clone());
+                        }
+                    }
+                });
+            });
+    }
+}
+
+/// The display name for a recent entry: its file/object name (the last path segment), or the whole
+/// path/URL if it has none.
+fn recent_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// Middle-elide `s` to at most `max` characters, keeping the start and end (so a file extension stays
+/// visible): a long `…fusionauth-alb-acl_20260524T2355Z_43f57849.log.gz` becomes `…43f57849.log.gz`.
+fn elide_middle(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_string();
+    }
+    let keep = max.saturating_sub(1); // room for the ellipsis
+    let tail = keep / 2;
+    let head = keep - tail;
+    let start: String = chars[..head].iter().collect();
+    let end: String = chars[chars.len() - tail..].iter().collect();
+    format!("{start}…{end}")
 }
 
 /// Format a byte count in binary units (KiB/MiB/GiB), for the download progress dialog.
@@ -212,4 +217,23 @@ pub(crate) fn fmt_count(n: u64) -> String {
         out.push(*b as char);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::elide_middle;
+
+    #[test]
+    fn elide_middle_keeps_start_and_end() {
+        // Short strings pass through unchanged.
+        assert_eq!(elide_middle("short.csv", 58), "short.csv");
+        // Long names keep both ends (so the extension survives) around a single ellipsis.
+        let long =
+            "121700706967_waflogs_ap-northeast-1_fusionauth-alb-acl_20260524T2355Z_43f57849.log.gz";
+        let elided = elide_middle(long, 40);
+        assert_eq!(elided.chars().count(), 40);
+        assert!(elided.starts_with("121700706967"));
+        assert!(elided.ends_with("43f57849.log.gz"));
+        assert!(elided.contains('…'));
+    }
 }
