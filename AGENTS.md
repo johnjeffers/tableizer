@@ -107,7 +107,7 @@ makes the grid a swappable layer.
 
 ## Conventions
 
-- Rust **edition 2024**, **MSRV 1.96** (= current latest stable; `rust-toolchain.toml` pins stable + rustfmt
+- Rust **edition 2024**, **MSRV 1.99** (= current latest stable; `rust-toolchain.toml` pins stable + rustfmt
   + clippy). Per the dependency rule, the MSRV tracks latest stable so deps stay current — bump it when stable advances.
 - **Zero warnings.** Workspace lints set `clippy::all` and `unsafe_code` to warn; CI denies warnings.
 - `unsafe` is allowed only where required (e.g. mmap) and **every use must carry a justifying comment**.
@@ -119,6 +119,10 @@ makes the grid a swappable layer.
   change APIs (e.g. eframe 0.32→0.34 moved `App::update` to `App::ui`). The updated `Cargo.lock` is part of
   the change for the human to commit. If the latest needs a newer toolchain than the MSRV, **raise
   `rust-version`** (it tracks current stable).
+  **One exception: `skrifa` tracks egui's version, not the latest.** The font guard in
+  `crates/tableizer/src/fonts.rs` must parse with the exact skrifa egui uses (egui panics on fonts its
+  skrifa rejects). Bump it together with eframe to the version `cargo tree -p epaint` shows;
+  `cargo-deny` fails on a second skrifa version.
 - **Add a dependency only when the code that uses it lands** (no unused deps — clippy/CI flag them). The
   planned engine spine is the comment checklist in `crates/tableizer-core/Cargo.toml`.
 - Document public items with the decision they encode; link back to `docs/architecture.md` (or

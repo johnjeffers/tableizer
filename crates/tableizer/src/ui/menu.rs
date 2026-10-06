@@ -178,7 +178,7 @@ fn panel_heading(ui: &mut egui::Ui, title: &str) {
 /// The Columns panel tab: Select All/None, a scrollable per-column visibility list, and a pinned
 /// "Reset columns & view" action.
 pub(crate) fn columns_tab(ui: &mut egui::Ui, loaded: &mut LoadedTable) {
-    egui::Panel::bottom("tz_columns_reset").show_inside(ui, |ui| {
+    egui::Panel::bottom("tz_columns_reset").show(ui, |ui| {
         ui.add_space(6.0);
         if ui
             .add_sized(
@@ -191,7 +191,7 @@ pub(crate) fn columns_tab(ui: &mut egui::Ui, loaded: &mut LoadedTable) {
         }
         ui.add_space(6.0);
     });
-    egui::CentralPanel::default().show_inside(ui, |ui| {
+    egui::CentralPanel::default().show(ui, |ui| {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             let w = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
@@ -320,6 +320,7 @@ pub(crate) fn parsing_tab(ui: &mut egui::Ui, loaded: &mut LoadedTable) {
                 ("Comma", b','),
                 ("Pipe", b'|'),
                 ("Semicolon", b';'),
+                ("Space", b' '),
                 ("Tab", b'\t'),
             ] {
                 let selected = !loaded.delimiter_auto && loaded.dialect.delimiter == byte;

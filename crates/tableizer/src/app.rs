@@ -460,7 +460,7 @@ impl eframe::App for TableizerApp {
             self.panel_open = false;
         }
 
-        egui::Panel::top("menu_bar").show_inside(ui, |ui| {
+        egui::Panel::top("menu_bar").show(ui, |ui| {
             // `wide_menu` gives the bar buttons *and* every dropdown popup roomier horizontal item
             // padding than egui's default `menu_style` (which hugs the text at 2px). `.config(..)`
             // carries it into the submenus, which inherit the bar's menu config.
@@ -471,7 +471,7 @@ impl eframe::App for TableizerApp {
         });
 
         if matches!(self.view, View::Loaded(_)) {
-            egui::Panel::top("toolbar").show_inside(ui, |ui| {
+            egui::Panel::top("toolbar").show(ui, |ui| {
                 if let View::Loaded(loaded) = &mut self.view {
                     toolbar(ui, loaded, focus_find);
                 }
@@ -479,7 +479,7 @@ impl eframe::App for TableizerApp {
         }
 
         if matches!(self.view, View::Loaded(_)) {
-            egui::Panel::bottom("status_bar").show_inside(ui, |ui| {
+            egui::Panel::bottom("status_bar").show(ui, |ui| {
                 if let View::Loaded(loaded) = &self.view {
                     status_bar(ui, loaded, &palette);
                 }
@@ -490,13 +490,16 @@ impl eframe::App for TableizerApp {
         // toggled. Shown before the central panel so the grid takes the remaining width; the default
         // width suits the Settings tab (its font picker is the widest content).
         self.fix_panel_tab();
-        let panel_open = self.panel_open;
+        // egui may flip `panel_open` (drag the edge past min size to close, drag the collapsed
+        // handle to reopen); copied out and written back since the contents closure borrows `self`.
+        let mut panel_open = self.panel_open;
         egui::Panel::right("side_panel")
             .resizable(true)
             .default_size(280.0)
             .min_size(280.0)
             .max_size(500.0)
-            .show_animated_inside(ui, panel_open, |ui| self.side_panel_contents(ui));
+            .show_collapsible(ui, &mut panel_open, |ui| self.side_panel_contents(ui));
+        self.panel_open = panel_open;
 
         // React to edits from the toolbar (filter/sort) and the side panel (Parsing → dialect,
         // Columns → layout): a dialect change re-opens the file; otherwise apply the view and persist
@@ -560,7 +563,7 @@ impl eframe::App for TableizerApp {
         let central_frame = egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::ZERO);
         egui::CentralPanel::default()
             .frame(central_frame)
-            .show_inside(ui, |ui| match &mut self.view {
+            .show(ui, |ui| match &mut self.view {
                 View::Empty => empty_view(ui, &self.recent, &mut to_open),
                 View::Failed { path, error } => {
                     ui.add_space(40.0);

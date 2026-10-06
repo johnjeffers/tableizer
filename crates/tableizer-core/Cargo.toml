@@ -11,18 +11,18 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
-arrow = "59.0.0"
+arrow = "60.0.0"
 csv = "1.4.0"
 directories = "6.0.0"
-encoding_rs = "0.8.35"
-memchr = "2.8.2"
+encoding_rs = "0.8.42"
+memchr = "2.8.3"
 memmap2 = "0.9.11"
-parquet = "59.0.0"
-regex = "1.12.4"
+parquet = "60.0.0"
+regex = "1.13.1"
 # preserve_order: NDJSON columns follow first-seen object-key order, not serde_json's default
 # alphabetical sort (which would shuffle the table's columns relative to the source).
-serde_json = { version = "1.0.150", features = ["preserve_order"] }
-thiserror = "2.0.18"
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+thiserror = "2.0.21"
 # thiserror added via `cargo add`.
 
 # Engine dependency spine (add each as the corresponding module is implemented, so there are no
