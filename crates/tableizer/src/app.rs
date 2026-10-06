@@ -979,10 +979,10 @@ impl TableizerApp {
                 .default_size(300.0)
                 .min_size(240.0)
                 .max_size(480.0)
-                .show_inside(ui, |ui| {
+                .show(ui, |ui| {
                     empty_view(ui, recent.as_slice(), &mut to_open);
                 });
-            egui::CentralPanel::default().show_inside(ui, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     // The toggle shows the mode it switches *to*.
@@ -1497,9 +1497,12 @@ impl eframe::App for TableizerApp {
         let central_frame = egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::ZERO);
         egui::CentralPanel::default()
             .frame(central_frame)
-            .show(ui, |ui| match &mut self.view {
-                View::Empty => empty_view(ui, &self.recent, &mut to_open),
-                View::Failed { path, error } => {
+            .show(ui, |ui| {
+                if matches!(self.view, View::Empty) {
+                    self.show_landing(ui, &ctx);
+                } else if let View::Loaded(loaded) = &mut self.view {
+                    grid(ui, loaded, &palette);
+                } else if let View::Failed { path, error } = &self.view {
                     ui.add_space(40.0);
                     ui.vertical_centered(|ui| {
                         ui.heading("Could not open file");
