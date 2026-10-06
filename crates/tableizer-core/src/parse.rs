@@ -42,9 +42,10 @@ impl Default for Dialect {
 impl Dialect {
     /// Auto-detect a dialect from a head sample: pick the delimiter that yields the most consistent
     /// column count, and guess whether the first row is a header. Always an *editable default* — the
-    /// user can override (`docs/formats.md`). On a tie, earlier candidates win (comma first).
+    /// user can override (`docs/formats.md`). On a tie, earlier candidates win (comma first). Space
+    /// is last: it often appears *inside* fields of other dialects, so it must win outright.
     pub fn sniff(sample: &[u8]) -> Self {
-        const CANDIDATES: [u8; 4] = [b',', b'\t', b';', b'|'];
+        const CANDIDATES: [u8; 5] = *b",\t;| ";
         let mut best_delim = b',';
         let mut best_score = 0i64;
         for &delim in &CANDIDATES {
@@ -131,6 +132,20 @@ mod tests {
     fn sniffs_semicolon_delimiter() {
         let d = Dialect::sniff(b"a;b;c\n1;2;3\n");
         assert_eq!(d.delimiter, b';');
+    }
+
+    #[test]
+    fn sniffs_space_delimiter() {
+        let d = Dialect::sniff(b"name age city\nbob 30 paris\nann 25 rome\n");
+        assert_eq!(d.delimiter, b' ');
+        assert!(d.has_header);
+    }
+
+    #[test]
+    fn space_loses_ties_to_other_delimiters() {
+        // Spaces inside CSV fields can split every row consistently too; the real delimiter wins.
+        let d = Dialect::sniff(b"id,full name\n1,bob smith\n2,ann lee\n");
+        assert_eq!(d.delimiter, b',');
     }
 
     #[test]

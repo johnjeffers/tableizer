@@ -30,8 +30,11 @@ path is a future option if typed sorting/formatting is needed.
 
 ## Delimited — CSV / TSV / arbitrary separator (`CsvTable`)
 
-The reference reader. `Dialect::sniff` auto-detects the delimiter (comma/tab/semicolon/pipe, with
-custom + header overrides) as a visible, editable default. Parsing is byte-faithful via the `csv`
+The reference reader. `Dialect::sniff` auto-detects the delimiter (comma/tab/semicolon/pipe/space,
+with custom + header overrides) as a visible, editable default. Space is tried last and must win
+outright, since it often appears inside fields of the other dialects. It is a single-byte delimiter:
+a run of spaces is several delimiters with empty fields between them, not one, so column-aligned
+(padded) text rarely sniffs as space-delimited and, if forced, shows empty columns. Parsing is byte-faithful via the `csv`
 crate's `ByteRecord` (never hand-rolled RFC 4180): quoting, doubled-quote escaping, embedded
 newlines/delimiters, ragged rows tolerated and counted (a "⚠ N ragged rows" badge). Encodings:
 BOM-aware UTF-8 / UTF-16 LE+BE (transcoded to UTF-8 at open), with user override to Latin-1 /

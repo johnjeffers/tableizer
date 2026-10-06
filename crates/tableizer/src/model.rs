@@ -234,6 +234,7 @@ pub(crate) fn delimiter_label(delimiter: u8) -> String {
         b'\t' => "tab".to_string(),
         b';' => "semicolon".to_string(),
         b'|' => "pipe".to_string(),
+        b' ' => "space".to_string(),
         _ => delimiter_display(delimiter),
     }
 }
@@ -654,6 +655,12 @@ mod tests {
             format_label(Format::Delimited, &semi),
             "Delimited · semicolon"
         );
+        // A space delimiter is named, not rendered as an invisible " ".
+        let space = Dialect {
+            delimiter: b' ',
+            ..Dialect::default()
+        };
+        assert_eq!(format_label(Format::Delimited, &space), "Delimited · space");
     }
 
     #[test]

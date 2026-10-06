@@ -43,6 +43,30 @@ cargo watch -x 'run -p tableizer -- /tmp/big.csv'   # debug build = fastest rebu
 Use a `--release` build for performance / frame-rate measurement; the debug build for quick visual tweaks.
 (True state-preserving hot reload via a `hot-lib-reloader` split is possible but not currently set up.)
 
+### Updating dependencies
+
+Dependencies are kept on their latest versions (see [AGENTS.md](AGENTS.md)). `cargo update` only moves
+within the ranges in `Cargo.toml`, so use `cargo upgrade` (from `cargo-edit`) to move the ranges themselves:
+
+```sh
+cargo install cargo-edit cargo-outdated         # one-time setup
+
+rustup update stable                            # the toolchain tracks latest stable
+cargo outdated --workspace                      # see what's behind (optional)
+cargo upgrade --incompatible --exclude skrifa   # latest versions, incl. major/minor jumps (skrifa: see below)
+cargo update                                    # bring transitive deps in Cargo.lock up to date
+just ci                                         # fmt check + clippy -D warnings + tests
+just deny                                       # license/advisory audit
+```
+
+- **0.x crates:** for a pre-1.0 crate a minor bump is a breaking change (e.g. eframe 0.32 → 0.34
+  moved `App::update` to `App::ui`), so expect to fix API breakage when `just ci` fails.
+- **MSRV:** if stable has moved on, or a new dependency needs a newer rustc, raise `rust-version` in
+  the root `Cargo.toml` — `cargo upgrade` doesn't touch it.
+- **skrifa** is pinned to the version egui uses, not the latest, so the app parses fonts exactly as
+  egui does. After bumping eframe, set it to match `cargo tree -p epaint` (`just deny` fails otherwise).
+- Commit `Cargo.toml` and `Cargo.lock` together.
+
 ## License
 
 Dual-licensed under either of

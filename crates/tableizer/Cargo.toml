@@ -15,15 +15,17 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-ab_glyph = "0.2.32"
 directories = "6.0.0"
-eframe = { version = "0.34.3", features = ["persistence"] }
-egui_table = "0.8.0"
-encoding_rs = "0.8.35"
-fontdb = "0.23.0"
+eframe = { version = "0.36.2", features = ["persistence"] }
+egui_table = "0.10.0"
+encoding_rs = "0.8.42"
+fontdb = "0.24.0"
 rfd = "0.17.2"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+# Pinned to egui's skrifa, not the latest: fonts.rs must parse fonts exactly as egui does. Bump it with
+# eframe (see AGENTS.md); cargo-deny rejects a second skrifa version.
+skrifa = "0.44"
 tableizer-core = { path = "../tableizer-core" }
 
 [dev-dependencies]
