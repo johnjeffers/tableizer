@@ -439,6 +439,26 @@ impl TableizerApp {
         }
     }
 
+    /// The right-side panel, sliding in or out with `panel_open`.
+    fn show_side_panel(&mut self, ui: &mut egui::Ui) {
+        self.fix_panel_tab();
+        // Two things can open or close the panel this frame: egui, through its own copy of the flag
+        // (dragging the edge past min size closes it; dragging the collapsed handle reopens it), and
+        // the panel's contents, through `self.panel_open` (its ✕). Take egui's copy back only if egui
+        // changed it — writing it back unconditionally would undo the ✕.
+        let before = self.panel_open;
+        let mut panel_open = before;
+        egui::Panel::right("side_panel")
+            .resizable(true)
+            .default_size(280.0)
+            .min_size(280.0)
+            .max_size(500.0)
+            .show_collapsible(ui, &mut panel_open, |ui| self.side_panel_contents(ui));
+        if panel_open != before {
+            self.panel_open = panel_open;
+        }
+    }
+
     /// Render the right panel's tab strip (with a close button) and the active tab's contents.
     fn side_panel_contents(&mut self, ui: &mut egui::Ui) {
         let tabs = self.available_tabs();
@@ -1885,17 +1905,7 @@ impl eframe::App for TableizerApp {
         // Right-side tabbed panel (Columns / Parsing / Settings): resizable, slides in/out when
         // toggled. Shown before the central panel so the grid takes the remaining width; the default
         // width suits the Settings tab (its font picker is the widest content).
-        self.fix_panel_tab();
-        // egui may flip `panel_open` (drag the edge past min size to close, drag the collapsed
-        // handle to reopen); copied out and written back since the contents closure borrows `self`.
-        let mut panel_open = self.panel_open;
-        egui::Panel::right("side_panel")
-            .resizable(true)
-            .default_size(280.0)
-            .min_size(280.0)
-            .max_size(500.0)
-            .show_collapsible(ui, &mut panel_open, |ui| self.side_panel_contents(ui));
-        self.panel_open = panel_open;
+        self.show_side_panel(ui);
 
         // React to edits from the toolbar (filter/sort) and the side panel (Parsing → dialect,
         // Columns → layout): a dialect change re-opens the file; otherwise apply the view and persist
@@ -2405,6 +2415,113 @@ mod tests {
             size: Some(1),
             ..folder(url, ChildState::Unloaded)
         }
+    }
+
+    /// Drives the real app's side panel headlessly, frame by frame, in a 1200×800 window.
+    struct PanelHarness {
+        ctx: egui::Context,
+        app: TableizerApp,
+    }
+
+    impl PanelHarness {
+        /// The app with its side panel open on the Settings tab (no file needed).
+        fn open_on_settings() -> Self {
+            let ctx = egui::Context::default();
+            let mut app = TableizerApp::new(None);
+            app.install_fonts(&ctx);
+            ctx.set_global_style(theme::build(&app.theme, false).0);
+            app.panel_open = true;
+            app.panel_tab = PanelTab::Settings;
+            let mut harness = Self { ctx, app };
+            harness.frame(Vec::new()); // lay out once, so input finds the widgets
+            harness
+        }
+
+        /// One frame with `events`; the shapes painted.
+        fn frame(&mut self, events: Vec<egui::Event>) -> Vec<egui::Shape> {
+            let input = egui::RawInput {
+                events,
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200.0, 800.0),
+                )),
+                ..egui::RawInput::default()
+            };
+            let Self { ctx, app } = self;
+            let mut output = ctx.run_ui(input, |ui| app.show_side_panel(ui));
+            output.textures_delta.clear(); // no renderer to upload the font atlas to
+            output.shapes.into_iter().map(|c| c.shape).collect()
+        }
+
+        /// The centre of the panel's ✕: the rightmost painted line segment pair on the tab row.
+        fn close_button_center(&mut self) -> egui::Pos2 {
+            let shapes = self.frame(Vec::new());
+            let tab_row = shapes
+                .iter()
+                .find_map(|s| match s {
+                    egui::Shape::Text(t) if t.galley.text() == "Settings" => {
+                        Some(t.galley.rect.translate(t.pos.to_vec2()).center().y)
+                    }
+                    _ => None,
+                })
+                .expect("the Settings tab label");
+            let cross: Vec<egui::Pos2> = shapes
+                .iter()
+                .filter_map(|s| match s {
+                    egui::Shape::LineSegment { points, .. }
+                        if (points[0].y - tab_row).abs() < 10.0 =>
+                    {
+                        Some(egui::pos2(
+                            (points[0].x + points[1].x) / 2.0,
+                            (points[0].y + points[1].y) / 2.0,
+                        ))
+                    }
+                    _ => None,
+                })
+                .collect();
+            *cross
+                .iter()
+                .max_by(|a, b| a.x.total_cmp(&b.x))
+                .expect("the ✕ on the tab row")
+        }
+
+        /// Click at `pos` (pointer moved there, pressed, then released over a few frames).
+        fn click(&mut self, pos: egui::Pos2) {
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            self.frame(vec![egui::Event::PointerMoved(pos)]);
+            self.frame(vec![button(true)]);
+            self.frame(vec![button(false)]);
+        }
+    }
+
+    #[test]
+    fn side_panel_reopens_from_its_collapsed_edge() {
+        // egui flips its own copy of the flag here; that change must still reach the app.
+        let mut h = PanelHarness::open_on_settings();
+        h.app.panel_open = false;
+        for _ in 0..30 {
+            h.frame(Vec::new()); // let the slide-out finish: only the grab strip at the edge remains
+        }
+        let edge = egui::pos2(1198.0, 400.0);
+        h.click(edge);
+        h.click(edge); // a double-click on the strip reopens the panel
+        assert!(h.app.panel_open);
+    }
+
+    #[test]
+    fn side_panel_close_button_closes_the_panel() {
+        let mut h = PanelHarness::open_on_settings();
+        let close = h.close_button_center();
+        h.click(close);
+        assert!(
+            !h.app.panel_open,
+            "the panel is still open after clicking its ✕"
+        );
     }
 
     #[test]
