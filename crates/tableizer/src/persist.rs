@@ -76,6 +76,45 @@ pub mod views {
     }
 }
 
+/// Cloud (S3) credentials/config in the OS config dir. Stored **unencrypted** — like the AWS CLI's
+/// `~/.aws/credentials` — but with owner-only (0600) permissions on Unix.
+pub mod cloud {
+    use crate::model::CloudConfig;
+    use std::path::PathBuf;
+
+    fn file() -> Option<PathBuf> {
+        let base = directories::BaseDirs::new()?;
+        Some(base.config_dir().join("tableizer").join("cloud.json"))
+    }
+
+    pub fn load() -> CloudConfig {
+        file()
+            .and_then(|f| std::fs::read(f).ok())
+            .and_then(|data| serde_json::from_slice(&data).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(config: &CloudConfig) {
+        let Some(path) = file() else {
+            return;
+        };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let Ok(data) = serde_json::to_vec_pretty(config) else {
+            return;
+        };
+        if std::fs::write(&path, data).is_ok() {
+            // The file holds secret keys; restrict it to the owner where the OS supports it.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+}
+
 /// Theme-settings persistence in the OS config dir.
 pub mod prefs {
     use crate::theme::Settings;

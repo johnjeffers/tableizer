@@ -3,6 +3,7 @@
 
 use eframe::egui;
 
+use crate::model::{CloudConfig, CredentialSource};
 use crate::theme;
 
 /// Format a byte count for the cache display.
@@ -76,6 +77,7 @@ pub(crate) fn settings_tab(
     families: &[(String, bool)],
     font_search: &mut String,
     mono_only: &mut bool,
+    cloud: &mut CloudConfig,
 ) {
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
@@ -196,17 +198,128 @@ pub(crate) fn settings_tab(
                 });
 
             ui.add_space(12.0);
-            settings_section(ui, "Index cache");
+            settings_section(ui, "Cloud storage (S3)");
+            segmented(
+                ui,
+                &mut cloud.source,
+                &[
+                    (CredentialSource::AwsChain, "AWS profile / SSO"),
+                    (CredentialSource::Static, "Static keys"),
+                ],
+            );
+            ui.add_space(8.0);
+            const FIELD_W: f32 = 180.0;
+            let weak = |ui: &egui::Ui, text: &str| {
+                egui::RichText::new(text).color(ui.visuals().weak_text_color())
+            };
+            match cloud.source {
+                CredentialSource::AwsChain => {
+                    ui.label(weak(
+                        ui,
+                        "Uses your AWS credential chain — environment, ~/.aws profiles, SSO, and IAM \
+                         roles. For SSO, run `aws sso login` first.",
+                    ));
+                    ui.add_space(6.0);
+                    egui::Grid::new("settings_cloud_chain")
+                        .num_columns(2)
+                        .spacing([16.0, 8.0])
+                        .min_col_width(96.0)
+                        .show(ui, |ui| {
+                            ui.label("Profile");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut cloud.profile)
+                                    .hint_text("default / AWS_PROFILE")
+                                    .desired_width(FIELD_W),
+                            );
+                            ui.end_row();
+
+                            ui.label("Region");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut cloud.region)
+                                    .hint_text("from profile if blank")
+                                    .desired_width(FIELD_W),
+                            );
+                            ui.end_row();
+                        });
+                }
+                CredentialSource::Static => {
+                    ui.label(weak(
+                        ui,
+                        "Static keys for pasted credentials or S3-compatible stores (MinIO/R2). \
+                         Saved unencrypted in your config dir.",
+                    ));
+                    ui.add_space(6.0);
+                    egui::Grid::new("settings_cloud_static")
+                        .num_columns(2)
+                        .spacing([16.0, 8.0])
+                        .min_col_width(96.0)
+                        .show(ui, |ui| {
+                            ui.label("Region");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut cloud.region)
+                                    .hint_text("us-east-1")
+                                    .desired_width(FIELD_W),
+                            );
+                            ui.end_row();
+
+                            ui.label("Access key ID");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut cloud.access_key_id)
+                                    .desired_width(FIELD_W),
+                            );
+                            ui.end_row();
+
+                            ui.label("Secret key");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut cloud.secret_access_key)
+                                    .password(true)
+                                    .desired_width(FIELD_W),
+                            );
+                            ui.end_row();
+
+                            ui.label("Session token");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut cloud.session_token)
+                                    .password(true)
+                                    .hint_text("(optional)")
+                                    .desired_width(FIELD_W),
+                            );
+                            ui.end_row();
+
+                            ui.label("Endpoint");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut cloud.endpoint)
+                                    .hint_text("MinIO/R2 (optional)")
+                                    .desired_width(FIELD_W),
+                            );
+                            ui.end_row();
+                        });
+                    ui.checkbox(
+                        &mut cloud.allow_http,
+                        "Allow plain-HTTP endpoint (e.g. local MinIO)",
+                    );
+                }
+            }
+
+            ui.add_space(12.0);
+            settings_section(ui, "Cache");
+            // The index cache, plus the downloaded-objects and decompressed-files caches (which can be
+            // large), all live in the OS state dir — never beside the user's data.
+            let total = tableizer_core::cache::total_size()
+                + tableizer_core::remote::cache_size()
+                + tableizer_core::gzip::total_size();
             ui.label(
                 egui::RichText::new(format!(
-                    "Size on disk: {}",
-                    human_bytes(tableizer_core::cache::total_size())
+                    "Index + downloads + decompressed on disk: {}",
+                    human_bytes(total)
                 ))
                 .color(ui.visuals().weak_text_color()),
             );
             ui.add_space(4.0);
             if ui.button("Clear cache").clicked() {
                 tableizer_core::cache::clear();
+                tableizer_core::remote::clear_cache();
+                tableizer_core::gzip::clear();
             }
         });
 }

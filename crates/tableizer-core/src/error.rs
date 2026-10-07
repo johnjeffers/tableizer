@@ -22,6 +22,11 @@ pub enum Error {
     /// A user-supplied search pattern (regex) failed to compile.
     #[error("invalid search pattern: {0}")]
     InvalidPattern(String),
+
+    /// Sourcing bytes from a remote object store (S3 / GCS / Azure / HTTP) failed — bad URL,
+    /// unsupported scheme, missing credentials, or a transport error.
+    #[error("remote source error: {0}")]
+    Remote(String),
 }
 
 /// Convenience alias for engine results.

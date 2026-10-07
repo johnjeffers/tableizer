@@ -96,6 +96,67 @@ files in practice — huge UTF-16 is not streamed). The known caveat: an `mmap`e
 another process can `SIGBUS`; a positioned-`pread` fallback + SIGBUS guard is the planned hardening
 for adversarial / network / removable media.
 
+**Gzip** (`crates/tableizer-core/src/gzip.rs`) is *streaming* — no random access — so it is handled
+the same way as a remote object: a gzipped file (detected by magic bytes, not extension) is
+**decompressed once to a cache file** in the OS *state* dir under `tableizer/decompressed` (streamed,
+progress + cancel, keyed by source `{path, size, mtime}`), and the seekable decompressed file is what
+the engine opens. Byte fidelity holds on the decompressed content (decode is lossless/deterministic;
+the wrapper is transport). It composes with remote: an `s3://…/data.csv.gz` is downloaded, then
+decompressed, then opened. The three caches (index, downloaded objects, decompressed files) share the
+state dir and are surfaced together with one **Clear cache** control (Settings ▸ Cache).
+
+**Remote / cloud sources** (`crates/tableizer-core/src/remote.rs`) are reached through the
+`object_store` crate (multi-cloud: S3 / GCS / Azure / HTTP behind one ranged-read API). It is *pure
+I/O* — a byte source, not a query or sort engine — so reusing it leaves the "the external sort is
+ours" invariant untouched. The current strategy is **download-to-cache**: a remote object is fetched
+once (streamed, with progress + cancel) into the OS *state* dir under `tableizer/remote-cache`, keyed
+by the object's ETag (else size + last-modified), then opened exactly like a local file — so the whole
+engine (index, view, sort, search, export, index persistence) works unchanged. The object store is
+async; that is confined to `remote.rs` behind a per-call current-thread runtime so the engine stays
+synchronous. **Credentials:** `object_store::parse_url` builds a *blank* backend (it does not read the
+environment), so auth is passed explicitly as options merged over the process environment. For S3 the
+options come from one of two sources, chosen in Settings ▸ Cloud storage: (1) the **AWS provider chain**
+(default) — `remote::aws_credentials` runs `aws-config` to resolve environment, `~/.aws` profiles,
+**SSO** (the `aws sso login` token cache → temporary credentials), assume-role, and EC2/ECS roles;
+`object_store` has no SSO of its own, so we resolve and pass static temp credentials in. Or (2) a
+**static-keys** form for pasted credentials / S3-compatible stores (MinIO, R2: endpoint + allow-HTTP).
+S3 buckets are region-specific, but one credential set (e.g. an SSO role) can span regions, so before
+each bucket operation the engine **resolves the bucket's region** (S3 `HeadBucket`, cached per bucket)
+and passes it to `object_store` — the in-app equivalent of the CLI's `--region`, so a bucket in a
+non-default region just works.
+The **start screen** (shown when no file is open) is a two-column landing: a left column with the
+recent-files list and, on the right, an inline **file browser** — the only way to open a file (no OS
+file picker, no URL dialog; a URL can still arrive via the CLI arg or a recent entry). A
+**Browse Local / Browse Remote** toggle switches the
+browser between the local filesystem (the default — no credentials, instant) and cloud storage; each
+mode keeps its own cached tree. The browser is a lazy **tree** (`BrowseNode` / `ChildState`):
+
+- **Remote:** opens to buckets discovered from the credentials (`remote::list_s3_buckets`, via
+  `aws-sdk-s3`'s `ListBuckets` — needed because `object_store` is bucket-scoped and can't enumerate
+  buckets); expanding a folder **reads ahead** from it (`remote::read_ahead`) on a background thread,
+  with the same credential resolution as opening. A read-ahead lists the folder in full
+  (`list_with_delimiter`), then the folders below it into a shared `remote::ListingCache`, so
+  expanding (or completing into) one of those is answered without a round-trip. It is bounded on
+  every axis, since a bucket can be arbitrarily deep or wide: **depth** (2 levels below the folder),
+  a **request budget** (100 listings per read-ahead), **concurrency** (8 in flight), and **one page**
+  per read-ahead folder (`object_store`'s `PaginatedListStore`, so a folder of a million objects
+  costs one request; it is cached as incomplete and listed in full once visited). Folders on the way
+  to what's being typed in the jump-to field go first. One store serves a whole read-ahead (one
+  connection pool, one credential resolution), and none is resolved when everything within reach is
+  already cached. The jump-to field's folder completion reads the same cache.
+- **Local:** roots at Home, Desktop, Downloads and Documents (where the platform has them) and the
+  filesystem root; each folder is listed inline with `std::fs::read_dir`
+  (fast, synchronous — no background job, which also sidesteps node identity issues when a directory is
+  reachable two ways).
+
+Expanded subtrees are cached and kept across visits, so revisiting a branch never re-lists; Refresh
+re-lists from scratch (clearing the remote listing cache too).
+
+The documented next step is a **streaming `ReadAt` source** — first screen from a head fetch,
+random access by ranged GET, no full download — which generalises the same `pread`/SIGBUS seam above
+and reuses this `object_store` backend and cache directory; download-to-cache is a strict subset of
+it (eager instead of lazy).
+
 ## Concurrency
 
 Index builds and view builds run on background threads; each long job carries a `CancellationToken`
