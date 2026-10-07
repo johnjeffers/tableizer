@@ -33,17 +33,25 @@
     **Browse Local / Browse Remote** toggle (default Local; each mode keeps its own cached tree).
     **Remote:** opens to **buckets discovered
     from the credentials** (`remote::list_s3_buckets` via `aws-sdk-s3` ListBuckets, since object_store
-    is bucket-scoped and can't enumerate); expand a bucket/folder to list it (`remote::list_dir`,
-    object_store `list_with_delimiter`) on a background thread. **Local:** roots at Home + filesystem
+    is bucket-scoped and can't enumerate); expand a bucket/folder to list it on a background thread —
+    by **reading ahead** from it (`remote::read_ahead`: the folder in full, then 2 levels below it,
+    one page each, ≤100 requests, 8 concurrent, into a shared `ListingCache`; see architecture.md
+    § I/O), so expanding a read-ahead folder is instant. **Local:** roots at Home + filesystem
     root, listed inline via `std::fs::read_dir` (hidden dot-files skipped). Click a file to open.
     **Expanded subtrees are cached** (`ChildState` in the `BrowseNode` tree) and persist across visits,
     so revisiting never re-lists; Refresh re-lists the root, and a "go to" field adds a bucket/prefix
-    (remote) or path (local) as a top-level node.
+    (remote) or path (local) as a top-level node. The field **autocompletes folders** as you type
+    (`complete.rs`): it lists the folder typed so far off the UI thread (local `read_dir`; remote by
+    reading ahead from it, steered toward what's typed, into the same `ListingCache` as the tree; or
+    the S3 buckets at `s3://`; remote listings cached until Refresh) and offers the matching
+    subfolders — ↑/↓ to highlight, Tab/click/Enter to complete, Esc to hide.
     Background-listed (multiple folders concurrently) with the same credential resolution as opening
     (SSO/profile/static). NOTE: `aws-sdk-s3` must keep `default-features=false` + `default-https-client`
     (NOT the default `rustls` feature → legacy rustls 0.21, RUSTSEC-2026-0098/0099/0104). Follow-ups:
-    bucket discovery for GCS/Azure (S3 only now), type-ahead filter, paging very large prefixes,
-    persisting the tree across app restarts.
+    bucket discovery for GCS/Azure (S3 only now), type-ahead filter, paging very large prefixes in the
+    tree (a visited folder is still listed whole), persisting the tree across app restarts, reusing
+    resolved credentials and connections *across* read-aheads (each resolves once — SSO is a network
+    exchange — and builds its own store).
   - DONE: S3 credentials (Settings ▸ Cloud storage), two modes — (1) **AWS chain** (default):
     `remote::aws_credentials` via `aws-config` covers env, `~/.aws` profiles, **SSO** (`aws sso login`
     token cache → temp creds), assume-role, EC2/ECS roles; optional profile + region fields. (2)

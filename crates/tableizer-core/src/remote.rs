@@ -32,6 +32,9 @@ use url::Url;
 
 use crate::{CancellationToken, Error, Result};
 
+mod read_ahead;
+pub use read_ahead::{CachedListing, ListingCache, ReadAheadLimits, read_ahead};
+
 /// Per-bucket S3 region cache. S3 buckets are region-specific, but one credential set (e.g. an SSO
 /// role) can read buckets in many regions — so we discover each bucket's region once and reuse it.
 fn region_cache() -> &'static Mutex<HashMap<String, String>> {
@@ -100,6 +103,13 @@ async fn build_store(
     url: &Url,
     options: &[(String, String)],
 ) -> Result<(Box<dyn ObjectStore>, object_store::path::Path)> {
+    object_store::parse_url_opts(url, store_options(url, options).await)
+        .map_err(|e| Error::Remote(format!("unsupported location: {e}")))
+}
+
+/// The final store options for `url`: `options` over the process environment, plus an AWS bucket's
+/// actual region (see [`build_store`]).
+async fn store_options(url: &Url, options: &[(String, String)]) -> Vec<(String, String)> {
     let mut merged = merge_options(std::env::vars(), options);
     if let Some(bucket) = s3_bucket(url)
         && !options.iter().any(|(k, _)| k == "aws_endpoint")
@@ -107,8 +117,7 @@ async fn build_store(
     {
         merged.push(("aws_region".to_string(), region)); // applied last → wins over the configured one
     }
-    object_store::parse_url_opts(url, merged)
-        .map_err(|e| Error::Remote(format!("unsupported location: {e}")))
+    merged
 }
 
 /// One entry in a remote directory listing: a child "folder" (common prefix) or an object (file).
@@ -287,68 +296,42 @@ fn buckets_to_listing(names: impl IntoIterator<Item = String>) -> DirListing {
     DirListing { entries }
 }
 
-/// List the immediate children of the remote prefix `location` (a bucket root like `s3://bucket` or a
-/// prefix like `s3://bucket/data/`) for the file browser: child prefixes become navigable folders and
-/// objects become files, each carrying a full URL. `options` supply credentials/config exactly as in
-/// [`fetch_to_cache`]. Folders are listed before files, each group sorted by name.
-pub fn list_dir(
-    location: &str,
-    options: &[(String, String)],
-    cancel: &CancellationToken,
-) -> Result<DirListing> {
-    let url = Url::parse(location).map_err(|e| Error::Remote(format!("invalid URL: {e}")))?;
-    // The bucket/host root to rebuild absolute URLs from the store-relative keys the listing returns.
-    let base = format!("{}://{}", url.scheme(), url.host_str().unwrap_or(""));
-
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(async move {
-        if cancel.is_cancelled() {
-            return Err(Error::Cancelled);
-        }
-        let (store, prefix) = build_store(&url, options).await?;
-        // `list_with_delimiter` returns the prefix's immediate children: common prefixes (folders) and
-        // objects (files), rather than a full recursive listing.
-        let prefix = (!prefix.as_ref().is_empty()).then_some(prefix);
-        let result = store
-            .list_with_delimiter(prefix.as_ref())
-            .await
-            .map_err(|e| Error::Remote(e.to_string()))?;
-
-        let mut folders: Vec<DirEntry> = result
-            .common_prefixes
-            .iter()
-            .map(|p| {
-                let key = p.as_ref();
-                DirEntry {
-                    name: last_segment(key).to_string(),
-                    url: format!("{base}/{key}/"),
-                    is_dir: true,
-                    size: None,
-                }
+/// Turn a delimited listing of the bucket/host root `base` into browser entries: child prefixes
+/// become folders and objects become files, each with a full URL — folders first, then files, each
+/// sorted by name.
+fn listing_from(base: &str, result: &object_store::ListResult) -> DirListing {
+    let mut folders: Vec<DirEntry> = result
+        .common_prefixes
+        .iter()
+        .map(|p| {
+            let key = p.as_ref();
+            DirEntry {
+                name: last_segment(key).to_string(),
+                url: format!("{base}/{key}/"),
+                is_dir: true,
+                size: None,
+            }
+        })
+        .collect();
+    let mut files: Vec<DirEntry> = result
+        .objects
+        .iter()
+        .filter_map(|o| {
+            let key = o.location.as_ref();
+            let name = last_segment(key);
+            // Skip the zero-length "directory marker" object some stores return for the prefix.
+            (!name.is_empty()).then(|| DirEntry {
+                name: name.to_string(),
+                url: format!("{base}/{key}"),
+                is_dir: false,
+                size: Some(o.size),
             })
-            .collect();
-        let mut files: Vec<DirEntry> = result
-            .objects
-            .iter()
-            .filter_map(|o| {
-                let key = o.location.as_ref();
-                let name = last_segment(key);
-                // Skip the zero-length "directory marker" object some stores return for the prefix.
-                (!name.is_empty()).then(|| DirEntry {
-                    name: name.to_string(),
-                    url: format!("{base}/{key}"),
-                    is_dir: false,
-                    size: Some(o.size),
-                })
-            })
-            .collect();
-        folders.sort_by(|a, b| a.name.cmp(&b.name));
-        files.sort_by(|a, b| a.name.cmp(&b.name));
-        folders.append(&mut files);
-        Ok(DirListing { entries: folders })
-    })
+        })
+        .collect();
+    folders.sort_by(|a, b| a.name.cmp(&b.name));
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    folders.append(&mut files);
+    DirListing { entries: folders }
 }
 
 /// The parent prefix URL of `location` for "up" navigation, or `None` when already at the bucket root.
@@ -511,6 +494,59 @@ fn url_extension(target: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn object(key: &str, size: u64) -> object_store::ObjectMeta {
+        object_store::ObjectMeta {
+            location: object_store::path::Path::from(key),
+            last_modified: Default::default(),
+            size,
+            e_tag: None,
+            version: None,
+        }
+    }
+
+    #[test]
+    fn listing_from_puts_sorted_folders_before_sorted_files() {
+        let result = object_store::ListResult {
+            common_prefixes: vec!["data/zeta".into(), "data/alpha".into()],
+            objects: vec![object("data/b.csv", 2), object("data/a.csv", 1)],
+            extensions: Default::default(),
+        };
+        let entries: Vec<_> = listing_from("s3://bucket", &result)
+            .entries
+            .into_iter()
+            .map(|e| (e.name, e.url, e.is_dir, e.size))
+            .collect();
+        assert_eq!(
+            entries,
+            [
+                ("alpha".into(), "s3://bucket/data/alpha/".into(), true, None),
+                ("zeta".into(), "s3://bucket/data/zeta/".into(), true, None),
+                (
+                    "a.csv".into(),
+                    "s3://bucket/data/a.csv".into(),
+                    false,
+                    Some(1)
+                ),
+                (
+                    "b.csv".into(),
+                    "s3://bucket/data/b.csv".into(),
+                    false,
+                    Some(2)
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn listing_from_skips_an_empty_key_directory_marker() {
+        let result = object_store::ListResult {
+            common_prefixes: Vec::new(),
+            objects: vec![object("", 0)],
+            extensions: Default::default(),
+        };
+        assert_eq!(listing_from("s3://bucket", &result).entries, []);
+    }
+
     #[test]
     fn is_remote_classifies_schemes() {
         assert!(is_remote("s3://bucket/key.csv"));
@@ -569,28 +605,6 @@ mod tests {
         // Already at the root → no parent.
         assert_eq!(parent_url("s3://bucket/"), None);
         assert_eq!(parent_url("s3://bucket"), None);
-    }
-
-    #[test]
-    fn list_dir_returns_folders_then_files() {
-        // A `file://` directory exercises list_with_delimiter through object_store's local backend.
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join("sub")).unwrap();
-        std::fs::write(dir.path().join("sub").join("nested.csv"), b"x").unwrap();
-        std::fs::write(dir.path().join("b.csv"), b"hi").unwrap();
-        std::fs::write(dir.path().join("a.csv"), b"hello").unwrap();
-        let url = Url::from_directory_path(dir.path()).unwrap();
-
-        let listing = list_dir(url.as_str(), &[], &CancellationToken::new()).unwrap();
-        let names: Vec<&str> = listing.entries.iter().map(|e| e.name.as_str()).collect();
-        // Folder first, then files sorted by name; the nested file is not listed (non-recursive).
-        assert_eq!(names, vec!["sub", "a.csv", "b.csv"]);
-        assert!(listing.entries[0].is_dir);
-        assert!(!listing.entries[1].is_dir);
-        assert_eq!(listing.entries[1].size, Some(5)); // a.csv = "hello"
-        // The folder URL is navigable (ends in `/`) and the file URL points at the object.
-        assert!(listing.entries[0].url.ends_with("/sub/"));
-        assert!(listing.entries[1].url.ends_with("/a.csv"));
     }
 
     #[test]

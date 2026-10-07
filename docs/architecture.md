@@ -133,13 +133,23 @@ mode keeps its own cached tree. The browser is a lazy **tree** (`BrowseNode` / `
 
 - **Remote:** opens to buckets discovered from the credentials (`remote::list_s3_buckets`, via
   `aws-sdk-s3`'s `ListBuckets` — needed because `object_store` is bucket-scoped and can't enumerate
-  buckets); each folder is listed on expand with `remote::list_dir` (`object_store`'s
-  `list_with_delimiter`) on a background thread, with the same credential resolution as opening.
+  buckets); expanding a folder **reads ahead** from it (`remote::read_ahead`) on a background thread,
+  with the same credential resolution as opening. A read-ahead lists the folder in full
+  (`list_with_delimiter`), then the folders below it into a shared `remote::ListingCache`, so
+  expanding (or completing into) one of those is answered without a round-trip. It is bounded on
+  every axis, since a bucket can be arbitrarily deep or wide: **depth** (2 levels below the folder),
+  a **request budget** (100 listings per read-ahead), **concurrency** (8 in flight), and **one page**
+  per read-ahead folder (`object_store`'s `PaginatedListStore`, so a folder of a million objects
+  costs one request; it is cached as incomplete and listed in full once visited). Folders on the way
+  to what's being typed in the jump-to field go first. One store serves a whole read-ahead (one
+  connection pool, one credential resolution), and none is resolved when everything within reach is
+  already cached. The jump-to field's folder completion reads the same cache.
 - **Local:** roots at Home + the filesystem root; each folder is listed inline with `std::fs::read_dir`
   (fast, synchronous — no background job, which also sidesteps node identity issues when a directory is
   reachable two ways).
 
-Expanded subtrees are cached and kept across visits, so revisiting a branch never re-lists.
+Expanded subtrees are cached and kept across visits, so revisiting a branch never re-lists; Refresh
+re-lists from scratch (clearing the remote listing cache too).
 
 The documented next step is a **streaming `ReadAt` source** — first screen from a head fetch,
 random access by ranged GET, no full download — which generalises the same `pread`/SIGBUS seam above

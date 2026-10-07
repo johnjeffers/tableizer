@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use eframe::egui;
 use encoding_rs::Encoding;
+use tableizer_core::remote::{CachedListing, ListingCache, ReadAheadLimits};
 use tableizer_core::{
     CancellationToken, ColumnId, ExportScope, RowCount, Schema, ViewportSource, parse::Dialect,
 };
@@ -22,7 +23,7 @@ use crate::ui::{
     ExportKind, ExportRequest, columns_tab, empty_view, fmt_bytes, fmt_count, grid, menu_bar,
     parsing_tab, settings_tab, status_bar, toolbar,
 };
-use crate::{fonts, theme};
+use crate::{complete, fonts, theme};
 
 /// A running (or just-finished) export, driven on a background thread so a multi-GB write never
 /// blocks the UI (the Tier-C contract: async, progress within ~100 ms, cancellable). The UI polls
@@ -83,6 +84,15 @@ pub(crate) struct TableizerApp {
     browse_jobs: Vec<BrowseJob>,
     /// The "go to" field: a URL (remote) or path (local) to add to the tree and expand.
     browse_goto: String,
+    /// Folder suggestions for the "go to" field as the user types.
+    goto_complete: GotoCompletion,
+    /// The "go to" text, shared with the field's read-ahead to steer it toward what's being typed.
+    goto_focus: Arc<Mutex<String>>,
+    /// Remote folder listings shared by the tree and the "go to" suggestions, filled by read-ahead.
+    /// Cleared by Refresh.
+    listings: Arc<ListingCache>,
+    /// Read-aheads from tree folders being expanded, until each finishes.
+    tree_read_aheads: Vec<ReadAheadJob>,
 }
 
 /// A running (or just-finished) remote download to the local cache, on a background thread so a
@@ -178,6 +188,44 @@ struct BrowseJob {
     outcome: Arc<Mutex<Option<Result<tableizer_core::remote::DirListing, String>>>>,
 }
 
+/// Folder completion for the "go to" field (see [`crate::complete`]): the folder the suggestions come
+/// from (the typed text up to its last separator), its subfolders once listed, and the popup's state.
+#[derive(Default)]
+struct GotoCompletion {
+    /// The folder listed for suggestions; `None` until the text contains a separator.
+    parent: Option<String>,
+    /// `parent`'s subfolder names; `None` while listing, or when it can't be listed (completion is
+    /// best-effort, so a failure just means no suggestions).
+    dirs: Option<Vec<String>>,
+    /// Whether `dirs` is final. A remote folder's suggestions keep updating from the shared listing
+    /// cache until its complete listing lands (a read-ahead may have read only its first page).
+    dirs_complete: bool,
+    /// The **local** listing in flight for `parent`.
+    job: Option<CompletionOutcome>,
+    /// Stops the read-ahead from a **remote** `parent` once the text moves on to another folder.
+    read_ahead: Option<CancellationToken>,
+    /// The suggestion highlighted with ↑/↓, if any. Cleared whenever the text changes.
+    highlighted: Option<usize>,
+    /// Escape hid the popup; it returns when the text changes.
+    dismissed: bool,
+    /// Whether the popup showed last frame — kept open while a click on it completes.
+    open: bool,
+}
+
+/// A local folder listing for [`GotoCompletion`], run on a background thread so a slow (network)
+/// mount never blocks the UI: `None` while running; the subfolder names, or an error message.
+type CompletionOutcome = Arc<Mutex<Option<Result<Vec<String>, String>>>>;
+
+/// A read-ahead from a tree folder being expanded, on a background thread. The folder's own listing is
+/// installed from the shared cache as soon as it lands ([`install_cached`]); the read-ahead goes on
+/// below it.
+struct ReadAheadJob {
+    root: String,
+    cancel: CancellationToken,
+    /// `None` while running; then whether the folder itself could be listed.
+    outcome: Arc<Mutex<Option<Result<(), String>>>>,
+}
+
 /// Which filesystem the start-screen browser is showing.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum BrowseMode {
@@ -264,6 +312,10 @@ impl TableizerApp {
             local_root: ChildState::Unloaded,
             browse_jobs: Vec::new(),
             browse_goto: String::new(),
+            goto_complete: GotoCompletion::default(),
+            goto_focus: Arc::default(),
+            listings: Arc::default(),
+            tree_read_aheads: Vec::new(),
         }
     }
 
@@ -825,10 +877,18 @@ impl TableizerApp {
         }
     }
 
-    /// Spawn a background listing for `location` (`""` = discover buckets, else list a prefix). The
-    /// result is installed on the matching tree node by [`poll_browse`](Self::poll_browse). Multiple
-    /// may run at once (expanding several folders); the tree node was already marked `Loading`.
+    /// List a tree location (its node already marked `Loading`): `""` discovers the buckets on a
+    /// background thread; a folder is **read ahead** from, and its listing installed from the shared
+    /// cache as soon as it's there — at once, if an earlier read-ahead already listed it. Either way
+    /// [`poll_browse`](Self::poll_browse) installs the result. Several may run at once.
     fn load_children(&mut self, location: String, ctx: &egui::Context) {
+        if !location.is_empty() {
+            install_cached(&mut self.browse_root, &self.listings);
+            let focus = Arc::new(Mutex::new(location.clone()));
+            let job = self.spawn_read_ahead(location, focus, ctx);
+            self.tree_read_aheads.push(job);
+            return;
+        }
         let cancel = CancellationToken::new();
         let outcome: Arc<Mutex<Option<Result<tableizer_core::remote::DirListing, String>>>> =
             Arc::new(Mutex::new(None));
@@ -837,25 +897,11 @@ impl TableizerApp {
             cancel: cancel.clone(),
             outcome: Arc::clone(&outcome),
         });
+        // Root: enumerate buckets reachable with the configured credentials.
         let ctx = ctx.clone();
-        if location.is_empty() {
-            // Root: enumerate buckets reachable with the configured credentials.
-            let auth = self.s3_auth();
-            std::thread::spawn(move || {
-                let result =
-                    tableizer_core::remote::list_s3_buckets(&auth).map_err(|e| e.to_string());
-                *outcome.lock().expect("browse outcome lock") = Some(result);
-                ctx.request_repaint();
-            });
-            return;
-        }
-        let auth = self.cloud_auth(&location);
+        let auth = self.s3_auth();
         std::thread::spawn(move || {
-            let result = (|| -> Result<tableizer_core::remote::DirListing, String> {
-                let options = auth.resolve()?;
-                tableizer_core::remote::list_dir(&location, &options, &cancel)
-                    .map_err(|e| e.to_string())
-            })();
+            let result = tableizer_core::remote::list_s3_buckets(&auth).map_err(|e| e.to_string());
             *outcome.lock().expect("browse outcome lock") = Some(result);
             ctx.request_repaint();
         });
@@ -879,6 +925,17 @@ impl TableizerApp {
             }
         });
         for (location, result) in finished {
+            if let (true, Ok(listing)) = (location.is_empty(), &result) {
+                // The buckets also feed the "go to" field's suggestions at `s3://`.
+                let listing = listing.clone();
+                self.listings.insert(
+                    "s3://",
+                    CachedListing {
+                        listing,
+                        complete: true,
+                    },
+                );
+            }
             let state = match result {
                 Ok(listing) => ChildState::Loaded(nodes_from(listing)),
                 Err(error) => ChildState::Failed(error),
@@ -887,6 +944,27 @@ impl TableizerApp {
                 self.browse_root = state;
             } else if let Some(node) = find_node_mut(&mut self.browse_root, &location) {
                 node.children = state;
+            }
+        }
+        // Read-ahead tree folders: install each listing as it lands (the read-ahead repaints), and
+        // mark the folders that could not be listed.
+        install_cached(&mut self.browse_root, &self.listings);
+        let mut failed = Vec::new();
+        self.tree_read_aheads.retain(|job| {
+            match job.outcome.lock().expect("read-ahead outcome lock").take() {
+                Some(Err(error)) => {
+                    failed.push((job.root.clone(), error));
+                    false
+                }
+                Some(Ok(())) => false,
+                None => true,
+            }
+        });
+        for (root, error) in failed {
+            if let Some(node) = find_node_mut(&mut self.browse_root, &root)
+                && matches!(node.children, ChildState::Loading)
+            {
+                node.children = ChildState::Failed(error);
             }
         }
         if running {
@@ -951,11 +1029,139 @@ impl TableizerApp {
         }
     }
 
+    /// Keep the "go to" suggestions in step with the typed text: when its folder part changes, list
+    /// that folder afresh (a remote one by reading ahead from it). Local suggestions arrive with their
+    /// listing; remote ones are taken from the shared listing cache as the read-ahead fills it.
+    fn update_goto_completion(&mut self, ctx: &egui::Context) {
+        let mode = self.browse_mode;
+        {
+            let mut focus = self.goto_focus.lock().expect("goto focus lock");
+            if *focus != self.browse_goto {
+                focus.clone_from(&self.browse_goto); // steers the read-ahead toward what's typed
+            }
+        }
+        let parent = complete::split(&self.browse_goto, goto_separator(mode))
+            .map(|(parent, _)| parent.to_owned());
+        if parent != self.goto_complete.parent {
+            let completion = &mut self.goto_complete;
+            completion.job = None; // a superseded local listing just goes unread
+            if let Some(read_ahead) = completion.read_ahead.take() {
+                read_ahead.cancel(); // the old folder's read-ahead is no longer wanted
+            }
+            completion.dirs = None;
+            completion.dirs_complete = false;
+            completion.parent = parent.clone();
+            if let Some(parent) = parent {
+                self.start_completion_listing(parent, ctx);
+            }
+        }
+        let completion = &mut self.goto_complete;
+        let finished = completion
+            .job
+            .as_ref()
+            .and_then(|outcome| outcome.lock().expect("completion outcome lock").take());
+        if let Some(result) = finished {
+            completion.job = None;
+            completion.dirs = result.ok();
+            completion.dirs_complete = true;
+        }
+        if mode == BrowseMode::Remote
+            && !completion.dirs_complete
+            && let Some(parent) = &completion.parent
+            && let Some((dirs, complete)) = cached_dirs(&self.listings, parent)
+        {
+            completion.dirs = Some(dirs);
+            completion.dirs_complete = complete;
+        }
+    }
+
+    /// Start listing `parent`'s subfolders for the "go to" suggestions, off the UI thread: a local
+    /// directory directly; a remote bucket/prefix by reading ahead from it into the shared cache; the
+    /// S3 buckets (at `s3://`) into the cache, unless already there.
+    fn start_completion_listing(&mut self, parent: String, ctx: &egui::Context) {
+        match self.browse_mode {
+            BrowseMode::Local => {
+                let outcome: CompletionOutcome = Arc::new(Mutex::new(None));
+                self.goto_complete.job = Some(Arc::clone(&outcome));
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    let result = complete::list_local_subdirs(Path::new(&parent));
+                    *outcome.lock().expect("completion outcome lock") = Some(result);
+                    ctx.request_repaint();
+                });
+            }
+            BrowseMode::Remote => match complete::remote_source(&parent) {
+                None => {}
+                Some(complete::RemoteSource::Buckets) => {
+                    if self.listings.get(&parent).is_some() {
+                        return;
+                    }
+                    let auth = self.s3_auth();
+                    let listings = Arc::clone(&self.listings);
+                    let ctx = ctx.clone();
+                    std::thread::spawn(move || {
+                        // Best-effort: without credentials there are simply no bucket suggestions.
+                        if let Ok(listing) = tableizer_core::remote::list_s3_buckets(&auth) {
+                            let complete = true;
+                            listings.insert(&parent, CachedListing { listing, complete });
+                            ctx.request_repaint();
+                        }
+                    });
+                }
+                Some(complete::RemoteSource::Prefix) => {
+                    let focus = Arc::clone(&self.goto_focus);
+                    let job = self.spawn_read_ahead(parent, focus, ctx);
+                    self.goto_complete.read_ahead = Some(job.cancel);
+                }
+            },
+        }
+    }
+
+    /// Start a read-ahead from remote folder `root` on a worker thread (see
+    /// [`tableizer_core::remote::read_ahead`]), filling the shared listing cache and steered toward
+    /// `focus`; each listing that lands repaints, so it shows straight away.
+    fn spawn_read_ahead(
+        &self,
+        root: String,
+        focus: Arc<Mutex<String>>,
+        ctx: &egui::Context,
+    ) -> ReadAheadJob {
+        let job = ReadAheadJob {
+            root: root.clone(),
+            cancel: CancellationToken::new(),
+            outcome: Arc::new(Mutex::new(None)),
+        };
+        let auth = self.cloud_auth(&root);
+        let listings = Arc::clone(&self.listings);
+        let cancel = job.cancel.clone();
+        let outcome = Arc::clone(&job.outcome);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let resolve = || auth.resolve().map_err(tableizer_core::Error::Remote);
+            let focus = || focus.lock().expect("read-ahead focus lock").clone();
+            let repaint = || ctx.request_repaint();
+            let result = tableizer_core::remote::read_ahead(
+                &root,
+                resolve,
+                ReadAheadLimits::default(),
+                &focus,
+                &listings,
+                &cancel,
+                &repaint,
+            )
+            .map_err(|e| e.to_string());
+            *outcome.lock().expect("read-ahead outcome lock") = Some(result);
+            ctx.request_repaint();
+        });
+        job
+    }
+
     /// The start screen (shown when no file is open): a left column with recent files and, on the
     /// right, the inline **browser** — a Local/Remote toggle, a jump-to field + Refresh, and the lazy
     /// tree (cloud buckets/prefixes, or the local filesystem). Opening anything here transitions to the
     /// grid; both trees stay cached.
     fn show_landing(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        self.update_goto_completion(ctx);
         let mut to_open: Option<PathBuf> = None;
         let mut action = BrowseAction::None;
         {
@@ -967,6 +1173,7 @@ impl TableizerApp {
                 browse_root,
                 local_root,
                 browse_goto,
+                goto_complete,
                 ..
             } = self;
             let mode = *browse_mode;
@@ -1003,14 +1210,8 @@ impl TableizerApp {
                         BrowseMode::Remote => "s3://bucket/prefix/ — jump to",
                         BrowseMode::Local => "/path/to/folder — jump to",
                     };
-                    let submit = ui
-                        .add(
-                            egui::TextEdit::singleline(browse_goto)
-                                .hint_text(hint)
-                                .desired_width(ui.available_width() - 56.0),
-                        )
-                        .lost_focus()
-                        && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let width = ui.available_width() - 56.0;
+                    let submit = goto_field(ui, browse_goto, goto_complete, mode, hint, width);
                     let ready = !browse_goto.trim().is_empty();
                     if ui.add_enabled(ready, egui::Button::new("Go")).clicked() || (submit && ready)
                     {
@@ -1033,18 +1234,30 @@ impl TableizerApp {
         match action {
             BrowseAction::Load(location) => self.load_children(location, ctx),
             BrowseAction::Open(url) => self.open_target(url, ctx),
-            BrowseAction::Refresh => match self.browse_mode {
-                BrowseMode::Remote => {
-                    for job in self.browse_jobs.drain(..) {
-                        job.cancel.cancel(); // abandon in-flight listings of the old tree
+            BrowseAction::Refresh => {
+                // Re-list the folder behind the "go to" suggestions too.
+                if let Some(read_ahead) = self.goto_complete.read_ahead.take() {
+                    read_ahead.cancel();
+                }
+                self.goto_complete = GotoCompletion::default();
+                ctx.request_repaint();
+                match self.browse_mode {
+                    BrowseMode::Remote => {
+                        for job in self.browse_jobs.drain(..) {
+                            job.cancel.cancel(); // abandon in-flight listings of the old tree
+                        }
+                        for job in self.tree_read_aheads.drain(..) {
+                            job.cancel.cancel();
+                        }
+                        self.listings.clear(); // everything is listed afresh
+                        self.browse_root = ChildState::Loading;
+                        self.load_children(String::new(), ctx);
                     }
-                    self.browse_root = ChildState::Loading;
-                    self.load_children(String::new(), ctx);
+                    BrowseMode::Local => {
+                        self.local_root = ChildState::Loaded(local_places());
+                    }
                 }
-                BrowseMode::Local => {
-                    self.local_root = ChildState::Loaded(local_places());
-                }
-            },
+            }
             BrowseAction::Goto(target) => self.goto_browse(target, ctx),
             BrowseAction::ToggleMode => {
                 self.browse_mode = match self.browse_mode {
@@ -1056,6 +1269,168 @@ impl TableizerApp {
             BrowseAction::None => {}
         }
     }
+}
+
+/// The path separators of the "go to" field: the platform's for local paths, `/` for URLs.
+fn goto_separator(mode: BrowseMode) -> fn(char) -> bool {
+    match mode {
+        BrowseMode::Local => std::path::is_separator,
+        BrowseMode::Remote => |c| c == '/',
+    }
+}
+
+/// The folder names in a remote listing (its files dropped), for the "go to" suggestions.
+fn folder_names(listing: tableizer_core::remote::DirListing) -> Vec<String> {
+    listing
+        .entries
+        .into_iter()
+        .filter(|entry| entry.is_dir)
+        .map(|entry| entry.name)
+        .collect()
+}
+
+/// The "go to" field with its folder-suggestion popup (see [`GotoCompletion`]). ↑/↓ highlight a
+/// suggestion; Tab or a click completes to the highlighted one (else the first) and keeps the field
+/// focused, so the next level's suggestions follow; Enter completes a highlighted suggestion, and
+/// otherwise submits; Escape hides the popup. Returns `true` on submit.
+fn goto_field(
+    ui: &mut egui::Ui,
+    text: &mut String,
+    completion: &mut GotoCompletion,
+    mode: BrowseMode,
+    hint: &str,
+    width: f32,
+) -> bool {
+    let id = goto_field_id();
+    let (parent, partial) = complete::split(text, goto_separator(mode)).unwrap_or_default();
+    let parent = parent.to_owned();
+    // The listing tracks the text as it stood at the start of this frame, as do these suggestions.
+    let suggestions: Vec<String> = match &completion.dirs {
+        Some(dirs) if completion.parent.as_deref() == Some(parent.as_str()) => {
+            complete::matches(dirs, partial)
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        }
+        _ => Vec::new(),
+    };
+    completion.highlighted = completion.highlighted.filter(|&i| i < suggestions.len());
+    let focused = ui.memory(|mem| mem.has_focus(id));
+    // Clicking a suggestion takes focus from the field before the click registers, so the popup stays
+    // up while a click on it is in progress.
+    let clicking =
+        completion.open && ui.input(|i| i.pointer.any_down() || i.pointer.any_released());
+    let open = !suggestions.is_empty() && !completion.dismissed && (focused || clicking);
+
+    // The popup's keys, taken before the field sees them.
+    let mut accepted = None;
+    let mut moved = false;
+    if open && focused {
+        ui.input_mut(|i| {
+            let len = suggestions.len();
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                completion.highlighted =
+                    complete::move_highlight(completion.highlighted, len, true);
+                moved = true;
+            }
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                completion.highlighted =
+                    complete::move_highlight(completion.highlighted, len, false);
+                moved = true;
+            }
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::Tab) {
+                accepted = Some(completion.highlighted.unwrap_or(0));
+            }
+            if completion.highlighted.is_some()
+                && i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+            {
+                accepted = completion.highlighted;
+            }
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
+                completion.dismissed = true;
+            }
+        });
+    }
+    if let Some(i) = accepted {
+        complete_to(ui.ctx(), id, text, completion, &parent, &suggestions[i]);
+    }
+
+    let response = ui.add(
+        egui::TextEdit::singleline(text)
+            .id(id)
+            .hint_text(hint)
+            .desired_width(width)
+            // While the popup is up, Tab and Escape act on it instead of moving or dropping focus.
+            .event_filter(egui::EventFilter {
+                horizontal_arrows: true,
+                vertical_arrows: true,
+                tab: open,
+                escape: open,
+            }),
+    );
+    if response.changed() {
+        completion.highlighted = None;
+        completion.dismissed = false;
+        // Re-evaluate the suggestions (and the keys the field captures) before the next key arrives.
+        ui.ctx().request_repaint();
+    }
+    let submit = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+    completion.open = open;
+    let mut clicked = None;
+    egui::Popup::from_response(&response)
+        .open(open)
+        .width(response.rect.width())
+        .show(|ui| {
+            egui::ScrollArea::vertical()
+                .max_height(240.0)
+                .show(ui, |ui| {
+                    ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+                        for (i, name) in suggestions.iter().enumerate() {
+                            let highlighted = completion.highlighted == Some(i);
+                            let item = ui.selectable_label(highlighted, name);
+                            if highlighted && moved {
+                                item.scroll_to_me(None);
+                            }
+                            if item.clicked() {
+                                clicked = Some(i);
+                            }
+                        }
+                    });
+                });
+        });
+    if let Some(i) = clicked {
+        complete_to(ui.ctx(), id, text, completion, &parent, &suggestions[i]);
+        response.request_focus();
+    }
+    submit
+}
+
+/// The "go to" field's widget id — fixed, as there is only ever one.
+fn goto_field_id() -> egui::Id {
+    egui::Id::new("browse_goto")
+}
+
+/// Complete the "go to" field to folder `name` in `parent`, cursor at the end, ready to type on.
+fn complete_to(
+    ctx: &egui::Context,
+    id: egui::Id,
+    text: &mut String,
+    completion: &mut GotoCompletion,
+    parent: &str,
+    name: &str,
+) {
+    *text = complete::accept(parent, name);
+    completion.highlighted = None;
+    completion.dismissed = false;
+    if let Some(mut state) = egui::TextEdit::load_state(ctx, id) {
+        let end = egui::text::CCursor::new(text.chars().count());
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::one(end)));
+        egui::TextEdit::store_state(ctx, id, state);
+    }
+    ctx.request_repaint(); // list the new folder straight away
 }
 
 /// Build tree nodes (each initially unexpanded/unloaded) from a directory listing.
@@ -1072,6 +1447,29 @@ fn nodes_from(listing: tableizer_core::remote::DirListing) -> Vec<BrowseNode> {
             children: ChildState::Unloaded,
         })
         .collect()
+}
+
+/// Fill every remote tree folder still waiting on its listing (`Loading`) whose complete listing has
+/// reached the shared cache — read ahead earlier, or just landed from its own read-ahead.
+fn install_cached(state: &mut ChildState, listings: &ListingCache) {
+    let ChildState::Loaded(nodes) = state else {
+        return;
+    };
+    for node in nodes.iter_mut() {
+        if matches!(node.children, ChildState::Loading)
+            && let Some(cached) = listings.get(&node.url).filter(|c| c.complete)
+        {
+            node.children = ChildState::Loaded(nodes_from(cached.listing));
+        }
+        install_cached(&mut node.children, listings);
+    }
+}
+
+/// The "go to" suggestions for remote folder `parent` from the shared cache: its subfolder names,
+/// and whether that listing is complete (a read-ahead may have read only its first page).
+fn cached_dirs(listings: &ListingCache, parent: &str) -> Option<(Vec<String>, bool)> {
+    let cached = listings.get(parent)?;
+    Some((folder_names(cached.listing), cached.complete))
 }
 
 /// Find the folder node with URL `url` anywhere in the tree, to install a finished listing onto it.
@@ -1153,10 +1551,7 @@ fn show_browse_node(
             if disclosure(ui, node.expanded).clicked() {
                 toggle = true;
             }
-            if ui
-                .selectable_label(false, format!("{}/", node.name))
-                .clicked()
-            {
+            if ui.selectable_label(false, node.name.as_str()).clicked() {
                 toggle = true;
             }
         });
@@ -1693,3 +2088,207 @@ pub(crate) const SETTINGS_SHORTCUT: egui::KeyboardShortcut =
 /// Close the current file (⌘W / Ctrl+W).
 pub(crate) const CLOSE_SHORTCUT: egui::KeyboardShortcut =
     egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::W);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::Key;
+    use tableizer_core::remote::{DirEntry, DirListing};
+
+    /// Drives [`goto_field`] headlessly through real egui frames and input events.
+    struct GotoHarness {
+        ctx: egui::Context,
+        text: String,
+        completion: GotoCompletion,
+        submitted: bool,
+    }
+
+    impl GotoHarness {
+        /// The field focused and showing `text`, with `parent`'s subfolders `dirs` already listed.
+        fn new(text: &str, parent: &str, dirs: &[&str]) -> Self {
+            let mut harness = Self {
+                ctx: egui::Context::default(),
+                text: text.to_string(),
+                completion: GotoCompletion {
+                    parent: Some(parent.to_string()),
+                    dirs: Some(dirs.iter().map(|d| d.to_string()).collect()),
+                    ..GotoCompletion::default()
+                },
+                submitted: false,
+            };
+            harness
+                .ctx
+                .memory_mut(|mem| mem.request_focus(goto_field_id()));
+            harness.frame(Vec::new()); // focus lands
+            harness.frame(Vec::new()); // the popup's keys are captured from here on
+            harness
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) {
+            let input = egui::RawInput {
+                events,
+                ..egui::RawInput::default()
+            };
+            let Self {
+                ctx,
+                text,
+                completion,
+                submitted,
+            } = self;
+            let mut output = ctx.run_ui(input, |ui| {
+                *submitted |= goto_field(ui, text, completion, BrowseMode::Local, "", 300.0);
+            });
+            output.textures_delta.clear(); // no renderer to upload the font atlas to
+        }
+
+        fn press(&mut self, key: Key) {
+            self.frame(vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+        }
+
+        fn type_text(&mut self, text: &str) {
+            self.frame(vec![egui::Event::Text(text.to_string())]);
+        }
+
+        fn focused(&self) -> bool {
+            self.ctx.memory(|mem| mem.has_focus(goto_field_id()))
+        }
+    }
+
+    fn folder(url: &str, children: ChildState) -> BrowseNode {
+        BrowseNode {
+            url: url.to_string(),
+            name: browse_label(url),
+            is_dir: true,
+            size: None,
+            expanded: true,
+            children,
+        }
+    }
+
+    fn cached(entries: &[(&str, bool)], complete: bool) -> CachedListing {
+        CachedListing {
+            listing: DirListing {
+                entries: entries
+                    .iter()
+                    .map(|&(url, is_dir)| DirEntry {
+                        url: url.to_string(),
+                        name: browse_label(url),
+                        is_dir,
+                        size: (!is_dir).then_some(1),
+                    })
+                    .collect(),
+            },
+            complete,
+        }
+    }
+
+    #[test]
+    fn install_cached_fills_waiting_folders_with_complete_listings() {
+        let listings = ListingCache::default();
+        listings.insert("s3://b/a/", cached(&[("s3://b/a/x.csv", false)], true));
+        listings.insert("s3://b/p/", cached(&[("s3://b/p/y.csv", false)], false));
+        listings.insert("s3://b/c/d/", cached(&[("s3://b/c/d/z/", true)], true));
+        let mut root = ChildState::Loaded(vec![
+            folder("s3://b/a/", ChildState::Loading),
+            folder("s3://b/p/", ChildState::Loading),
+            folder(
+                "s3://b/c/",
+                ChildState::Loaded(vec![folder("s3://b/c/d/", ChildState::Loading)]),
+            ),
+        ]);
+        install_cached(&mut root, &listings);
+        let ChildState::Loaded(nodes) = &root else {
+            panic!("root stays loaded")
+        };
+        assert!(
+            matches!(&nodes[0].children, ChildState::Loaded(n) if n[0].name == "x.csv"),
+            "a complete cached listing is installed"
+        );
+        assert!(
+            matches!(nodes[1].children, ChildState::Loading),
+            "a partial listing is not: the folder would look incomplete"
+        );
+        let ChildState::Loaded(c) = &nodes[2].children else {
+            panic!("c stays loaded")
+        };
+        assert!(
+            matches!(&c[0].children, ChildState::Loaded(n) if n[0].name == "z"),
+            "nested folders are filled too"
+        );
+    }
+
+    #[test]
+    fn cached_dirs_lists_only_folders_and_says_whether_complete() {
+        let listings = ListingCache::default();
+        listings.insert(
+            "s3://b/",
+            cached(&[("s3://b/data/", true), ("s3://b/x.csv", false)], false),
+        );
+        assert_eq!(
+            cached_dirs(&listings, "s3://b/"),
+            Some((vec!["data".to_string()], false))
+        );
+        assert_eq!(cached_dirs(&listings, "s3://b/data/"), None);
+    }
+
+    #[test]
+    fn goto_tab_completes_the_first_matching_folder() {
+        let mut h = GotoHarness::new("/Us", "/", &["Library", "Users", "usr"]);
+        assert!(h.completion.open);
+        h.press(Key::Tab);
+        assert_eq!(h.text, "/Users/");
+    }
+
+    #[test]
+    fn goto_tab_keeps_focus_with_the_cursor_at_the_end() {
+        let mut h = GotoHarness::new("/Us", "/", &["Users"]);
+        h.press(Key::Tab);
+        assert!(h.focused());
+        h.type_text("j");
+        assert_eq!(h.text, "/Users/j");
+    }
+
+    #[test]
+    fn goto_arrows_and_enter_complete_the_highlighted_folder() {
+        let mut h = GotoHarness::new("/", "/", &["Library", "Users"]);
+        h.press(Key::ArrowDown);
+        h.press(Key::ArrowDown);
+        h.press(Key::Enter);
+        assert_eq!(h.text, "/Users/");
+        assert!(!h.submitted);
+        assert!(h.focused());
+    }
+
+    #[test]
+    fn goto_enter_without_a_highlight_submits() {
+        let mut h = GotoHarness::new("/Users/", "/Users/", &["john"]);
+        h.press(Key::Enter);
+        assert!(h.submitted);
+        assert_eq!(h.text, "/Users/");
+    }
+
+    #[test]
+    fn goto_escape_hides_the_suggestions_until_the_text_changes() {
+        let mut h = GotoHarness::new("/U", "/", &["Users"]);
+        h.press(Key::Escape);
+        h.frame(Vec::new());
+        assert!(!h.completion.open);
+        assert!(h.focused());
+        h.type_text("s");
+        h.frame(Vec::new());
+        assert!(h.completion.open);
+    }
+
+    #[test]
+    fn goto_shows_no_suggestions_from_another_folders_listing() {
+        // The listing is still for `/` while the text has moved on to `/Users/`.
+        let h = GotoHarness::new("/Users/", "/", &["Users"]);
+        assert!(!h.completion.open);
+    }
+}
