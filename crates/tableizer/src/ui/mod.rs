@@ -136,32 +136,129 @@ pub(crate) fn status_bar(ui: &mut egui::Ui, loaded: &LoadedTable, palette: &them
     });
 }
 
+/// The rows of a start-screen list (the browse tree, the recents), styled like the data grid's: for
+/// items the whole row, full width, taking the click and the `hover` highlight, and — given a `stripe`
+/// color (the tree; not the recents) — alternating backgrounds, rows counted in display order across
+/// every level.
+pub(crate) struct ListRows {
+    stripe: Option<egui::Color32>,
+    hover: egui::Color32,
+    /// The next row's position in display order.
+    row: usize,
+}
+
+impl ListRows {
+    pub(crate) fn new(stripe: Option<egui::Color32>, hover: egui::Color32) -> Self {
+        Self {
+            stripe,
+            hover,
+            row: 0,
+        }
+    }
+
+    /// Lay out a status row ("Listing…", an error) with `add_contents` (left to right): striped like
+    /// any row, but not interactive.
+    pub(crate) fn status(&mut self, ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
+        // Reserve the background's place before the row's contents are painted; its size is only
+        // known once they're laid out.
+        let background = ui.painter().add(egui::Shape::Noop);
+        let row = ui.horizontal(add_contents).response.rect;
+        if let Some(stripe) = self.stripe_now() {
+            ui.painter().set(
+                background,
+                egui::Shape::rect_filled(band(ui, row), egui::CornerRadius::ZERO, stripe),
+            );
+        }
+        self.row += 1;
+    }
+
+    /// Lay out a file or folder row with `add_contents` (left to right; non-interactive contents —
+    /// the row itself takes the click), returning the whole row's response. Like a table row: the full
+    /// width responds, and hovering it paints `hover` over its stripe, behind its contents.
+    pub(crate) fn item(
+        &mut self,
+        ui: &mut egui::Ui,
+        id: egui::Id,
+        add_contents: impl FnOnce(&mut egui::Ui),
+    ) -> egui::Response {
+        // Backgrounds, least- to most-specific (as in the grid): stripe → hover. Their places are
+        // reserved before the contents are painted; their size is only known once laid out.
+        let stripe = ui.painter().add(egui::Shape::Noop);
+        let hover = ui.painter().add(egui::Shape::Noop);
+        let row = ui.horizontal(add_contents).response.rect;
+        let band = band(ui, row);
+        let response = ui.interact(band, id, egui::Sense::click());
+        let fill = |color| egui::Shape::rect_filled(band, egui::CornerRadius::ZERO, color);
+        if let Some(color) = self.stripe_now() {
+            ui.painter().set(stripe, fill(color));
+        }
+        if response.hovered() {
+            ui.painter().set(hover, fill(self.hover));
+        }
+        self.row += 1;
+        response
+    }
+
+    /// The current row's stripe color, if it is striped: every other row, when striping at all.
+    fn stripe_now(&self) -> Option<egui::Color32> {
+        self.stripe.filter(|_| self.row % 2 == 1)
+    }
+}
+
+/// A list row's background band: the full width, and half the gap above and below, so neighbouring
+/// bands meet evenly.
+fn band(ui: &egui::Ui, row: egui::Rect) -> egui::Rect {
+    let half_gap = ui.spacing().item_spacing.y / 2.0;
+    egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), row.y_range())
+        .expand2(egui::vec2(0.0, half_gap))
+}
+
 /// The start-screen **controls column** (left side of the landing): the recent-files list. Files are
 /// opened from the browser column to its right (see `show_landing`) — there is no OS file picker or
-/// URL dialog. Sets `to_open` when a recent entry is clicked.
-pub(crate) fn empty_view(ui: &mut egui::Ui, recent: &[PathBuf], to_open: &mut Option<PathBuf>) {
+/// URL dialog. Rows highlight on hover like the table's (from `palette`), unstriped. Sets `to_open` when a recent entry is
+/// clicked, and `clear_recent` when the list's
+/// Clear button is (the File menu's Clear Recents does the same).
+pub(crate) fn empty_view(
+    ui: &mut egui::Ui,
+    recent: &[PathBuf],
+    palette: &theme::Palette,
+    to_open: &mut Option<PathBuf>,
+    clear_recent: &mut bool,
+) {
     ui.add_space(10.0);
     ui.label("Browse for a file on the right, or pick a recent.");
     if !recent.is_empty() {
         ui.add_space(20.0);
-        ui.label(egui::RichText::new("RECENT").weak());
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("RECENT").weak());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button("Clear")
+                    .on_hover_text("Clear the recent files list")
+                    .clicked()
+                {
+                    *clear_recent = true;
+                }
+            });
+        });
         ui.add_space(6.0);
-        // Full-width rows, left-aligned, name middle-elided so a long key keeps its start + extension;
-        // the full path/URL shows on hover. Scrolls within the column.
+        // Rows highlighted like the table's (and the browser's): the whole row hovering and taking the
+        // click — but unstriped, as a short list. Names are middle-elided so a long key keeps its start + extension; the full
+        // path/URL shows on hover. Scrolls within the column.
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
-                    for path in recent {
-                        if ui
-                            .selectable_label(false, elide_middle(&recent_name(path), 36))
-                            .on_hover_text(path.display().to_string())
-                            .clicked()
-                        {
-                            *to_open = Some(path.clone());
-                        }
+                let mut rows = ListRows::new(None, palette.row_hover);
+                for path in recent {
+                    let name = elide_middle(&recent_name(path), 36);
+                    let row = rows.item(ui, ui.id().with(path), |ui| {
+                        ui.add_space(4.0);
+                        ui.add(egui::Label::new(name).selectable(false));
+                    });
+                    if row.on_hover_text(path.display().to_string()).clicked() {
+                        *to_open = Some(path.clone());
                     }
-                });
+                }
             });
     }
 }
@@ -221,7 +318,169 @@ pub(crate) fn fmt_count(n: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::elide_middle;
+    use super::*;
+
+    const STRIPE: egui::Color32 = egui::Color32::from_rgb(1, 2, 3);
+    const HOVER: egui::Color32 = egui::Color32::from_rgb(4, 5, 6);
+
+    /// Renders [`empty_view`] headlessly, frame by frame, recording what it asks for.
+    struct RecentsHarness {
+        ctx: egui::Context,
+        recent: Vec<PathBuf>,
+        palette: theme::Palette,
+        to_open: Option<PathBuf>,
+        clear_recent: bool,
+        /// The view's full width.
+        width: f32,
+    }
+
+    impl RecentsHarness {
+        fn new(recent: &[&str]) -> Self {
+            let (_, mut palette) = theme::build(&theme::Settings::default(), false);
+            palette.stripe = STRIPE;
+            palette.row_hover = HOVER;
+            let mut harness = Self {
+                ctx: egui::Context::default(),
+                recent: recent.iter().map(PathBuf::from).collect(),
+                palette,
+                to_open: None,
+                clear_recent: false,
+                width: 0.0,
+            };
+            harness.frame(Vec::new()); // lay out once, so input finds the rows
+            harness
+        }
+
+        /// One frame with `events`: the shapes painted, in paint order.
+        fn frame(&mut self, events: Vec<egui::Event>) -> Vec<egui::Shape> {
+            let input = egui::RawInput {
+                events,
+                ..egui::RawInput::default()
+            };
+            let Self {
+                ctx,
+                recent,
+                palette,
+                to_open,
+                clear_recent,
+                width,
+            } = self;
+            let mut output = ctx.run_ui(input, |ui| {
+                *width = ui.max_rect().width();
+                empty_view(ui, recent, palette, to_open, clear_recent);
+            });
+            output.textures_delta.clear(); // no renderer to upload the font atlas to
+            output.shapes.into_iter().map(|c| c.shape).collect()
+        }
+
+        /// Where `text` is painted, if it is.
+        fn text_rect(&mut self, text: &str) -> Option<egui::Rect> {
+            self.frame(Vec::new()).iter().find_map(|shape| match shape {
+                egui::Shape::Text(t) if t.galley.text() == text => {
+                    Some(t.galley.rect.translate(t.pos.to_vec2()))
+                }
+                _ => None,
+            })
+        }
+
+        /// Move the pointer to `pos`; the next frame's shapes.
+        fn hover(&mut self, pos: egui::Pos2) -> Vec<egui::Shape> {
+            self.frame(vec![egui::Event::PointerMoved(pos)]);
+            self.frame(Vec::new())
+        }
+
+        /// Click at `pos` (pointer moved there, pressed, then released over a few frames).
+        fn click(&mut self, pos: egui::Pos2) {
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            self.frame(vec![egui::Event::PointerMoved(pos)]);
+            self.frame(vec![button(true)]);
+            self.frame(vec![button(false)]);
+        }
+    }
+
+    /// The rects filled with `color` in `shapes`, in paint order.
+    fn filled(shapes: &[egui::Shape], color: egui::Color32) -> Vec<egui::Rect> {
+        shapes
+            .iter()
+            .filter_map(|shape| match shape {
+                egui::Shape::Rect(r) if r.fill == color => Some(r.rect),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn empty_view_clear_button_asks_to_clear_the_recents() {
+        let mut h = RecentsHarness::new(&["/data/a.csv", "/data/b.csv"]);
+        let clear = h.text_rect("Clear").unwrap();
+        h.click(clear.center());
+        assert_eq!((h.to_open, h.clear_recent), (None, true));
+    }
+
+    #[test]
+    fn empty_view_opens_a_clicked_recent() {
+        let mut h = RecentsHarness::new(&["/data/a.csv", "/data/b.csv"]);
+        let name = h.text_rect("b.csv").unwrap();
+        h.click(name.center());
+        assert_eq!(h.to_open, Some(PathBuf::from("/data/b.csv")));
+        assert!(!h.clear_recent);
+    }
+
+    #[test]
+    fn empty_view_opens_a_recent_clicked_anywhere_on_its_row() {
+        let mut h = RecentsHarness::new(&["/data/a.csv", "/data/b.csv"]);
+        let name = h.text_rect("b.csv").unwrap();
+        h.click(egui::pos2(h.width - 10.0, name.center().y));
+        assert_eq!(h.to_open, Some(PathBuf::from("/data/b.csv")));
+    }
+
+    #[test]
+    fn empty_view_hover_highlights_the_whole_row_like_a_table() {
+        let mut h = RecentsHarness::new(&["/data/a.csv", "/data/b.csv"]);
+        let name = h.text_rect("a.csv").unwrap();
+        let shapes = h.hover(name.center());
+        let bands = filled(&shapes, HOVER);
+        assert_eq!(bands.len(), 1, "one hovered row");
+        assert!(bands[0].contains(name.center()));
+        assert!(
+            (bands[0].width() - h.width).abs() < 1.0,
+            "full width: {} of {}",
+            bands[0].width(),
+            h.width
+        );
+        // The table's highlight is the only one under the pointer: no per-label hover box.
+        let others: Vec<_> = shapes
+            .iter()
+            .filter_map(|s| match s {
+                egui::Shape::Rect(r)
+                    if ![STRIPE, HOVER].contains(&r.fill)
+                        && r.fill.a() > 0
+                        && r.rect.contains(name.center()) =>
+                {
+                    Some(r.rect)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(others, [], "no other highlight");
+    }
+
+    #[test]
+    fn empty_view_does_not_stripe_the_recents() {
+        let mut h = RecentsHarness::new(&["/data/a.csv", "/data/b.csv", "/data/c.csv"]);
+        assert_eq!(filled(&h.frame(Vec::new()), STRIPE), []);
+    }
+
+    #[test]
+    fn empty_view_has_no_clear_button_without_recents() {
+        let mut h = RecentsHarness::new(&[]);
+        assert_eq!(h.text_rect("Clear"), None);
+    }
 
     #[test]
     fn elide_middle_keeps_start_and_end() {

@@ -11,8 +11,9 @@
 //! decodes them via the selected encoding for rendering.
 //!
 //! GUI glue with no headless test seam (the engine it drives is unit-tested), except the pure
-//! `reorder` and `decode_field` helpers, which have their own tests, and the start screen's jump-to
-//! field, which `app`'s tests drive through real (headless) egui frames and key events.
+//! `reorder` and `decode_field` helpers, which have their own tests, and parts of the start screen
+//! (the jump-to field, the browse tree's row stripes, the recents list), which tests drive through
+//! real (headless) egui frames, key presses and clicks.
 
 mod app;
 mod complete;

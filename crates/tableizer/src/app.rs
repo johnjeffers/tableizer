@@ -20,8 +20,8 @@ use crate::model::{
 };
 use crate::persist::{cloud, prefs, recent, views};
 use crate::ui::{
-    ExportKind, ExportRequest, columns_tab, empty_view, fmt_bytes, fmt_count, grid, menu_bar,
-    parsing_tab, settings_tab, status_bar, toolbar,
+    ExportKind, ExportRequest, ListRows, columns_tab, empty_view, fmt_bytes, fmt_count, grid,
+    menu_bar, parsing_tab, settings_tab, status_bar, toolbar,
 };
 use crate::{complete, fonts, theme};
 
@@ -1160,9 +1160,10 @@ impl TableizerApp {
     /// right, the inline **browser** — a Local/Remote toggle, a jump-to field + Refresh, and the lazy
     /// tree (cloud buckets/prefixes, or the local filesystem). Opening anything here transitions to the
     /// grid; both trees stay cached.
-    fn show_landing(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn show_landing(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, palette: &theme::Palette) {
         self.update_goto_completion(ctx);
         let mut to_open: Option<PathBuf> = None;
+        let mut clear_recent = false;
         let mut action = BrowseAction::None;
         {
             // Split-borrow: the controls column reads `recent`; the browser column mutates the active
@@ -1187,7 +1188,13 @@ impl TableizerApp {
                 .min_size(240.0)
                 .max_size(480.0)
                 .show(ui, |ui| {
-                    empty_view(ui, recent.as_slice(), &mut to_open);
+                    empty_view(
+                        ui,
+                        recent.as_slice(),
+                        palette,
+                        &mut to_open,
+                        &mut clear_recent,
+                    );
                 });
             egui::CentralPanel::default().show(ui, |ui| {
                 ui.add_space(8.0);
@@ -1223,13 +1230,17 @@ impl TableizerApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 3.0;
-                        show_browse_children(ui, root, 0, mode, &mut action);
+                        let mut rows = ListRows::new(Some(palette.stripe), palette.row_hover);
+                        show_browse_children(ui, root, 0, mode, &mut action, &mut rows);
                     });
             });
         }
 
         if let Some(path) = to_open {
             self.open_target(path.to_string_lossy().into_owned(), ctx);
+        }
+        if clear_recent {
+            recent::clear(&mut self.recent);
         }
         match action {
             BrowseAction::Load(location) => self.load_children(location, ctx),
@@ -1504,31 +1515,32 @@ fn show_browse_children(
     depth: usize,
     mode: BrowseMode,
     action: &mut BrowseAction,
+    rows: &mut ListRows,
 ) {
     let indent = depth as f32 * 16.0 + 18.0;
     match state {
         ChildState::Unloaded => {}
         ChildState::Loading => {
-            ui.horizontal(|ui| {
+            rows.status(ui, |ui| {
                 ui.add_space(indent);
                 ui.weak("Listing…");
             });
         }
         ChildState::Failed(error) => {
-            ui.horizontal(|ui| {
+            rows.status(ui, |ui| {
                 ui.add_space(indent);
                 ui.colored_label(ui.visuals().error_fg_color, error.as_str());
             });
         }
         ChildState::Loaded(nodes) if nodes.is_empty() => {
-            ui.horizontal(|ui| {
+            rows.status(ui, |ui| {
                 ui.add_space(indent);
                 ui.weak("(empty)");
             });
         }
         ChildState::Loaded(nodes) => {
             for node in nodes.iter_mut() {
-                show_browse_node(ui, node, depth, mode, action);
+                show_browse_node(ui, node, depth, mode, action, rows);
             }
         }
     }
@@ -1541,21 +1553,17 @@ fn show_browse_node(
     depth: usize,
     mode: BrowseMode,
     action: &mut BrowseAction,
+    rows: &mut ListRows,
 ) {
     let indent = depth as f32 * 16.0;
     if node.is_dir {
-        let mut toggle = false;
-        ui.horizontal(|ui| {
+        let row = rows.item(ui, ui.id().with(&node.url), |ui| {
             ui.add_space(indent);
             ui.spacing_mut().item_spacing.x = 2.0;
-            if disclosure(ui, node.expanded).clicked() {
-                toggle = true;
-            }
-            if ui.selectable_label(false, node.name.as_str()).clicked() {
-                toggle = true;
-            }
+            disclosure(ui, node.expanded);
+            ui.add(egui::Label::new(node.name.as_str()).selectable(false));
         });
-        if toggle {
+        if row.clicked() {
             node.expanded = !node.expanded;
             // Expanding an unlisted (or previously failed) folder lists it once. Local listing is fast,
             // so it's done inline here (mutating the node directly); a remote listing is dispatched to
@@ -1578,35 +1586,32 @@ fn show_browse_node(
             }
         }
         if node.expanded {
-            show_browse_children(ui, &mut node.children, depth + 1, mode, action);
+            show_browse_children(ui, &mut node.children, depth + 1, mode, action, rows);
         }
     } else {
-        ui.horizontal(|ui| {
+        let row = rows.item(ui, ui.id().with(&node.url), |ui| {
             ui.add_space(indent + 18.0); // align past the disclosure column
-            if ui.selectable_label(false, node.name.as_str()).clicked() {
-                *action = BrowseAction::Open(node.url.clone());
-            }
+            ui.add(egui::Label::new(node.name.as_str()).selectable(false));
             if let Some(size) = node.size {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.weak(fmt_bytes(size));
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(fmt_bytes(size)).weak())
+                            .selectable(false),
+                    );
                 });
             }
         });
+        if row.clicked() {
+            *action = BrowseAction::Open(node.url.clone());
+        }
     }
 }
 
 /// A small disclosure triangle (▶ collapsed / ▼ expanded) drawn as a shape (font-independent, like the
-/// grid's painted arrows). Returns its click response.
-fn disclosure(ui: &mut egui::Ui, open: bool) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    let color = if response.hovered() {
-        ui.visuals().text_color()
-    } else {
-        ui.visuals().weak_text_color()
-    };
+/// grid's painted arrows). Just an indicator: the whole folder row takes the click.
+fn disclosure(ui: &mut egui::Ui, open: bool) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+    let color = ui.visuals().weak_text_color();
     let c = rect.center();
     let points = if open {
         vec![
@@ -1626,7 +1631,6 @@ fn disclosure(ui: &mut egui::Ui, open: bool) -> egui::Response {
         color,
         egui::Stroke::NONE,
     ));
-    response
 }
 
 /// The top-level entries of the **local** browse tree: Home and the filesystem root, each a folder
@@ -1894,7 +1898,7 @@ impl eframe::App for TableizerApp {
             .frame(central_frame)
             .show(ui, |ui| {
                 if matches!(self.view, View::Empty) {
-                    self.show_landing(ui, &ctx);
+                    self.show_landing(ui, &ctx, &palette);
                 } else if let View::Loaded(loaded) = &mut self.view {
                     grid(ui, loaded, &palette);
                 } else if let View::Failed { path, error } = &self.view {
@@ -2235,6 +2239,215 @@ mod tests {
             Some((vec!["data".to_string()], false))
         );
         assert_eq!(cached_dirs(&listings, "s3://b/data/"), None);
+    }
+
+    const STRIPE: egui::Color32 = egui::Color32::from_rgb(1, 2, 3);
+    const HOVER: egui::Color32 = egui::Color32::from_rgb(4, 5, 6);
+
+    /// Renders a browse tree headlessly, frame by frame, as the start screen does.
+    struct TreeHarness {
+        ctx: egui::Context,
+        tree: ChildState,
+        /// The tree's full width.
+        width: f32,
+    }
+
+    impl TreeHarness {
+        fn new(nodes: Vec<BrowseNode>) -> Self {
+            let mut harness = Self {
+                ctx: egui::Context::default(),
+                tree: ChildState::Loaded(nodes),
+                width: 0.0,
+            };
+            harness.frame(Vec::new()); // lay out once, so input finds the rows
+            harness
+        }
+
+        /// One frame with `events`: the shapes painted (in paint order), and what the tree asked for.
+        fn frame(&mut self, events: Vec<egui::Event>) -> (Vec<egui::Shape>, BrowseAction) {
+            let input = egui::RawInput {
+                events,
+                ..egui::RawInput::default()
+            };
+            let mut action = BrowseAction::None;
+            let Self { ctx, tree, width } = self;
+            let mut output = ctx.run_ui(input, |ui| {
+                *width = ui.max_rect().width();
+                let mut rows = ListRows::new(Some(STRIPE), HOVER);
+                show_browse_children(ui, tree, 0, BrowseMode::Local, &mut action, &mut rows);
+            });
+            output.textures_delta.clear(); // no renderer to upload the font atlas to
+            (output.shapes.into_iter().map(|c| c.shape).collect(), action)
+        }
+
+        /// Where `text` is painted.
+        fn text_rect(&mut self, text: &str) -> egui::Rect {
+            let (shapes, _) = self.frame(Vec::new());
+            shapes
+                .iter()
+                .find_map(|shape| match shape {
+                    egui::Shape::Text(t) if t.galley.text() == text => {
+                        Some(t.galley.rect.translate(t.pos.to_vec2()))
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{text:?} is not on screen"))
+        }
+
+        /// Move the pointer to `pos`; the next frame's shapes.
+        fn hover(&mut self, pos: egui::Pos2) -> Vec<egui::Shape> {
+            self.frame(vec![egui::Event::PointerMoved(pos)]);
+            self.frame(Vec::new()).0
+        }
+
+        /// Click at `pos`; what the tree asked for.
+        fn click(&mut self, pos: egui::Pos2) -> BrowseAction {
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            self.frame(vec![egui::Event::PointerMoved(pos)]);
+            self.frame(vec![button(true)]);
+            self.frame(vec![button(false)]).1
+        }
+    }
+
+    /// The rects filled with `color` in `shapes`, in paint order.
+    fn filled(shapes: &[egui::Shape], color: egui::Color32) -> Vec<egui::Rect> {
+        shapes
+            .iter()
+            .filter_map(|shape| match shape {
+                egui::Shape::Rect(r) if r.fill == color => Some(r.rect),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The position in `shapes` of the text `text`.
+    fn text_index(shapes: &[egui::Shape], text: &str) -> usize {
+        shapes
+            .iter()
+            .position(|s| matches!(s, egui::Shape::Text(t) if t.galley.text() == text))
+            .unwrap()
+    }
+
+    fn file(url: &str) -> BrowseNode {
+        BrowseNode {
+            is_dir: false,
+            size: Some(1),
+            ..folder(url, ChildState::Unloaded)
+        }
+    }
+
+    #[test]
+    fn browse_tree_stripes_every_other_row_across_levels() {
+        // Rows in display order: a/ (0), a/1 (1), a/2 (2), b (3), c (4) → stripes on 1 and 3.
+        let mut h = TreeHarness::new(vec![
+            folder(
+                "/a/",
+                ChildState::Loaded(vec![file("/a/1.csv"), file("/a/2.csv")]),
+            ),
+            file("/b.csv"),
+            file("/c.csv"),
+        ]);
+        let bands = filled(&h.frame(Vec::new()).0, STRIPE);
+        assert_eq!(bands.len(), 2);
+        assert!(
+            bands.iter().all(|band| band.width() == h.width),
+            "full width"
+        );
+        // Bands for rows 1 and 3 are separated by row 2, never touching.
+        assert!(bands[0].bottom() < bands[1].top());
+    }
+
+    #[test]
+    fn browse_tree_stripe_sits_behind_the_row_text() {
+        let mut h = TreeHarness::new(vec![file("/a.csv"), file("/b.csv")]);
+        let (shapes, _) = h.frame(Vec::new());
+        let band = shapes
+            .iter()
+            .position(|s| matches!(s, egui::Shape::Rect(r) if r.fill == STRIPE))
+            .unwrap();
+        assert!(
+            band < text_index(&shapes, "b.csv"),
+            "the stripe is painted first, so the text sits on top"
+        );
+    }
+
+    #[test]
+    fn browse_tree_stripes_status_rows_too() {
+        // a/ (0), its "Listing…" row (1).
+        let mut h = TreeHarness::new(vec![folder("/a/", ChildState::Loading)]);
+        assert_eq!(filled(&h.frame(Vec::new()).0, STRIPE).len(), 1);
+    }
+
+    #[test]
+    fn browse_tree_hover_highlights_the_whole_row_like_a_table() {
+        let mut h = TreeHarness::new(vec![file("/a.csv"), file("/b.csv"), file("/c.csv")]);
+        let row = h.text_rect("a.csv");
+        let shapes = h.hover(row.center());
+        let bands = filled(&shapes, HOVER);
+        assert_eq!(bands.len(), 1, "one hovered row");
+        assert_eq!(bands[0].width(), h.width, "full width");
+        assert!(bands[0].contains(row.center()));
+        let band = shapes
+            .iter()
+            .position(|s| matches!(s, egui::Shape::Rect(r) if r.fill == HOVER))
+            .unwrap();
+        assert!(band < text_index(&shapes, "a.csv"), "behind the text");
+        // The table's highlight is the only one: no per-label hover box besides it.
+        let others: Vec<_> = shapes
+            .iter()
+            .filter_map(|s| match s {
+                egui::Shape::Rect(r) if ![STRIPE, HOVER].contains(&r.fill) => Some(r.rect),
+                _ => None,
+            })
+            .filter(|r| r.is_positive())
+            .collect();
+        assert_eq!(others, [], "no other highlight");
+    }
+
+    #[test]
+    fn browse_tree_highlights_nothing_without_hover() {
+        let mut h = TreeHarness::new(vec![file("/a.csv"), file("/b.csv")]);
+        assert_eq!(filled(&h.frame(Vec::new()).0, HOVER), []);
+    }
+
+    #[test]
+    fn browse_tree_status_rows_do_not_highlight() {
+        let mut h = TreeHarness::new(vec![folder("/a/", ChildState::Loading)]);
+        let status = h.text_rect("Listing…");
+        assert_eq!(filled(&h.hover(status.center()), HOVER), []);
+    }
+
+    #[test]
+    fn browse_tree_click_anywhere_on_a_file_row_opens_it() {
+        let mut h = TreeHarness::new(vec![file("/a.csv"), file("/b.csv")]);
+        let name = h.text_rect("b.csv");
+        // Well right of the name, in the row's empty middle.
+        let action = h.click(egui::pos2(h.width / 2.0, name.center().y));
+        assert!(
+            matches!(&action, BrowseAction::Open(url) if url == "/b.csv"),
+            "the row opens its file"
+        );
+        // ...and so does clicking the name itself.
+        let action = h.click(name.center());
+        assert!(matches!(&action, BrowseAction::Open(url) if url == "/b.csv"));
+    }
+
+    #[test]
+    fn browse_tree_click_anywhere_on_a_folder_row_toggles_it() {
+        let mut collapsed = folder("/a/", ChildState::Loaded(Vec::new()));
+        collapsed.expanded = false;
+        let mut h = TreeHarness::new(vec![collapsed]);
+        let name = h.text_rect("a");
+        h.click(egui::pos2(h.width / 2.0, name.center().y));
+        let ChildState::Loaded(nodes) = &h.tree else {
+            unreachable!()
+        };
+        assert!(nodes[0].expanded);
     }
 
     #[test]
