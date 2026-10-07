@@ -144,7 +144,8 @@ mode keeps its own cached tree. The browser is a lazy **tree** (`BrowseNode` / `
   to what's being typed in the jump-to field go first. One store serves a whole read-ahead (one
   connection pool, one credential resolution), and none is resolved when everything within reach is
   already cached. The jump-to field's folder completion reads the same cache.
-- **Local:** roots at Home + the filesystem root; each folder is listed inline with `std::fs::read_dir`
+- **Local:** roots at Home, Desktop, Downloads and Documents (where the platform has them) and the
+  filesystem root; each folder is listed inline with `std::fs::read_dir`
   (fast, synchronous — no background job, which also sidesteps node identity issues when a directory is
   reachable two ways).
 

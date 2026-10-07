@@ -36,8 +36,9 @@
     is bucket-scoped and can't enumerate); expand a bucket/folder to list it on a background thread —
     by **reading ahead** from it (`remote::read_ahead`: the folder in full, then 2 levels below it,
     one page each, ≤100 requests, 8 concurrent, into a shared `ListingCache`; see architecture.md
-    § I/O), so expanding a read-ahead folder is instant. **Local:** roots at Home + filesystem
-    root, listed inline via `std::fs::read_dir` (hidden dot-files skipped). Click a file to open.
+    § I/O), so expanding a read-ahead folder is instant. **Local:** roots at Home, Desktop,
+    Downloads, Documents + filesystem root, listed inline via `std::fs::read_dir` (hidden dot-files
+    skipped). Click a file to open.
     **Expanded subtrees are cached** (`ChildState` in the `BrowseNode` tree) and persist across visits,
     so revisiting never re-lists; Refresh re-lists the root, and a "go to" field adds a bucket/prefix
     (remote) or path (local) as a top-level node. The field **autocompletes folders** as you type

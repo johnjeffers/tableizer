@@ -78,7 +78,8 @@ pub(crate) struct TableizerApp {
     browse_mode: BrowseMode,
     /// The **remote** browse tree's root (the buckets). Cached so revisiting never re-lists.
     browse_root: ChildState,
-    /// The **local** browse tree's root (Home + filesystem root). Cached, like the remote tree.
+    /// The **local** browse tree's root (Home, Desktop, Downloads, Documents + filesystem root).
+    /// Cached, like the remote tree.
     local_root: ChildState,
     /// In-flight remote listings (one per expanding folder, plus the root), keyed by location.
     browse_jobs: Vec<BrowseJob>,
@@ -229,7 +230,7 @@ struct ReadAheadJob {
 /// Which filesystem the start-screen browser is showing.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum BrowseMode {
-    /// The local filesystem (Home + the filesystem root), via `std::fs`. The default — it needs no
+    /// The local filesystem (Home and the usual user folders + the filesystem root), via `std::fs`. The default — it needs no
     /// credentials and is instant.
     #[default]
     Local,
@@ -1633,28 +1634,47 @@ fn disclosure(ui: &mut egui::Ui, open: bool) {
     ));
 }
 
-/// The top-level entries of the **local** browse tree: Home and the filesystem root, each a folder
-/// node whose `url` is the local path. The user expands down from these (or jumps via "go to").
+/// The top-level entries of the **local** browse tree: Home, the Desktop, Downloads and Documents
+/// folders (wherever the platform keeps them, when they exist), and the filesystem root. The user
+/// expands down from these (or jumps via "go to").
 fn local_places() -> Vec<BrowseNode> {
-    let dir_node = |name: &str, path: &Path| BrowseNode {
+    let dirs = directories::UserDirs::new();
+    let dirs = dirs.as_ref();
+    // The filesystem root (Unix `/`; on Windows this is the root of the home drive — multi-drive
+    // listing is a future refinement).
+    let root = dirs
+        .and_then(|d| d.home_dir().ancestors().last().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("/"));
+    let named = [
+        ("Home", dirs.map(|d| d.home_dir())),
+        ("Desktop", dirs.and_then(|d| d.desktop_dir())),
+        ("Downloads", dirs.and_then(|d| d.download_dir())),
+        ("Documents", dirs.and_then(|d| d.document_dir())),
+    ];
+    places(&named, &root)
+}
+
+/// The local tree's top-level folders: the `named` ones in order — skipping any the platform doesn't
+/// have, or that don't exist — then the filesystem `root`, named by its path. Each is a folder node
+/// whose `url` is its local path.
+fn places(named: &[(&str, Option<&Path>)], root: &Path) -> Vec<BrowseNode> {
+    named
+        .iter()
+        .filter_map(|&(name, path)| path.filter(|p| p.is_dir()).map(|p| place(name, p)))
+        .chain([place(&root.to_string_lossy(), root)])
+        .collect()
+}
+
+/// A top-level folder node of the local tree.
+fn place(name: &str, path: &Path) -> BrowseNode {
+    BrowseNode {
         url: path.to_string_lossy().into_owned(),
         name: name.to_string(),
         is_dir: true,
         size: None,
         expanded: false,
         children: ChildState::Unloaded,
-    };
-    let mut places = Vec::new();
-    if let Some(dirs) = directories::UserDirs::new() {
-        places.push(dir_node("Home", dirs.home_dir()));
     }
-    // The filesystem root (Unix `/`; on Windows this is the root of the home drive — multi-drive
-    // listing is a future refinement).
-    let root = directories::UserDirs::new()
-        .and_then(|d| d.home_dir().ancestors().last().map(Path::to_path_buf))
-        .unwrap_or_else(|| PathBuf::from("/"));
-    places.push(dir_node(&root.to_string_lossy(), &root));
-    places
 }
 
 /// List a **local** directory into tree nodes (folders first, then files, each by name). Hidden
@@ -2339,6 +2359,38 @@ mod tests {
             size: Some(1),
             ..folder(url, ChildState::Unloaded)
         }
+    }
+
+    #[test]
+    fn places_lists_the_named_folders_that_exist_then_the_root() {
+        let home = tempfile::tempdir().unwrap();
+        for dir in ["Desktop", "Downloads"] {
+            std::fs::create_dir(home.path().join(dir)).unwrap();
+        }
+        let desktop = home.path().join("Desktop");
+        let downloads = home.path().join("Downloads");
+        let missing = home.path().join("Documents"); // not created
+        let named = [
+            ("Home", Some(home.path())),
+            ("Desktop", Some(desktop.as_path())),
+            ("Downloads", Some(downloads.as_path())),
+            ("Documents", Some(missing.as_path())),
+            ("Music", None), // a folder the platform doesn't have
+        ];
+        let listed: Vec<(String, String)> = places(&named, Path::new("/"))
+            .into_iter()
+            .map(|node| (node.name, node.url))
+            .collect();
+        let path = |p: &Path| p.to_string_lossy().into_owned();
+        assert_eq!(
+            listed,
+            [
+                ("Home".to_string(), path(home.path())),
+                ("Desktop".to_string(), path(&desktop)),
+                ("Downloads".to_string(), path(&downloads)),
+                ("/".to_string(), "/".to_string()),
+            ]
+        );
     }
 
     #[test]
