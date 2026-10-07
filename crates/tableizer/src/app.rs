@@ -47,6 +47,8 @@ pub(crate) struct TableizerApp {
     theme: theme::Settings,
     /// `(settings, system_dark)` last pushed to egui — restyle only when this changes.
     applied_theme: Option<(theme::Settings, bool)>,
+    /// The window title last set — sent to the window only when it changes.
+    applied_title: Option<String>,
     /// System font database (for the chrome font + the table-font picker).
     fonts_db: std::sync::Arc<fontdb::Database>,
     /// Installed font families + a monospaced flag (cached for the picker).
@@ -295,6 +297,7 @@ impl TableizerApp {
             recent: recent::load(),
             theme: prefs::load(),
             applied_theme: None,
+            applied_title: None,
             fonts_db,
             font_families,
             font_rx: Some(font_rx),
@@ -1634,6 +1637,17 @@ fn disclosure(ui: &mut egui::Ui, open: bool) {
     ));
 }
 
+/// The window's title: the open file's name — the last segment of its `origin` (local path or URL),
+/// never the full path — else the app's name.
+fn window_title(origin: Option<&str>) -> String {
+    origin
+        .and_then(|origin| Path::new(origin).file_name())
+        .map_or_else(
+            || "Tableizer".to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        )
+}
+
 /// The top-level entries of the **local** browse tree: Home, the Desktop, Downloads and Documents
 /// folders (wherever the platform keeps them, when they exist), and the filesystem root. The user
 /// expands down from these (or jumps via "go to").
@@ -1750,6 +1764,17 @@ impl eframe::App for TableizerApp {
             }
         }
         self.poll_browse(&ctx);
+
+        // Title the window after the open file (its name only), else the app.
+        let origin = match &self.view {
+            View::Loaded(loaded) => Some(loaded.origin.as_str()),
+            _ => None,
+        };
+        let title = window_title(origin);
+        if self.applied_title.as_ref() != Some(&title) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.applied_title = Some(title);
+        }
 
         // Resolve the theme (following the OS for `Auto`) and restyle only when it changes.
         let system_dark = ctx.system_theme().is_none_or(|t| t == egui::Theme::Dark);
@@ -2359,6 +2384,17 @@ mod tests {
             size: Some(1),
             ..folder(url, ChildState::Unloaded)
         }
+    }
+
+    #[test]
+    fn window_title_is_the_open_files_name_only() {
+        assert_eq!(window_title(Some("/data/2026/sales.csv")), "sales.csv");
+        assert_eq!(window_title(Some("s3://bucket/logs/x.log.gz")), "x.log.gz");
+    }
+
+    #[test]
+    fn window_title_without_a_file_is_the_apps_name() {
+        assert_eq!(window_title(None), "Tableizer");
     }
 
     #[test]
