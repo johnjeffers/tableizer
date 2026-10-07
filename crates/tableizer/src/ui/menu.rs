@@ -138,13 +138,20 @@ enum CornerAction {
     ToggleSearch,
 }
 
-/// Show or hide the search bar. Hiding it also clears the search `query`, so no rows stay filtered
-/// out — or highlighted — by a search that's no longer on screen (the match options are kept).
+/// Show or hide the search bar (hiding it as [`hide_search`] does).
 pub(crate) fn toggle_search(open: &mut bool, query: &mut String) {
-    *open = !*open;
-    if !*open {
-        query.clear();
+    if *open {
+        hide_search(open, query);
+    } else {
+        *open = true;
     }
+}
+
+/// Hide the search bar. This also clears the search `query`, so no rows stay filtered out — or
+/// highlighted — by a search that's no longer on screen (the match options are kept).
+pub(crate) fn hide_search(open: &mut bool, query: &mut String) {
+    *open = false;
+    query.clear();
 }
 
 /// The menu bar's right end for an open file, laid out right to left in `ui`: a close button in the
@@ -497,6 +504,14 @@ mod tests {
         let (mut open, mut query) = (false, String::new());
         toggle_search(&mut open, &mut query);
         assert!(open);
+    }
+
+    #[test]
+    fn hide_search_hides_the_bar_and_clears_the_query() {
+        let (mut open, mut query) = (true, "error".to_string());
+        hide_search(&mut open, &mut query);
+        assert!(!open);
+        assert_eq!(query, "");
     }
 
     #[test]

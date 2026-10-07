@@ -19,9 +19,10 @@ use crate::model::{
     sniff_file,
 };
 use crate::persist::{cloud, prefs, recent, views};
+use crate::ui::hide_search;
 use crate::ui::{
-    ExportKind, ExportRequest, ListRows, columns_tab, empty_view, fmt_bytes, fmt_count, grid,
-    menu_bar, parsing_tab, settings_tab, status_bar, toolbar,
+    ExportKind, ExportRequest, ListRows, close_button, columns_tab, empty_view, fmt_bytes,
+    fmt_count, grid, menu_bar, parsing_tab, settings_tab, status_bar, toolbar,
 };
 use crate::{complete, fonts, theme};
 
@@ -65,6 +66,8 @@ pub(crate) struct TableizerApp {
     pub(crate) panel_open: bool,
     /// Whether the search bar is shown (see [`search_bar_open`]). Hidden by default.
     pub(crate) search_open: bool,
+    /// Whether a widget held keyboard focus as the last frame ended (see `close_panel_on_escape`).
+    keyboard_focus_held: bool,
     /// Which tab the right-side panel shows.
     pub(crate) panel_tab: PanelTab,
     /// The in-flight (or just-finished) export, if any — driven on a background thread.
@@ -308,6 +311,7 @@ impl TableizerApp {
             font_mono_only: false,
             panel_open: false,
             search_open: false,
+            keyboard_focus_held: false,
             panel_tab: PanelTab::default(),
             export_job: None,
             download_job: None,
@@ -439,6 +443,30 @@ impl TableizerApp {
         }
     }
 
+    /// Esc closes the right-side panel when nothing else held keyboard focus (e.g. not mid-edit in a
+    /// field — Esc there is the field's, like the Find field's closing the search bar). Runs at the
+    /// start of the frame, before any widget sees the key.
+    ///
+    /// Asks whether focus was held at the *end of last frame* ([`note_keyboard_focus`]): by now egui
+    /// has already dropped a field's focus in answer to this very Esc, so asking it now would always
+    /// say nothing is focused.
+    ///
+    /// [`note_keyboard_focus`]: Self::note_keyboard_focus
+    fn close_panel_on_escape(&mut self, ctx: &egui::Context) {
+        if self.panel_open
+            && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+            && !self.keyboard_focus_held
+        {
+            self.panel_open = false;
+        }
+    }
+
+    /// Remember whether a widget holds keyboard focus as the frame ends, for the next frame's Esc
+    /// handling ([`close_panel_on_escape`](Self::close_panel_on_escape)).
+    fn note_keyboard_focus(&mut self, ctx: &egui::Context) {
+        self.keyboard_focus_held = ctx.memory(|m| m.focused().is_some());
+    }
+
     /// The right-side panel, sliding in or out with `panel_open`.
     fn show_side_panel(&mut self, ui: &mut egui::Ui) {
         self.fix_panel_tab();
@@ -473,7 +501,7 @@ impl TableizerApp {
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if close_button(ui).clicked() {
+                if close_button(ui, "Close panel").clicked() {
                     self.panel_open = false;
                 }
             });
@@ -1861,13 +1889,7 @@ impl eframe::App for TableizerApp {
                 self.panel_tab = PanelTab::Settings;
             }
         }
-        // Esc closes the panel when nothing else holds keyboard focus (e.g. not mid-edit in a field).
-        if self.panel_open
-            && ctx.input(|i| i.key_pressed(egui::Key::Escape))
-            && ctx.memory(|m| m.focused().is_none())
-        {
-            self.panel_open = false;
-        }
+        self.close_panel_on_escape(&ctx);
 
         egui::Panel::top("menu_bar").show(ui, |ui| {
             // `wide_menu` gives the bar buttons *and* every dropdown popup roomier horizontal item
@@ -1888,8 +1910,10 @@ impl eframe::App for TableizerApp {
         }
         if self.search_open && matches!(self.view, View::Loaded(_)) {
             egui::Panel::top("toolbar").show(ui, |ui| {
-                if let View::Loaded(loaded) = &mut self.view {
-                    toolbar(ui, loaded, focus_find);
+                if let View::Loaded(loaded) = &mut self.view
+                    && toolbar(ui, &mut loaded.view, focus_find)
+                {
+                    hide_search(&mut self.search_open, &mut loaded.view.search);
                 }
             });
         }
@@ -2004,34 +2028,13 @@ impl eframe::App for TableizerApp {
         if let Some((scope, kind)) = to_export {
             self.start_export(scope, kind, &ctx);
         }
+        self.note_keyboard_focus(&ctx);
     }
 
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
         // Window edges match the panel background (set via the theme `Style`).
         visuals.panel_fill.to_normalized_gamma_f32()
     }
-}
-
-/// A small ✕ close button drawn as two strokes (shapes, not a glyph — font-independent, per the `ui`
-/// module's hand-painted-text invariant). Returns its click response.
-fn close_button(ui: &mut egui::Ui) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    let color = if response.hovered() {
-        ui.visuals().text_color()
-    } else {
-        ui.visuals().weak_text_color()
-    };
-    let c = rect.center();
-    let r = 4.0;
-    let stroke = egui::Stroke::new(1.5, color);
-    ui.painter()
-        .line_segment([c + egui::vec2(-r, -r), c + egui::vec2(r, r)], stroke);
-    ui.painter()
-        .line_segment([c + egui::vec2(-r, r), c + egui::vec2(r, -r)], stroke);
-    response.on_hover_text("Close panel")
 }
 
 /// Create the export file and run the chosen writer (off the UI thread), reporting `progress` and
@@ -2511,6 +2514,58 @@ mod tests {
         h.click(edge);
         h.click(edge); // a double-click on the strip reopens the panel
         assert!(h.app.panel_open);
+    }
+
+    /// Press Esc with the side panel open — with a text field (say, the Find field) focused, or not —
+    /// running the app's start-of-frame Esc handling first, then the field, then the end-of-frame focus
+    /// note, as a frame does; whether the panel is still open.
+    fn esc_leaves_panel_open(field_focused: bool) -> bool {
+        let ctx = egui::Context::default();
+        let mut app = TableizerApp::new(None);
+        app.panel_open = true;
+        let field = egui::Id::new("some field");
+        let mut text = String::new();
+        let mut frame = |app: &mut TableizerApp, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                events,
+                ..egui::RawInput::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                app.close_panel_on_escape(ui.ctx());
+                ui.add(egui::TextEdit::singleline(&mut text).id(field));
+                app.note_keyboard_focus(ui.ctx());
+            });
+            output.textures_delta.clear(); // no renderer to upload the font atlas to
+        };
+        if field_focused {
+            ctx.memory_mut(|mem| mem.request_focus(field));
+        }
+        frame(&mut app, Vec::new());
+        frame(&mut app, Vec::new()); // the field holds focus
+        frame(
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        app.panel_open
+    }
+
+    #[test]
+    fn esc_in_a_text_field_does_not_close_the_side_panel() {
+        assert!(
+            esc_leaves_panel_open(true),
+            "Esc in a field closed the panel"
+        );
+    }
+
+    #[test]
+    fn esc_with_nothing_focused_closes_the_side_panel() {
+        assert!(!esc_leaves_panel_open(false));
     }
 
     #[test]

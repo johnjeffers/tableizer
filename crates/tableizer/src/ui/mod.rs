@@ -13,7 +13,7 @@ mod menu;
 mod settings;
 
 pub(crate) use grid::grid;
-pub(crate) use menu::{ExportKind, ExportRequest, columns_tab, menu_bar, parsing_tab};
+pub(crate) use menu::{ExportKind, ExportRequest, columns_tab, hide_search, menu_bar, parsing_tab};
 pub(crate) use settings::settings_tab;
 
 use std::path::{Path, PathBuf};
@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use eframe::egui;
 use tableizer_core::RowCount;
 
-use crate::model::{LoadedTable, format_label};
+use crate::model::{LoadedTable, ViewControls, format_label};
 use crate::theme;
 
 /// egui's standard menu look (`menu_style`) with roomier horizontal item padding, so the highlight
@@ -33,42 +33,79 @@ pub(crate) fn wide_menu(style: &mut egui::Style) {
     style.spacing.button_padding.x = 6.0;
 }
 
-/// The toolbar: the find/filter controls. `focus_find` requests focus on the Find field (⌘/Ctrl+F).
-pub(crate) fn toolbar(ui: &mut egui::Ui, loaded: &mut LoadedTable, focus_find: bool) {
-    let LoadedTable { view, .. } = loaded;
-    ui.horizontal_wrapped(|ui| {
-        ui.label("Find:");
-        let find = ui.add(
-            egui::TextEdit::singleline(&mut view.search)
-                .hint_text("substring or regex")
-                .desired_width(180.0),
-        );
-        if focus_find {
-            find.request_focus();
-        }
-        // Prev/Next jump the selection between matches across the whole file (a background scan, so a
-        // far-off match never freezes the UI). Enabled whenever there's a query; degenerate but
-        // harmless under "Show matches only" (every visible row matches there).
-        let has_query = !view.search.is_empty();
-        if ui
-            .add_enabled(has_query, egui::Button::new("<"))
-            .on_hover_text("Previous match (above the selection)")
-            .clicked()
-        {
-            view.find_request = Some(false);
-        }
-        if ui
-            .add_enabled(has_query, egui::Button::new(">"))
-            .on_hover_text("Next match (below the selection)")
-            .clicked()
-        {
-            view.find_request = Some(true);
-        }
-        ui.checkbox(&mut view.filter_mode, "Show matches only");
-        ui.checkbox(&mut view.regex, "Use regex");
-        ui.checkbox(&mut view.case_sensitive, "Match case");
-        ui.checkbox(&mut view.invert, "Invert search");
-    });
+/// The toolbar (search bar): the find/filter controls. `focus_find` requests focus on the Find field
+/// (⌘/Ctrl+F). Returns `true` when it asks to be hidden: its close button, or Esc in the Find field.
+pub(crate) fn toolbar(ui: &mut egui::Ui, view: &mut ViewControls, focus_find: bool) -> bool {
+    // The ✕ at the right end, laid out first; the controls fill (and wrap within) the rest.
+    let row = egui::Layout::right_to_left(egui::Align::Center);
+    ui.with_layout(row, |ui| {
+        let close = close_button(ui, "Hide search (clears it)").clicked();
+        let controls = egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true);
+        let escaped = ui.with_layout(controls, |ui| find_controls(ui, view, focus_find));
+        close || escaped.inner
+    })
+    .inner
+}
+
+/// The search bar's find/filter controls, left to right. Returns `true` when Esc was pressed in the
+/// Find field.
+fn find_controls(ui: &mut egui::Ui, view: &mut ViewControls, focus_find: bool) -> bool {
+    ui.label("Find:");
+    let find = ui.add(
+        egui::TextEdit::singleline(&mut view.search)
+            .hint_text("substring or regex")
+            .desired_width(180.0),
+    );
+    if focus_find {
+        find.request_focus();
+    }
+    // Prev/Next jump the selection between matches across the whole file (a background scan, so a
+    // far-off match never freezes the UI). Enabled whenever there's a query; degenerate but
+    // harmless under "Show matches only" (every visible row matches there).
+    let has_query = !view.search.is_empty();
+    if ui
+        .add_enabled(has_query, egui::Button::new("<"))
+        .on_hover_text("Previous match (above the selection)")
+        .clicked()
+    {
+        view.find_request = Some(false);
+    }
+    if ui
+        .add_enabled(has_query, egui::Button::new(">"))
+        .on_hover_text("Next match (below the selection)")
+        .clicked()
+    {
+        view.find_request = Some(true);
+    }
+    ui.checkbox(&mut view.filter_mode, "Show matches only");
+    ui.checkbox(&mut view.regex, "Use regex");
+    ui.checkbox(&mut view.case_sensitive, "Match case");
+    ui.checkbox(&mut view.invert, "Invert search");
+    // Esc makes egui drop the field's focus as the frame starts, so it shows up here as focus lost
+    // this frame with Esc pressed (the same way egui reports Enter).
+    find.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape))
+}
+
+/// A small ✕ close button drawn as two strokes (shapes, not a glyph — font-independent, per the module
+/// invariant), with `tooltip` on hover. Returns its click response.
+pub(crate) fn close_button(ui: &mut egui::Ui, tooltip: &str) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let color = if response.hovered() {
+        ui.visuals().text_color()
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    let c = rect.center();
+    let r = 4.0;
+    let stroke = egui::Stroke::new(1.5, color);
+    ui.painter()
+        .line_segment([c + egui::vec2(-r, -r), c + egui::vec2(r, r)], stroke);
+    ui.painter()
+        .line_segment([c + egui::vec2(-r, r), c + egui::vec2(r, -r)], stroke);
+    response.on_hover_text(tooltip)
 }
 
 /// The bottom status bar: path · format · cols/rows · indexing/view-build progress · data-quality ·
@@ -480,6 +517,165 @@ mod tests {
     fn empty_view_has_no_clear_button_without_recents() {
         let mut h = RecentsHarness::new(&[]);
         assert_eq!(h.text_rect("Clear"), None);
+    }
+
+    /// Render [`toolbar`] headlessly in a 900-pt-wide window, clicking at the point `at` picks from
+    /// the first frame's shapes; whether the toolbar asked to close.
+    fn click_toolbar(at: impl Fn(&[egui::Shape]) -> egui::Pos2) -> bool {
+        let ctx = egui::Context::default();
+        let mut view = ViewControls::default();
+        let mut closed = false;
+        let mut frame = |events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                events,
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 600.0),
+                )),
+                ..egui::RawInput::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                closed |= toolbar(ui, &mut view, false);
+            });
+            output.textures_delta.clear(); // no renderer to upload the font atlas to
+            output
+                .shapes
+                .into_iter()
+                .map(|c| c.shape)
+                .collect::<Vec<_>>()
+        };
+        let pos = at(&frame(Vec::new()));
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(vec![egui::Event::PointerMoved(pos)]);
+        frame(vec![button(true)]);
+        frame(vec![button(false)]);
+        closed
+    }
+
+    /// The centre of the toolbar's ✕: the rightmost painted line segment.
+    fn toolbar_close(shapes: &[egui::Shape]) -> egui::Pos2 {
+        shapes
+            .iter()
+            .filter_map(|s| match s {
+                egui::Shape::LineSegment { points, .. } => Some(egui::pos2(
+                    (points[0].x + points[1].x) / 2.0,
+                    (points[0].y + points[1].y) / 2.0,
+                )),
+                _ => None,
+            })
+            .max_by(|a, b| a.x.total_cmp(&b.x))
+            .expect("the toolbar's ✕")
+    }
+
+    #[test]
+    fn toolbar_stays_one_row_tall_in_its_panel() {
+        // The ✕ and the controls share one row at a normal window width.
+        let ctx = egui::Context::default();
+        let mut view = ViewControls::default();
+        let mut height = 0.0;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 600.0),
+            )),
+            ..egui::RawInput::default()
+        };
+        for _ in 0..3 {
+            let mut output = ctx.run_ui(input.clone(), |ui| {
+                let panel = egui::Panel::top("toolbar").show(ui, |ui| {
+                    toolbar(ui, &mut view, false);
+                });
+                height = panel.response.rect.height();
+            });
+            output.textures_delta.clear();
+        }
+        assert!(height < 40.0, "the search bar is {height} pt tall");
+    }
+
+    /// Render [`toolbar`] headlessly over a few frames — the first with `focus_find` — then press
+    /// `key`; whether the toolbar asked to close.
+    fn press_in_toolbar(focus_find: bool, key: egui::Key) -> bool {
+        let ctx = egui::Context::default();
+        let mut view = ViewControls::default();
+        let mut closed = false;
+        let mut frame = |events: Vec<egui::Event>, focus: bool| {
+            let input = egui::RawInput {
+                events,
+                ..egui::RawInput::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                closed |= toolbar(ui, &mut view, focus);
+            });
+            output.textures_delta.clear(); // no renderer to upload the font atlas to
+        };
+        frame(Vec::new(), focus_find);
+        frame(Vec::new(), false); // the focus request lands
+        frame(
+            vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            false,
+        );
+        closed
+    }
+
+    #[test]
+    fn toolbar_esc_in_the_find_field_asks_to_hide_the_search_bar() {
+        assert!(press_in_toolbar(true, egui::Key::Escape));
+    }
+
+    #[test]
+    fn toolbar_esc_elsewhere_does_not_close_it() {
+        assert!(!press_in_toolbar(false, egui::Key::Escape));
+    }
+
+    #[test]
+    fn toolbar_other_keys_in_the_find_field_do_not_close_it() {
+        assert!(!press_in_toolbar(true, egui::Key::Enter));
+    }
+
+    #[test]
+    fn toolbar_close_button_asks_to_hide_the_search_bar() {
+        assert!(click_toolbar(toolbar_close));
+    }
+
+    #[test]
+    fn toolbar_close_button_sits_at_the_right_end() {
+        let at = std::cell::Cell::new(egui::Pos2::ZERO);
+        click_toolbar(|shapes| {
+            at.set(toolbar_close(shapes));
+            egui::Pos2::ZERO
+        });
+        assert!(
+            at.get().x > 850.0,
+            "the ✕ is at the bar's right end: {:?}",
+            at.get()
+        );
+    }
+
+    #[test]
+    fn toolbar_does_not_close_on_other_clicks() {
+        let label = |shapes: &[egui::Shape]| {
+            shapes
+                .iter()
+                .find_map(|s| match s {
+                    egui::Shape::Text(t) if t.galley.text() == "Find:" => {
+                        Some(t.galley.rect.translate(t.pos.to_vec2()).center())
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert!(!click_toolbar(label));
     }
 
     #[test]
