@@ -1,11 +1,13 @@
-//! The menu bar (File / Parsing + the Columns-panel toggle and close button), the right-side Columns
-//! panel, and the Export submenu (which only records the request; the app runs the write off the UI
-//! thread).
+//! The menu bar (File / Parsing + the search and Columns-panel toggles and close button), the
+//! right-side Columns panel, and the Export submenu (which only records the request; the app runs the
+//! write off the UI thread).
 
 use eframe::egui;
 use tableizer_core::{ColumnId, ExportScope, RowCount};
 
-use crate::app::{CLOSE_SHORTCUT, PanelTab, QUIT_SHORTCUT, SETTINGS_SHORTCUT, TableizerApp};
+use crate::app::{
+    CLOSE_SHORTCUT, FIND_SHORTCUT, PanelTab, QUIT_SHORTCUT, SETTINGS_SHORTCUT, TableizerApp,
+};
 use crate::model::{
     GridLayout, LoadedTable, View, column_name, delimiter_display, delimiter_label, parse_delimiter,
 };
@@ -105,7 +107,7 @@ pub(crate) fn menu_bar(
     if matches!(app.view, View::Loaded(_)) {
         let on_columns = app.panel_open && app.panel_tab == PanelTab::Columns;
         let corner = ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            file_corner(ui, on_columns)
+            file_corner(ui, on_columns, app.search_open)
         });
         match corner.inner {
             CornerAction::None => {}
@@ -115,6 +117,11 @@ pub(crate) fn menu_bar(
                 app.panel_tab = PanelTab::Columns;
             }
             CornerAction::Close => app.view = View::Empty,
+            CornerAction::ToggleSearch => {
+                if let View::Loaded(loaded) = &mut app.view {
+                    toggle_search(&mut app.search_open, &mut loaded.view.search);
+                }
+            }
         }
     }
 }
@@ -127,13 +134,24 @@ enum CornerAction {
     ToggleColumns,
     /// Close the open file (back to the start screen), as File ▸ Close File and ⌘W do.
     Close,
+    /// Show or hide the search bar.
+    ToggleSearch,
+}
+
+/// Show or hide the search bar. Hiding it also clears the search `query`, so no rows stay filtered
+/// out — or highlighted — by a search that's no longer on screen (the match options are kept).
+pub(crate) fn toggle_search(open: &mut bool, query: &mut String) {
+    *open = !*open;
+    if !*open {
+        query.clear();
+    }
 }
 
 /// The menu bar's right end for an open file, laid out right to left in `ui`: a close button in the
 /// corner, then the Columns-panel toggle (the right-side panel holds Columns / Parsing / Settings tabs;
 /// Parsing is a tab there when delimited). `columns_open` says whether the panel is showing its
 /// Columns tab.
-fn file_corner(ui: &mut egui::Ui, columns_open: bool) -> CornerAction {
+fn file_corner(ui: &mut egui::Ui, columns_open: bool, search_open: bool) -> CornerAction {
     let mut action = CornerAction::None;
     if close_button(ui).clicked() {
         action = CornerAction::Close;
@@ -141,7 +159,26 @@ fn file_corner(ui: &mut egui::Ui, columns_open: bool) -> CornerAction {
     if columns_toggle(ui, columns_open).clicked() {
         action = CornerAction::ToggleColumns;
     }
+    if search_toggle(ui, search_open).clicked() {
+        action = CornerAction::ToggleSearch;
+    }
     action
+}
+
+/// The menu-bar toggle for the search bar: a painted magnifying glass, accent-coloured while the bar
+/// is showing.
+fn search_toggle(ui: &mut egui::Ui, open: bool) -> egui::Response {
+    let response = icon_button(ui, open, |painter, at, stroke| {
+        let center = at(10.5, 10.5);
+        painter.circle_stroke(center, at(16.0, 10.5).x - center.x, stroke);
+        painter.line_segment([at(14.5, 14.5), at(19.5, 19.5)], stroke);
+    });
+    let shortcut = ui.ctx().format_shortcut(&FIND_SHORTCUT);
+    response.on_hover_text(if open {
+        "Hide search (clears it)".to_string()
+    } else {
+        format!("Search ({shortcut})")
+    })
 }
 
 /// The menu-bar close button for the open file: a painted ✕.
@@ -424,7 +461,7 @@ mod tests {
                 let layout = egui::Layout::right_to_left(egui::Align::Center);
                 let size = egui::vec2(ui.max_rect().width(), 24.0);
                 ui.allocate_ui_with_layout(size, layout, |ui| {
-                    let clicked = file_corner(ui, false);
+                    let clicked = file_corner(ui, false, false);
                     if clicked != CornerAction::None {
                         action = clicked;
                     }
@@ -444,6 +481,30 @@ mod tests {
         frame(vec![button(true)]);
         frame(vec![button(false)]);
         action
+    }
+
+    #[test]
+    fn file_corner_search_toggle_sits_left_of_columns() {
+        // The third 30-pt button in.
+        assert_eq!(
+            click_corner(|spacing| 2.0 * (30.0 + spacing) + 15.0),
+            CornerAction::ToggleSearch
+        );
+    }
+
+    #[test]
+    fn toggle_search_opens_the_bar_with_the_query_untouched() {
+        let (mut open, mut query) = (false, String::new());
+        toggle_search(&mut open, &mut query);
+        assert!(open);
+    }
+
+    #[test]
+    fn toggle_search_hides_the_bar_and_clears_the_query() {
+        let (mut open, mut query) = (true, "error".to_string());
+        toggle_search(&mut open, &mut query);
+        assert!(!open);
+        assert_eq!(query, "");
     }
 
     #[test]

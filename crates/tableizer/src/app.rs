@@ -63,6 +63,8 @@ pub(crate) struct TableizerApp {
     font_mono_only: bool,
     /// Whether the right-side panel (Columns / Parsing / Settings tabs) is expanded.
     pub(crate) panel_open: bool,
+    /// Whether the search bar is shown (see [`search_bar_open`]). Hidden by default.
+    pub(crate) search_open: bool,
     /// Which tab the right-side panel shows.
     pub(crate) panel_tab: PanelTab,
     /// The in-flight (or just-finished) export, if any — driven on a background thread.
@@ -305,6 +307,7 @@ impl TableizerApp {
             font_search: String::new(),
             font_mono_only: false,
             panel_open: false,
+            search_open: false,
             panel_tab: PanelTab::default(),
             export_job: None,
             download_job: None,
@@ -1637,6 +1640,13 @@ fn disclosure(ui: &mut egui::Ui, open: bool) {
     ));
 }
 
+/// Whether the search bar shows this frame: when toggled on (`open`), when ⌘F asked for it, and always
+/// while there's a search `query` (e.g. a filter restored with the file), so a search never filters or
+/// highlights rows out of sight.
+fn search_bar_open(open: bool, find_shortcut: bool, query: &str) -> bool {
+    open || find_shortcut || !query.is_empty()
+}
+
 /// The window's title: the open file's name — the last segment of its `origin` (local path or URL),
 /// never the full path — else the app's name.
 fn window_title(origin: Option<&str>) -> String {
@@ -1809,8 +1819,9 @@ impl eframe::App for TableizerApp {
             View::Loaded(loaded) => Some(loaded.dialect),
             _ => None,
         };
-        // ⌘/Ctrl+F focuses the Find field.
-        let focus_find = ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F));
+        // ⌘/Ctrl+F shows the search bar and focuses its Find field.
+        let find_shortcut = ctx.input_mut(|i| i.consume_shortcut(&FIND_SHORTCUT));
+        let search_was_open = self.search_open;
         // ⌘Q / Ctrl+Q quits the app.
         if ctx.input_mut(|i| i.consume_shortcut(&QUIT_SHORTCUT)) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1848,7 +1859,14 @@ impl eframe::App for TableizerApp {
                 .ui(ui, |ui| menu_bar(ui, self, &mut to_open, &mut to_export));
         });
 
-        if matches!(self.view, View::Loaded(_)) {
+        // The search bar (toggled from the menu bar's search icon, or ⌘F). Opening it on purpose
+        // focuses the Find field; a search restored with the file shows it without taking focus.
+        let focus_find = find_shortcut || (!search_was_open && self.search_open);
+        if let View::Loaded(loaded) = &self.view {
+            self.search_open =
+                search_bar_open(self.search_open, find_shortcut, &loaded.view.search);
+        }
+        if self.search_open && matches!(self.view, View::Loaded(_)) {
             egui::Panel::top("toolbar").show(ui, |ui| {
                 if let View::Loaded(loaded) = &mut self.view {
                     toolbar(ui, loaded, focus_find);
@@ -2134,6 +2152,9 @@ pub(crate) const QUIT_SHORTCUT: egui::KeyboardShortcut =
 /// Open the right panel on the Settings tab (⌘, / Ctrl+,).
 pub(crate) const SETTINGS_SHORTCUT: egui::KeyboardShortcut =
     egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Comma);
+/// Show the search bar and focus its Find field (⌘F / Ctrl+F).
+pub(crate) const FIND_SHORTCUT: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::F);
 /// Close the current file (⌘W / Ctrl+W).
 pub(crate) const CLOSE_SHORTCUT: egui::KeyboardShortcut =
     egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::W);
@@ -2384,6 +2405,22 @@ mod tests {
             size: Some(1),
             ..folder(url, ChildState::Unloaded)
         }
+    }
+
+    #[test]
+    fn search_bar_is_hidden_by_default() {
+        assert!(!search_bar_open(false, false, ""));
+    }
+
+    #[test]
+    fn search_bar_shows_when_toggled_on_or_asked_for() {
+        assert!(search_bar_open(true, false, ""));
+        assert!(search_bar_open(false, true, ""), "⌘F");
+    }
+
+    #[test]
+    fn search_bar_shows_while_there_is_a_search() {
+        assert!(search_bar_open(false, false, "error"));
     }
 
     #[test]
